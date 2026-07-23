@@ -1,0 +1,20 @@
+# --- Core logic (no models, no keys) — works everywhere incl. plain CPU ---
+# (stdlib only: sqlite3, re, uuid — nothing to install)
+
+# --- Local voice models (free, open-source, from Hugging Face) ---
+faster-whisper>=1.0.0        # STT  (openai/whisper weights)
+transformers>=4.44.0         # LLM  (Qwen2.5 instruct)
+torch>=2.2.0                 # backend for transformers
+accelerate>=0.30.0
+# TTS — pick ONE for your platform:
+kokoro>=0.9.2                #   Linux/Colab: best quality (needs espeak-ng + C++ toolchain)
+pyttsx3>=2.90               #   Windows: offline SAPI5, pure wheels, no compiler
+soundfile>=0.12.1            # audio I/O
+numpy>=1.24.0
+
+# IMPORTANT: use Python 3.11 or 3.12. Python 3.13/3.14 lack prebuilt wheels for
+# torch / ctranslate2 and will try to compile from source (fails without MSVC).
+
+# --- Deployment scaffold only (LiveKit + Twilio) ---
+# livekit-agents>=1.0
+# livekit-plugins-silero
