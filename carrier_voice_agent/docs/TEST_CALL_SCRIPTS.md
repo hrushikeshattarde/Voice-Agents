@@ -28,33 +28,39 @@ and follow one script per call. Watch the terminal — you'll see
 
 ---
 
+> **Booking is a two-step close.** Once you agree on a rate, the agent confirms
+> the pickup and says it's sending a rate con — reply **"yep, I can cover it"** to
+> finalize. If you say you *can't* make the pickup, it hands you to a rep instead.
+
 ## Scenario 1 — Happy path: accept the opening offer
 **Purpose:** confirm the whole flow works end to end.
 
 | You say | Agent should |
 |---|---|
 | "I'm calling about load **L one zero zero one**." | Confirm *Chicago to Dallas, Dry Van*, ask for MC/USDOT |
-| "My MC is **one two three four five six**." | "You're verified, Blue Sky Logistics. I've got this at **$2000**. Does that work?" |
-| "**Yes, that works.**" | "Done — you're booked on L1001 at **$2000**…" |
+| "My MC is **one two three four five six**." | "You're all set, Blue Sky Logistics. I've got this at **$2000** — how's that sound?" |
+| "**Yes, that works.**" | Confirms rate, asks if you can cover the pickup + says it's sending the rate con |
+| "**Yep, I can cover it.**" | "You're locked in on L1001 at **$2000** — rate con's on its way…" |
 
 **Expected outcome:** `booked` at $2000.
 
 ---
 
-## Scenario 2 — Negotiate: agent holds firm, then makes real concessions
-**Purpose:** see the human hold-then-concede behavior (bigger, decreasing moves
-that converge toward the cap, not tiny fixed steps).
+## Scenario 2 — Negotiate: hold firm, then split the difference
+**Purpose:** see the human hold-then-meet-in-the-middle behavior (it does NOT
+just cave to your exact number).
 
 | You say | Agent should |
 |---|---|
 | "Load **L one zero zero one**." | Confirm lane, ask MC |
 | "MC **one two three four five six**." | Offer **$2000** |
-| "I need **twenty-three hundred**." | **Hold:** pushes back, reacts to $2300, stays at $2000 |
-| "**Twenty-three hundred.**" | **Concede:** comes up to **~$2175** |
-| "**Still twenty-three hundred.**" | **Concede:** comes up to **~$2280** |
-| "**Twenty-three hundred.**" | **Books at $2300** (now within its cap) |
+| "I need **twenty-three hundred**." | **Hold:** "$2300's a reach — I'm working with $2000, get closer?" |
+| "**Twenty-three hundred.**" | **Split:** comes up to **~$2150** |
+| "**Still twenty-three hundred.**" | **Split:** comes up to **~$2225** |
+| "**Twenty-three hundred.**" | Meets your number → confirms pickup + rate con |
+| "**Yep, I can make it.**" | Books at **$2300** |
 
-**Expected outcome:** `booked` at $2300 (a rate at/under the hidden $2350 cap).
+**Expected outcome:** `booked` at $2300 (at/under the hidden $2350 cap).
 If you ask *above* $2350 and hold, it makes its best offer, then declines with a note.
 
 ---
@@ -66,7 +72,8 @@ If you ask *above* $2350 and hold, it makes its best offer, then declines with a
 |---|---|
 | "Load **L one zero zero two**." | Confirm *Atlanta to Miami, Reefer*, ask MC |
 | "MC **six five four three two one**." | Offer **$1400** |
-| "I'll do it for **thirteen fifty**." | Books at **$1350** (cheaper than our offer) |
+| "I'll do it for **thirteen fifty**." | Takes it → confirms pickup + rate con |
+| "**Yep, I can cover it.**" | Books at **$1350** |
 
 **Expected outcome:** `booked` at $1350.
 

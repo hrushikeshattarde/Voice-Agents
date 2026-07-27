@@ -48,6 +48,11 @@ _REJECT_WORDS = (
     "no", "nope", "nah", "can't", "cannot", "too low", "not enough",
     "come on", "forget it", "pass", "higher", "more than that", "no way",
 )
+# At the booking-confirmation step: the carrier can't cover the pickup.
+_CANNOT_COVER = (
+    "can't", "cannot", "can not", "not available", "won't work", "wont work",
+    "no truck", "different day", "nope", "not that day",
+)
 
 
 class CallState(str, enum.Enum):
@@ -56,6 +61,7 @@ class CallState(str, enum.Enum):
     VERIFY_CARRIER = "verify_carrier"
     STATE_PRICE = "state_price"
     NEGOTIATE = "negotiate"
+    CONFIRM_BOOKING = "confirm_booking"   # rate agreed; confirm pickup + rate con
     DONE = "done"
 
 
@@ -80,6 +86,7 @@ class CarrierSalesAgent:
         self.carrier = None
         self.neg: NegotiationEngine | None = None
         self._last_ask: float | None = None
+        self._agreed_rate: float | None = None
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
         repo.start_call(self.call_id)
@@ -127,6 +134,7 @@ class CarrierSalesAgent:
             CallState.VERIFY_CARRIER: self._verify_carrier,
             CallState.STATE_PRICE: self._negotiate,
             CallState.NEGOTIATE: self._negotiate,
+            CallState.CONFIRM_BOOKING: self._confirm_booking,
             CallState.DONE: lambda _t: "This call has ended. Goodbye.",
         }.get(self.state, self._identify_load)
         return handler(user_text)
@@ -230,7 +238,7 @@ class CarrierSalesAgent:
 
         # Explicit "yes" with no number -> accept the offer on the table.
         if money is None and any(w in lowered for w in _ACCEPT_WORDS):
-            return self._book(self.neg.current_offer)
+            return self._propose_booking(self.neg.current_offer)
         if any(w in lowered for w in _HUMAN_WORDS):
             return self._transfer_and_say(reason="carrier_request")
 
@@ -253,7 +261,7 @@ class CarrierSalesAgent:
 
     def _apply_negotiation(self, result, ask: float) -> str:
         if result.decision == Decision.ACCEPT:
-            return self._book(result.rate)
+            return self._propose_booking(result.rate)
 
         if result.decision == Decision.REVIEW:
             self._repo.log_note(
@@ -270,12 +278,13 @@ class CarrierSalesAgent:
             rate = int(result.rate)
             self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
             return self._say(
-                f"Oof, ${int(ask)} is a tough one for this lane — I'm sitting at ${rate} "
-                "right now. Any way you can work with me there?",
-                instruction=f"The carrier wants ${int(ask)}, which is more than you can pay. "
-                f"Push back warmly, react to their number, and hold at your current offer "
-                f"of ${rate}. Never reveal your max. Sound like a real rep, not scripted.",
-                context=f"Hold firm at ${rate}. Never reveal your ceiling/max.",
+                f"Yeah, ${int(ask)}'s a reach for me on this one — I'm working with ${rate} "
+                "right now. Can you help me out and get closer to that?",
+                instruction=f"The carrier wants ${int(ask)}. Don't call their number "
+                "too-high or 'above market' (you don't want to bluff a number you might "
+                f"pay). Just say where you're at — ${rate} — and nudge them toward it. "
+                "Blunt, warm, transactional; never reveal your max.",
+                context=f"You're working with ${rate}. Never reveal your ceiling/max.",
             )
 
         # COUNTER — a real concession up the ladder
@@ -297,18 +306,56 @@ class CarrierSalesAgent:
             context=f"Your improved offer is ${rate}. Never reveal your max.",
         )
 
-    # -- Step 6a: book ------------------------------------------------------ #
-    def _book(self, rate: float) -> str:
+    # -- Step 6a: agree on rate -> confirm operations before booking -------- #
+    def _propose_booking(self, rate: float) -> str:
         if rate > self.neg.ceiling:   # final server-side guard (defense in depth)
             return self._transfer_and_say(reason="ceiling_guard")
-        self._repo.book_load(self.load.load_id)
+        self._agreed_rate = rate
+        self.state = CallState.CONFIRM_BOOKING
         self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
+        ld = self.load
+        city = ld.origin.split(",")[0]
+        return self._say(
+            f"Alright, ${int(rate)} it is. Can you cover the pickup in {city} on "
+            f"{ld.pickup_date} with a {ld.equipment}? If so I'll shoot the rate con over "
+            "for you to sign — that locks it in.",
+            instruction=f"You've agreed on ${int(rate)} for the {ld.equipment} load, "
+            f"{ld.origin} to {ld.destination}, pickup {ld.pickup_date}. Confirm the rate, "
+            f"ask if they can cover that pickup (date/location/equipment), and say you'll "
+            "send the rate confirmation to sign to lock it in. Direct and warm.",
+            context=f"Agreed rate ${int(rate)}. Pickup {ld.pickup_date} in {city}. "
+            f"Equipment {ld.equipment}.",
+        )
+
+    def _confirm_booking(self, text: str) -> str:
+        lowered = text.lower()
+        money = parsing.extract_money(text)
+
+        # Carrier reopens price at the last second -> back to negotiating.
+        if money is not None and money != int(self._agreed_rate):
+            self.state = CallState.NEGOTIATE
+            return self._negotiate(text)
+
+        # Can't cover the pickup -> hand to a rep to rework, don't just book.
+        if any(p in lowered for p in _CANNOT_COVER):
+            self._repo.log_note(
+                self.call_id,
+                f"Agreed ${int(self._agreed_rate)} on {self.load.load_id} but carrier "
+                f"couldn't confirm the {self.load.pickup_date} pickup — needs a rep to rework.",
+            )
+            return self._transfer_and_say(reason="pickup_issue")
+
+        return self._finalize_booking()
+
+    def _finalize_booking(self) -> str:
+        rate = int(self._agreed_rate)
+        self._repo.book_load(self.load.load_id)
         self._finish(CallOutcome.BOOKED)
         return self._say(
-            f"Done — you're booked on load {self.load.load_id} at ${int(rate)}. "
-            "Rate confirmation is on its way to you. Thanks, and drive safe.",
-            instruction=f"Confirm the booking on load {self.load.load_id} at ${int(rate)}, "
-            "mention a rate confirmation is coming, and close warmly.",
+            f"You're locked in on {self.load.load_id} at ${rate} — rate con's on its way, "
+            "get that signed and you're all set. Thanks, drive safe.",
+            instruction=f"Confirm they're booked on {self.load.load_id} at ${rate}, remind "
+            "them to sign the rate con you're sending, and close warmly and briefly.",
         )
 
     # -- Step 6b: transfer -------------------------------------------------- #

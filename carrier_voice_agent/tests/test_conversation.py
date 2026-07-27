@@ -14,7 +14,9 @@ def test_happy_path_books_at_opening(repo):
     a.greeting()
     a.handle("about L1001")
     a.handle("MC 123456")
-    a.handle("yeah that works")
+    a.handle("yeah that works")        # agree on rate -> confirm step
+    assert a.state.value == "confirm_booking"
+    a.handle("yep, I can cover it")    # confirm pickup -> finalize
     assert a.summary()["outcome"] == "booked"
     assert repo.get_load("L1001").status.value == "covered"
 
@@ -24,9 +26,21 @@ def test_walk_up_then_book(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC 123456")
-    a.handle("I need 2080")     # high ask -> hold firm at 2000
-    a.handle("come on 2060")    # we concede toward the cap; 2060 is within it -> book
+    a.handle("I need 2080")     # high ask -> hold firm
+    a.handle("2050")            # we split the difference and counter
+    a.handle("deal")            # accept the offer on the table -> confirm step
+    a.handle("yep can cover it")  # confirm pickup -> finalize
     assert a.summary()["outcome"] == "booked"
+
+
+def test_cannot_cover_pickup_is_transferred(repo):
+    a = _agent(repo)
+    a.greeting()
+    a.handle("about L1001")
+    a.handle("MC 123456")
+    a.handle("yeah that works")        # agree -> confirm step
+    a.handle("actually I can't make that pickup day")
+    assert a.summary()["outcome"] == "transferred"
 
 
 def test_high_ask_ends_no_deal_with_note(repo):

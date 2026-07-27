@@ -34,21 +34,22 @@ def test_high_ask_holds_firm_first(engine):
     assert result.rate == 2000              # restates the opening, does not move
 
 
-def test_human_ladder_counters_then_accepts(engine):
+def test_split_the_difference_then_accepts(engine):
+    # Carrier holds at 2300 (within our 2350 cap): we meet them partway, not instantly.
     assert engine.evaluate(2300).decision == Decision.HOLD
     c1 = engine.evaluate(2300)
-    assert (c1.decision, c1.rate) == (Decision.COUNTER, 2175)
+    assert (c1.decision, c1.rate) == (Decision.COUNTER, 2150)   # +50% of the gap
     c2 = engine.evaluate(2300)
-    assert (c2.decision, c2.rate) == (Decision.COUNTER, 2280)
-    done = engine.evaluate(2300)            # 2300 is now within our raised offer (2350)
+    assert (c2.decision, c2.rate) == (Decision.COUNTER, 2225)   # +50% of remainder
+    done = engine.evaluate(2300)            # our offer now reaches their number
     assert done.decision == Decision.ACCEPT
     assert done.rate == 2300
 
 
 def test_final_offer_is_flagged(engine):
-    engine.evaluate(3000)                    # HOLD
+    engine.evaluate(3000)                    # HOLD  (3000 is above our 2350 cap)
     engine.evaluate(3000)                    # COUNTER 2175
-    engine.evaluate(3000)                    # COUNTER 2280
+    engine.evaluate(3000)                    # COUNTER 2263
     final = engine.evaluate(3000)            # COUNTER 2350 = the cap
     assert final.decision == Decision.COUNTER
     assert final.rate == 2350
