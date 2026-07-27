@@ -50,6 +50,8 @@ class Repository:
             fraud_low_rate=row["fraud_low_rate"],
             assigned_rep_id=row["assigned_rep_id"],
             status=LoadStatus(row["status"]),
+            is_posted=bool(row["is_posted"]),
+            notes=row["notes"],
         )
 
     @staticmethod
@@ -62,6 +64,7 @@ class Repository:
             insurance_on_file=bool(row["insurance_on_file"]),
             authority_reactivated_days=row["authority_reactivated_days"],
             last_verified_at=row["last_verified_at"],
+            approved=bool(row["approved"]),
         )
 
     @staticmethod
@@ -85,9 +88,12 @@ class Repository:
             conn.close()
 
     def open_loads(self) -> list[Load]:
+        """Bookable loads only: open AND posted."""
         conn = self._db.connect()
         try:
-            rows = conn.execute("SELECT * FROM loads WHERE status='open'").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM loads WHERE status='open' AND is_posted=1"
+            ).fetchall()
             return [self._load(r) for r in rows]
         finally:
             conn.close()

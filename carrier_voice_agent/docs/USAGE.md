@@ -85,9 +85,11 @@ Fill in (see [table below](#7-configuration--changing-models)):
 - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
 - `GROQ_API_KEY`
 
-### 4.2 One-time: accept Groq TTS terms
-In the Groq console → Models → `playai-tts` → accept its terms (else the first
-TTS call errors). Or set a different `TTS_MODEL` in `.env`.
+### 4.2 TTS model
+Defaults to `canopylabs/orpheus-v1-english` (Groq's Orpheus). The old
+`playai-tts` model was shut down 2025-12-31 — no terms to accept. Override the
+model/voice via `TTS_MODEL` / `TTS_VOICE` in `.env` if you like (voices: `troy`,
+`autumn`, `diana`, `hannah`, `austin`, `daniel`).
 
 ### 4.3 One-time: wire the phone number (SIP)
 Follow [docs/LIVE_SETUP.md](LIVE_SETUP.md) — create a LiveKit inbound trunk +
@@ -155,7 +157,7 @@ is overridable via `.env` (env var wins). **Change a model = change one value.**
 | Groq key | `GROQ_API_KEY` | — (required for live) |
 | STT model | `STT_MODEL` | `whisper-large-v3-turbo` |
 | LLM model | `LLM_MODEL` | `llama-3.1-8b-instant` |
-| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `playai-tts` / `Celeste-PlayAI` |
+| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `canopylabs/orpheus-v1-english` / `troy` |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
 | Turn buffer (sec) | `MIN_ENDPOINTING_DELAY` / `MAX_ENDPOINTING_DELAY` | `0.8` / `8.0` |
 | Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `6` |
@@ -169,7 +171,7 @@ Examples:
 echo "USE_LLM=1" >> .env
 echo "LLM_MODEL=llama-3.3-70b-versatile" >> .env
 # a different TTS voice:
-echo "TTS_VOICE=Fritz-PlayAI" >> .env
+echo "TTS_VOICE=autumn" >> .env
 ```
 
 ---
@@ -179,7 +181,7 @@ echo "TTS_VOICE=Fritz-PlayAI" >> .env
 | Symptom | Cause | Fix |
 |---|---|---|
 | `Missing required settings: …` on start | `.env` not filled | Add LiveKit + `GROQ_API_KEY` to `.env` |
-| Worker starts, call connects, **silent** | Groq `playai-tts` terms not accepted | Accept in Groq console, or change `TTS_MODEL` |
+| Worker starts, call connects, **silent** | wrong/removed `TTS_MODEL` (e.g. old `playai-tts`) | Use `canopylabs/orpheus-v1-english` (default) |
 | Call connects but **agent never joins** | dispatch rule missing | `lk sip dispatch list`; recreate per LIVE_SETUP §B3 |
 | Call **fails to connect** | number not attached / SIP URI mismatch | Recheck LIVE_SETUP §B |
 | STT hears wrong **digits** ("L1001"→"anyone") | phone audio + model | Say digits slowly, one at a time |

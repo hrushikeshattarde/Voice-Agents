@@ -27,3 +27,10 @@ def test_unknown_carrier_not_found(repo):
     result = CarrierVerificationService(repo).verify("MC000000")
     assert result.verified is False
     assert result.reason == "not_found"
+
+
+def test_not_approved_carrier_is_declined(repo):
+    result = CarrierVerificationService(repo).verify("MC222333")
+    assert result.verified is True          # authority/insurance are fine
+    assert result.approved is False         # but not approved to work with us
+    assert result.action == VerificationAction.DECLINE

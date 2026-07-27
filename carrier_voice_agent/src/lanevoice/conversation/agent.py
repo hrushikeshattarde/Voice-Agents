@@ -11,6 +11,7 @@ The LLM (phraser) only rewords; every decision comes from the services.
 from __future__ import annotations
 
 import enum
+import re
 import uuid
 
 from lanevoice import parsing
@@ -55,10 +56,26 @@ _CANNOT_COVER = (
 )
 
 
+def _declines_requirements(text: str) -> bool:
+    """True if the carrier says they CAN'T meet the load's special requirements."""
+    low = text.lower()
+    # Explicit inability first (catches "i can't", "not equipped", ...).
+    if any(p in low for p in (
+        "can't", "cannot", "can not", "not able", "unable", "won't", "wont",
+        "don't have", "not equipped", "no truck", "negative", "nope",
+    )):
+        return True
+    # A standalone "no" (but not "no problem" / "no worries").
+    if re.search(r"\bno\b", low) and "no problem" not in low and "no worries" not in low:
+        return True
+    return False
+
+
 class CallState(str, enum.Enum):
     GREETING = "greeting"
     IDENTIFY_LOAD = "identify_load"
     VERIFY_CARRIER = "verify_carrier"
+    CHECK_REQUIREMENTS = "check_requirements"   # narrate load notes, confirm carrier can do it
     STATE_PRICE = "state_price"
     NEGOTIATE = "negotiate"
     CONFIRM_BOOKING = "confirm_booking"   # rate agreed; confirm pickup + rate con
@@ -133,6 +150,7 @@ class CarrierSalesAgent:
         handler = {
             CallState.IDENTIFY_LOAD: self._identify_load,
             CallState.VERIFY_CARRIER: self._verify_carrier,
+            CallState.CHECK_REQUIREMENTS: self._check_requirements,
             CallState.STATE_PRICE: self._negotiate,
             CallState.NEGOTIATE: self._negotiate,
             CallState.CONFIRM_BOOKING: self._confirm_booking,
@@ -152,19 +170,33 @@ class CarrierSalesAgent:
             )
         result = self._loads.lookup(load_id)
         if not result.found:
-            opens = ", ".join(self._loads.open_load_ids())
+            opens = self._loads.open_loads_summary()
             return self._say(
                 f"I couldn't find load {load_id}. Open loads right now are {opens}. "
                 "Which one would you like?",
                 instruction=f"Tell the caller load {load_id} was not found, then offer "
-                f"the open loads: {opens}. Ask which they want.",
+                f"ONLY these open loads with their exact lanes: {opens}. Do not invent "
+                "any lanes. Ask which they want.",
+                context=f"Open loads (use these lanes exactly): {opens}",
+            )
+        if not result.posted:
+            opens = self._loads.open_loads_summary()
+            return self._say(
+                f"Load {load_id} isn't posted right now, so I can't book that one. "
+                f"Open loads are {opens}. Which would you like?",
+                instruction=f"Tell the caller load {load_id} isn't posted/available right "
+                f"now, then offer ONLY these open loads with their exact lanes: {opens}. "
+                "Do not invent any lanes.",
+                context=f"Open loads (use these lanes exactly): {opens}",
             )
         if not result.available:
-            opens = ", ".join(self._loads.open_load_ids())
+            opens = self._loads.open_loads_summary()
             return self._say(
                 f"Sorry, load {load_id} is already covered. Other open loads: {opens}.",
-                instruction=f"Tell the caller load {load_id} is already covered and "
-                f"offer open loads: {opens}.",
+                instruction=f"Tell the caller load {load_id} is already covered, then "
+                f"offer ONLY these open loads with their exact lanes: {opens}. Do not "
+                "invent any lanes.",
+                context=f"Open loads (use these lanes exactly): {opens}",
             )
 
         self.load = result.load
@@ -203,6 +235,23 @@ class CarrierSalesAgent:
             )
 
         self.carrier = result.carrier
+
+        # Not approved to work with Circle Logistics -> decline, don't book.
+        if result.action == VerificationAction.DECLINE:
+            self._repo.log_note(
+                self.call_id,
+                f"Carrier {self.carrier.legal_name} (USDOT {self.carrier.usdot_number}) "
+                "is not approved to work with Circle Logistics — declined.",
+            )
+            self._finish(CallOutcome.REJECTED)
+            return self._say(
+                "I'm sorry, but it looks like we're not set up to work with your company "
+                "on our end, so I won't be able to book this one. Thanks for calling.",
+                instruction="Politely tell the carrier your brokerage isn't set up to work "
+                "with their company, so you can't book with them. Do not explain why or "
+                "reveal internal lists. Keep it brief and professional.",
+            )
+
         if result.action == VerificationAction.HUMAN_REVIEW:
             self._repo.log_note(
                 self.call_id,
@@ -217,6 +266,23 @@ class CarrierSalesAgent:
                 "finish verification. Keep it smooth and non-accusatory.",
             )
 
+        # Approved & verified. If the load has special requirements, read them out
+        # and make sure the carrier can do it BEFORE talking rate.
+        if self.load.notes:
+            self.state = CallState.CHECK_REQUIREMENTS
+            return self._say(
+                f"You're good to go, {self.carrier.legal_name}. One thing on this load — "
+                f"{self.load.notes} Can you handle that?",
+                instruction=f"Confirm the carrier {self.carrier.legal_name} is verified "
+                "(by company name, never the MC number), then read them the load's "
+                f"special requirements verbatim: \"{self.load.notes}\" and ask if they can "
+                "do it.",
+                context=f"Carrier {self.carrier.legal_name}. Requirements: {self.load.notes}",
+            )
+        return self._present_offer()
+
+    def _present_offer(self) -> str:
+        """Set up negotiation and make the opening offer."""
         self.neg = NegotiationEngine(
             self.load,
             max_rounds=self._settings.max_negotiation_rounds,
@@ -227,14 +293,30 @@ class CarrierSalesAgent:
         self._repo.log_offer(self.call_id, 0, OfferParty.AGENT, opening)
         lane = f"{self.load.origin.split(',')[0]} to {self.load.destination.split(',')[0]}"
         return self._say(
-            f"You're good to go, {self.carrier.legal_name}. Nice lane, {lane} — I've got "
-            f"this one at ${opening}. That work?",
-            instruction=f"Confirm the carrier is verified by their COMPANY NAME "
-            f"({self.carrier.legal_name}) — do NOT read back their MC/USDOT number. Add a "
-            f"quick bit of lane rapport ({lane}), float the opening offer of ${opening}, "
-            "and ask if it works.",
+            f"Alright, {self.carrier.legal_name} — nice lane, {lane}. I've got this one "
+            f"at ${opening}. That work?",
+            instruction=f"Float the opening offer of ${opening} for the {lane} load and "
+            "ask if it works. Add a quick bit of lane rapport. Do not read back the MC "
+            "number.",
             context=f"Carrier {self.carrier.legal_name}. Lane {lane}. Opening offer ${opening}.",
         )
+
+    # -- Load requirements gate (PRD step: narrate notes, confirm) --------- #
+    def _check_requirements(self, text: str) -> str:
+        if _declines_requirements(text):
+            self._repo.log_note(
+                self.call_id,
+                f"Carrier {self.carrier.legal_name} can't meet the requirements on "
+                f"{self.load.load_id} ({self.load.notes!r}) — not booked.",
+            )
+            self._finish(CallOutcome.NO_DEAL)
+            return self._say(
+                "No worries — since you can't cover those requirements, I can't book this "
+                "one with you today. Thanks for calling, and let's catch the next one.",
+                instruction="Politely say that since they can't meet the load's "
+                "requirements you can't book it with them, and close warmly. 1-2 sentences.",
+            )
+        return self._present_offer()
 
     # -- Steps 4/5: negotiate ---------------------------------------------- #
     def _negotiate(self, text: str) -> str:
@@ -353,11 +435,11 @@ class CarrierSalesAgent:
         # Pickup confirmed -> collect the info a rate con actually needs.
         self.state = CallState.COLLECT_DETAILS
         return self._say(
-            "Great. What's the best email for the rate con, and who's your driver and "
-            "truck number?",
-            instruction="Ask for the two things you need to send the rate con: the best "
-            "email to send it to, and the driver name + truck (or trailer) number. One "
-            "short sentence.",
+            "Perfect — what email should I send the rate con to? And who's the driver, "
+            "plus the truck or trailer number?",
+            instruction="YOU (the rep) are sending the rate confirmation to the carrier. "
+            "Ask which email address you should send it to, and for the driver's name and "
+            "truck/trailer number. Never imply the carrier sends anything. One short sentence.",
         )
 
     def _collect_details(self, text: str) -> str:

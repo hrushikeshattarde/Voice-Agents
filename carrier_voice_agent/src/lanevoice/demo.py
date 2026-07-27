@@ -87,6 +87,19 @@ def main() -> None:
     _scripted("Revoked authority -> human review", [
         "L1002", "MC999888",
     ])
+    _scripted("Unposted load -> won't proceed", [
+        "L1005",
+    ])
+    _scripted("Carrier not approved to work with us -> declined", [
+        "L1001", "MC 222333",
+    ])
+    _scripted("Load has requirements -> carrier can do it -> books", [
+        "L1002", "MC 123456", "yeah I can run it that cold",
+        "that works", "yep can make the 8 AM", "ops@blue.com, driver Lee 555-222-3333",
+    ])
+    _scripted("Load has requirements -> carrier can't -> no booking", [
+        "L1002", "MC 123456", "no, I can't run it that cold",
+    ])
 
 
 if __name__ == "__main__":

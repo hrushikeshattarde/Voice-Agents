@@ -54,8 +54,20 @@ class CarrierVerificationService:
                 action=VerificationAction.HUMAN_REVIEW,
                 carrier=carrier,
                 high_risk=True,
+                approved=carrier.approved,
                 risk_flags=tuple(risk_flags),
                 reason="authority_or_insurance",
+            )
+
+        # Authority/insurance are fine, but is the carrier approved to work with us?
+        if not carrier.approved:
+            return VerificationResult(
+                verified=True,
+                action=VerificationAction.DECLINE,
+                carrier=carrier,
+                approved=False,
+                risk_flags=tuple(risk_flags),
+                reason="not_approved",
             )
 
         # Verified, but a soft risk flag routes to a human (logged, never dropped).
@@ -67,5 +79,6 @@ class CarrierVerificationService:
             ),
             carrier=carrier,
             high_risk=bool(risk_flags),
+            approved=True,
             risk_flags=tuple(risk_flags),
         )

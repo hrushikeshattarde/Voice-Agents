@@ -14,7 +14,14 @@ import asyncio
 
 import numpy as np
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    RoomInputOptions,
+    WorkerOptions,
+    cli,
+)
 from livekit.agents import tts as lk_tts
 from livekit.plugins import groq as lk_groq
 from livekit.plugins import silero
@@ -28,6 +35,7 @@ try:
 except ImportError:  # pragma: no cover
     from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
+from lanevoice import parsing
 from lanevoice.conversation import CarrierSalesAgent
 from lanevoice.db import Database, Repository
 from lanevoice.logging_config import get_logger, setup_logging
@@ -80,10 +88,29 @@ def prewarm(proc):
     db = Database(_settings.db_path)
     db.init(seed=True)
     proc.userdata["repo"] = Repository(db)
-    proc.userdata["vad"] = silero.VAD.load()
-    proc.userdata["stt"] = lk_groq.STT(model=_settings.stt_model)
+    # VAD tuned to ignore background noise: require clearer, slightly longer
+    # speech before it counts as a turn (defaults are 0.5 / 0.05s — too twitchy
+    # for a noisy phone line).
+    proc.userdata["vad"] = silero.VAD.load(
+        activation_threshold=0.6,
+        min_speech_duration=0.2,
+    )
+    proc.userdata["stt"] = lk_groq.STT(
+        model=_settings.stt_model,
+        prompt=_settings.stt_prompt,   # bias Whisper toward freight vocabulary
+    )
     proc.userdata["tts"] = GroqTTSPlugin()
     proc.userdata["phraser"] = GroqPhraser(_settings) if _settings.use_llm else None
+
+    # Background-noise / echo removal tuned for 8 kHz phone audio. Optional:
+    # if the native lib isn't available on this host, carry on without it.
+    proc.userdata["noise_cancellation"] = None
+    try:
+        from livekit.plugins import noise_cancellation
+        proc.userdata["noise_cancellation"] = noise_cancellation.BVCTelephony()
+        logger.info("noise cancellation: BVCTelephony enabled")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("noise cancellation unavailable (%s); continuing without", e)
 
 
 class CarrierAgent(Agent):
@@ -97,11 +124,19 @@ class CarrierAgent(Agent):
         await self.session.say(greeting)
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
-        user_text = getattr(new_message, "text_content", None) or ""
+        user_text = (getattr(new_message, "text_content", None) or "").strip()
+        # Ignore empty fragments and Whisper silence-hallucinations ("Thank you.",
+        # "you", "so"…) so the agent waits for real speech instead of replying to a phantom.
+        if len(user_text) < 2 or parsing.is_probably_noise(user_text):
+            logger.debug("Ignoring noise/empty transcript: %r", user_text)
+            raise StopResponse()
         logger.info("CALLER said → %s", user_text)
         reply = await asyncio.to_thread(self.brain.handle, user_text)
         logger.info("AGENT reply → %s", reply)
-        await self.session.say(reply)
+        try:
+            await self.session.say(reply)
+        except RuntimeError as e:  # e.g. caller hung up mid-turn
+            logger.info("Could not speak (session closing): %s", e)
         raise StopResponse()   # we answered this turn ourselves; skip the LLM node
 
 
@@ -112,12 +147,16 @@ async def entrypoint(ctx: JobContext):
         vad=ud["vad"],
         stt=ud["stt"],
         tts=ud["tts"],
-        allow_interruptions=True,
+        allow_interruptions=_settings.allow_interruptions,
         min_endpointing_delay=_settings.min_endpointing_delay,
         max_endpointing_delay=_settings.max_endpointing_delay,
     )
+    nc = ud.get("noise_cancellation")
+    room_input = RoomInputOptions(noise_cancellation=nc) if nc else RoomInputOptions()
     await session.start(
-        agent=CarrierAgent(ud["repo"], ud.get("phraser")), room=ctx.room
+        agent=CarrierAgent(ud["repo"], ud.get("phraser")),
+        room=ctx.room,
+        room_input_options=room_input,
     )
 
 

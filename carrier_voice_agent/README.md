@@ -71,7 +71,7 @@ via `.env`:
 |---|---|---|
 | STT model | `STT_MODEL` | `whisper-large-v3-turbo` |
 | LLM model | `LLM_MODEL` | `llama-3.1-8b-instant` |
-| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `playai-tts` / `Celeste-PlayAI` |
+| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `canopylabs/orpheus-v1-english` / `troy` |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
 | Turn buffer (s) | `MIN_ENDPOINTING_DELAY` | `0.8` |
 | Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `6` |

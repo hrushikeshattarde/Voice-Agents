@@ -79,6 +79,41 @@ def test_fraud_low_is_transferred(repo):
     assert a.summary()["outcome"] == "transferred"
 
 
+def test_unposted_load_is_not_offered(repo):
+    a = _agent(repo)
+    a.greeting()
+    reply = a.handle("L1005")               # seeded as is_posted=0
+    assert a.state.value == "identify_load"  # did NOT proceed to verification
+    assert "posted" in reply.lower()
+
+
+def test_not_approved_carrier_declined(repo):
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1001")
+    a.handle("MC 222333")                    # verified but not approved
+    assert a.summary()["outcome"] == "rejected"
+
+
+def test_load_requirements_accepted_leads_to_price(repo):
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1002")                        # L1002 has special requirements
+    a.handle("MC 123456")
+    assert a.state.value == "check_requirements"
+    a.handle("yeah, I can do that")
+    assert a.state.value == "state_price"
+
+
+def test_load_requirements_declined_no_deal(repo):
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1002")
+    a.handle("MC 123456")
+    a.handle("no, I can't run it that cold")
+    assert a.summary()["outcome"] == "no_deal"
+
+
 def test_carrier_asks_for_human(repo):
     a = _agent(repo)
     a.greeting()

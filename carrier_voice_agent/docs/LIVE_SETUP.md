@@ -112,8 +112,8 @@ Watch the terminal for the live transcript; the call is logged to `carrier_agent
 - [ ] Dial the number → agent answers
 
 ## If the call connects but the agent is silent / errors
-- **Silent / TTS error:** Groq's `playai-tts` needs a one-time terms acceptance in
-  the Groq console. Accept it, or set a different `GROQ_TTS_MODEL` in `.env`.
+- **Silent / TTS error:** the old `playai-tts` model was shut down 2025-12-31.
+  Use the default `canopylabs/orpheus-v1-english`, or set another `TTS_MODEL` in `.env`.
 - **Dead air / no answer:** the worker isn't picking up the room — confirm it's
   running and that the dispatch rule was created (`lk sip dispatch list`).
 - **`Missing required env vars`:** fill `.env` (LiveKit + `GROQ_API_KEY`).

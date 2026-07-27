@@ -46,6 +46,22 @@ def extract_mc_dot(text: str) -> tuple[str | None, str | None]:
     return "DOT", number
 
 
+# Words Whisper hallucinates on silence/noise (esp. "Thank you.", "you", "so").
+# A turn made up ENTIRELY of these, with no digits, is almost certainly a phantom.
+_NOISE_WORDS = {
+    "thank", "thanks", "you", "bye", "goodbye", "so", "please", "subscribe",
+    "for", "watching", "um", "uh", "ah", "mm", "hmm", "oh", "the", "a", "well",
+}
+
+
+def is_probably_noise(text: str) -> bool:
+    """True if the transcript looks like a Whisper silence-hallucination."""
+    if re.search(r"\d", text):          # any digit -> real content (load/MC/rate)
+        return False
+    words = re.findall(r"[a-z]+", text.lower())
+    return not words or all(w in _NOISE_WORDS for w in words)
+
+
 def extract_email(text: str) -> str | None:
     match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
     return match.group() if match else None

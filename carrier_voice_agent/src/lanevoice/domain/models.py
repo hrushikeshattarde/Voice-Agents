@@ -42,6 +42,7 @@ class Decision(str, Enum):
 class VerificationAction(str, Enum):
     PROCEED = "proceed"
     HUMAN_REVIEW = "human_review"
+    DECLINE = "decline"          # carrier not approved to work with us
 
 
 # --------------------------------------------------------------------------- #
@@ -60,10 +61,16 @@ class Load:
     fraud_low_rate: float   # suspiciously cheap -> fraud review
     assigned_rep_id: str | None
     status: LoadStatus
+    is_posted: bool = True   # only proceed with posted loads
+    notes: str | None = None  # special requirements to read to the carrier
 
     @property
     def is_open(self) -> bool:
         return self.status == LoadStatus.OPEN
+
+    @property
+    def is_bookable(self) -> bool:
+        return self.is_open and self.is_posted
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,7 @@ class Carrier:
     insurance_on_file: bool
     authority_reactivated_days: int | None = None
     last_verified_at: str | None = None
+    approved: bool = True   # approved to work with Circle Logistics
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,7 @@ class VerificationResult:
     action: VerificationAction
     carrier: Carrier | None = None
     high_risk: bool = False
+    approved: bool = True
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
     reason: str | None = None
 

@@ -21,6 +21,20 @@ def test_extract_money():
     assert parsing.extract_money("no price") is None
 
 
+def test_is_probably_noise():
+    # Whisper silence-hallucinations -> noise
+    assert parsing.is_probably_noise("Thank you.") is True
+    assert parsing.is_probably_noise("Thank you. Thank you.") is True
+    assert parsing.is_probably_noise("you") is True
+    assert parsing.is_probably_noise("So,") is True
+    assert parsing.is_probably_noise("") is True
+    # Real carrier input -> not noise
+    assert parsing.is_probably_noise("L1001") is False
+    assert parsing.is_probably_noise("MC 123456") is False
+    assert parsing.is_probably_noise("yes") is False
+    assert parsing.is_probably_noise("I need 2300") is False
+
+
 def test_extract_email_and_phone():
     assert parsing.extract_email("send it to dispatch@blue.com please") == "dispatch@blue.com"
     assert parsing.extract_email("no email here") is None

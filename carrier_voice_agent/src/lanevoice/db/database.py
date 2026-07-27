@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS loads (
     ceiling_rate    REAL NOT NULL,
     fraud_low_rate  REAL NOT NULL,
     assigned_rep_id TEXT,
-    status          TEXT NOT NULL DEFAULT 'open'
+    status          TEXT NOT NULL DEFAULT 'open',
+    is_posted       INTEGER NOT NULL DEFAULT 1,   -- only proceed if posted
+    notes           TEXT                          -- special requirements to read to the carrier
 );
 
 CREATE TABLE IF NOT EXISTS carriers (
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS carriers (
     authority_status           TEXT NOT NULL,
     insurance_on_file          INTEGER NOT NULL,
     authority_reactivated_days INTEGER,
-    last_verified_at           TEXT
+    last_verified_at           TEXT,
+    approved                   INTEGER NOT NULL DEFAULT 1   -- allowed to work with Circle Logistics
 );
 
 CREATE TABLE IF NOT EXISTS reps (
