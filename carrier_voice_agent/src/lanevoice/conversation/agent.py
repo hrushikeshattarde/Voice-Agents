@@ -62,6 +62,7 @@ class CallState(str, enum.Enum):
     STATE_PRICE = "state_price"
     NEGOTIATE = "negotiate"
     CONFIRM_BOOKING = "confirm_booking"   # rate agreed; confirm pickup + rate con
+    COLLECT_DETAILS = "collect_details"   # capture email + driver/truck for the con
     DONE = "done"
 
 
@@ -135,6 +136,7 @@ class CarrierSalesAgent:
             CallState.STATE_PRICE: self._negotiate,
             CallState.NEGOTIATE: self._negotiate,
             CallState.CONFIRM_BOOKING: self._confirm_booking,
+            CallState.COLLECT_DETAILS: self._collect_details,
             CallState.DONE: lambda _t: "This call has ended. Goodbye.",
         }.get(self.state, self._identify_load)
         return handler(user_text)
@@ -223,12 +225,15 @@ class CarrierSalesAgent:
         self.state = CallState.STATE_PRICE
         opening = int(self.neg.current_offer)
         self._repo.log_offer(self.call_id, 0, OfferParty.AGENT, opening)
+        lane = f"{self.load.origin.split(',')[0]} to {self.load.destination.split(',')[0]}"
         return self._say(
-            f"Perfect, you're all set, {self.carrier.legal_name}. I've got this one at "
-            f"${opening} — how's that sound?",
-            instruction=f"Tell the carrier they're verified, then float an opening offer of "
-            f"${opening} and ask if it works. Casual and confident.",
-            context=f"Carrier {self.carrier.legal_name}. Your opening offer is ${opening}.",
+            f"You're good to go, {self.carrier.legal_name}. Nice lane, {lane} — I've got "
+            f"this one at ${opening}. That work?",
+            instruction=f"Confirm the carrier is verified by their COMPANY NAME "
+            f"({self.carrier.legal_name}) — do NOT read back their MC/USDOT number. Add a "
+            f"quick bit of lane rapport ({lane}), float the opening offer of ${opening}, "
+            "and ask if it works.",
+            context=f"Carrier {self.carrier.legal_name}. Lane {lane}. Opening offer ${opening}.",
         )
 
     # -- Steps 4/5: negotiate ---------------------------------------------- #
@@ -345,17 +350,40 @@ class CarrierSalesAgent:
             )
             return self._transfer_and_say(reason="pickup_issue")
 
-        return self._finalize_booking()
+        # Pickup confirmed -> collect the info a rate con actually needs.
+        self.state = CallState.COLLECT_DETAILS
+        return self._say(
+            "Great. What's the best email for the rate con, and who's your driver and "
+            "truck number?",
+            instruction="Ask for the two things you need to send the rate con: the best "
+            "email to send it to, and the driver name + truck (or trailer) number. One "
+            "short sentence.",
+        )
 
-    def _finalize_booking(self) -> str:
+    def _collect_details(self, text: str) -> str:
+        email = parsing.extract_email(text)
+        phone = parsing.extract_phone(text)
+        self._repo.log_note(
+            self.call_id,
+            f"Booking details for {self.load.load_id} @ ${int(self._agreed_rate)} — "
+            f"email: {email or 'not given'}; contact: {phone or 'not given'}; "
+            f"raw: \"{text.strip()}\"",
+        )
+        return self._finalize_booking(details_ok=bool(email or phone))
+
+    def _finalize_booking(self, details_ok: bool = True) -> str:
         rate = int(self._agreed_rate)
         self._repo.book_load(self.load.load_id)
         self._finish(CallOutcome.BOOKED)
+        chase = "" if details_ok else " Shoot me the email and driver info when you can. "
         return self._say(
-            f"You're locked in on {self.load.load_id} at ${rate} — rate con's on its way, "
-            "get that signed and you're all set. Thanks, drive safe.",
-            instruction=f"Confirm they're booked on {self.load.load_id} at ${rate}, remind "
-            "them to sign the rate con you're sending, and close warmly and briefly.",
+            f"You're locked in on {self.load.load_id} at ${rate} — rate con's headed your "
+            f"way, sign it and you're set.{chase} Thanks, drive safe.",
+            instruction=f"Confirm they're booked on {self.load.load_id} at ${rate} and "
+            "remind them to sign the rate con. "
+            + ("" if details_ok else "Also ask them to send over the email and driver "
+               "info you still need. ")
+            + "Close warmly and briefly.",
         )
 
     # -- Step 6b: transfer -------------------------------------------------- #

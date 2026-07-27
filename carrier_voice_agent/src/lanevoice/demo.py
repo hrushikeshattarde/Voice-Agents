@@ -71,10 +71,11 @@ def main() -> None:
 
     _scripted("Carrier takes the opening offer (+ operational close)", [
         "about L1001", "MC 123456", "yeah that works", "yep, I can cover it",
+        "dispatch@blue.com, driver Mike 555-123-4567",
     ])
     _scripted("Carrier holds high; agent splits the difference, then books", [
         "L1001", "MC 123456", "I need 2300", "2300", "2300", "2300",
-        "yep can make the pickup",
+        "yep can make the pickup", "bill@rr.com, driver Sam 555-999-0000",
     ])
     _scripted("High ask -> hold firm -> concede -> walk away with a note", [
         "load 1003", "MC654321", "I need 1500", "no way 1500",

@@ -16,7 +16,9 @@ def test_happy_path_books_at_opening(repo):
     a.handle("MC 123456")
     a.handle("yeah that works")        # agree on rate -> confirm step
     assert a.state.value == "confirm_booking"
-    a.handle("yep, I can cover it")    # confirm pickup -> finalize
+    a.handle("yep, I can cover it")    # confirm pickup -> collect details
+    assert a.state.value == "collect_details"
+    a.handle("dispatch@blue.com, driver Mike 555-123-4567")   # -> finalize
     assert a.summary()["outcome"] == "booked"
     assert repo.get_load("L1001").status.value == "covered"
 
@@ -29,7 +31,8 @@ def test_walk_up_then_book(repo):
     a.handle("I need 2080")     # high ask -> hold firm
     a.handle("2050")            # we split the difference and counter
     a.handle("deal")            # accept the offer on the table -> confirm step
-    a.handle("yep can cover it")  # confirm pickup -> finalize
+    a.handle("yep can cover it")  # confirm pickup -> collect details
+    a.handle("bill@carrier.com, driver Sam 555-999-0000")  # -> finalize
     assert a.summary()["outcome"] == "booked"
 
 

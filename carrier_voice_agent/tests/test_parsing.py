@@ -19,3 +19,11 @@ def test_extract_money():
     assert parsing.extract_money("2050 dollars") == 2050
     assert parsing.extract_money("2.1k") == 2100
     assert parsing.extract_money("no price") is None
+
+
+def test_extract_email_and_phone():
+    assert parsing.extract_email("send it to dispatch@blue.com please") == "dispatch@blue.com"
+    assert parsing.extract_email("no email here") is None
+    assert parsing.extract_phone("driver Mike 555-123-4567") == "555-123-4567"
+    assert parsing.extract_phone("call (555) 123 4567") == "(555) 123 4567"
+    assert parsing.extract_phone("no number") is None

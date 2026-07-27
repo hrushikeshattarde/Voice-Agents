@@ -46,6 +46,19 @@ def extract_mc_dot(text: str) -> tuple[str | None, str | None]:
     return "DOT", number
 
 
+def extract_email(text: str) -> str | None:
+    match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+    return match.group() if match else None
+
+
+def extract_phone(text: str) -> str | None:
+    """A 10-digit US phone (kept separate from 6-digit MC / 4-digit rates)."""
+    match = re.search(
+        r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", text
+    )
+    return match.group().strip() if match else None
+
+
 def extract_money(text: str) -> float | None:
     """Extract a dollar amount: '$2,100', '2100', '2.1k'."""
     lowered = text.lower().replace(",", "")
