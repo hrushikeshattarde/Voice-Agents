@@ -69,17 +69,30 @@ def main() -> None:
         _interactive()
         return
 
+    # The address they give is already on Blue Sky's file -> matched, used as is.
     _scripted("Carrier takes the opening offer (+ operational close)", [
         "about L1001", "MC 123456", "yeah that works", "yep, I can cover it",
-        "dispatch@blue.com, driver Mike 555-123-4567",
+        "billing at blue sky logistics dot com",
     ])
-    _scripted("Carrier holds high; agent splits the difference, then books", [
-        "L1001", "MC 123456", "I need 2300", "2300", "2300", "2300",
-        "yep can make the pickup", "bill@rr.com, driver Sam 555-999-0000",
+    # An address we've never seen -> used AND appended to the carrier's file.
+    _scripted("Carrier gives a new email -> added to their file", [
+        "L1003", "MC654321", "that works", "yep can cover it",
+        "send it to newdesk at roadrunner freight dot com",
     ])
-    _scripted("High ask -> hold firm -> concede -> walk away with a note", [
+    # Reciprocity then the close: the agent holds while the carrier stonewalls,
+    # trades halves once they start moving, splits the last gap, and books it.
+    _scripted("Carrier grinds down from a high ask -> agent closes the deal", [
+        "L1001", "MC 123456", "I need 2500", "still 2500", "2400", "still 2400",
+        "2300", "2200", "2200, that's it", "yep, I can cover it",
+        "just use the one you have on file",
+    ])
+    # Inside Max Buy but above what the bot spends on its own -> a human closes it.
+    _scripted("Carrier immovable above the agent's authority -> handed to a rep", [
+        "L1001", "MC 123456", "2400", "still 2400", "2400 or I'm gone", "2400",
+    ])
+    _scripted("Ask above Max Buy -> hold firm -> best and final -> walk away with a note", [
         "load 1003", "MC654321", "I need 1500", "no way 1500",
-        "come on 1500", "1500 or nothing",
+        "come on 1500", "still 1500", "1500 or nothing",
     ], max_rounds=4)
     _scripted("Suspiciously cheap -> fraud review", [
         "L1001", "MC123456", "I'll haul it for 900",
@@ -95,7 +108,7 @@ def main() -> None:
     ])
     _scripted("Load has requirements -> carrier can do it -> books", [
         "L1002", "MC 123456", "yeah I can run it that cold",
-        "that works", "yep can make the 8 AM", "ops@blue.com, driver Lee 555-222-3333",
+        "that works", "yep can make the 8 AM", "just use the one you have on file",
     ])
     _scripted("Load has requirements -> carrier can't -> no booking", [
         "L1002", "MC 123456", "no, I can't run it that cold",

@@ -62,9 +62,37 @@ def is_probably_noise(text: str) -> bool:
     return not words or all(w in _NOISE_WORDS for w in words)
 
 
+_TLDS = "com|net|org|io|co|us|biz|info|trucking|transport"
+
+
+def _spoken_email(text: str) -> str | None:
+    """Recover an address a human SAID rather than typed.
+
+    Speech-to-text hands us "dispatch at blueskylogistics dot com" — or worse,
+    "dispatch at blue sky logistics dot com" with the domain split into words.
+    Only attempted when both an 'at' and a 'dot' are present, so ordinary
+    sentences don't get mangled into addresses.
+    """
+    low = f" {text.lower().strip()} "
+    if not re.search(r"\bdot\b", low) or not re.search(r"\bat\b", low):
+        return None
+    low = re.sub(r"\b(?:underscore|under score)\b", "_", low)
+    low = re.sub(r"\b(?:dash|hyphen|minus)\b", "-", low)
+    low = re.sub(r"\b(?:dot|period|point)\b", ".", low)
+    low = re.sub(r"\bat\b", "@", low)
+    low = re.sub(r"\s*([@._-])\s*", r"\1", low)       # tighten around separators
+    # The domain may still be spoken as separate words — allow spaces up to the TLD.
+    match = re.search(rf"([\w.+-]+)@([\w\s-]+?\.(?:{_TLDS}))\b", low)
+    if not match:
+        return None
+    return f"{match.group(1)}@{match.group(2)}".replace(" ", "")
+
+
 def extract_email(text: str) -> str | None:
     match = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
-    return match.group() if match else None
+    if match:
+        return match.group().rstrip(".")
+    return _spoken_email(text)
 
 
 def extract_phone(text: str) -> str | None:

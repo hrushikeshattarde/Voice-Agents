@@ -38,6 +38,17 @@ CREATE TABLE IF NOT EXISTS carriers (
     approved                   INTEGER NOT NULL DEFAULT 1   -- allowed to work with Circle Logistics
 );
 
+-- Every address we know for a carrier. A carrier can have several (dispatch,
+-- billing, a second office), so this is one-to-many: whatever a caller gives us
+-- on a booking gets checked against it and added if it's new.
+CREATE TABLE IF NOT EXISTS carrier_emails (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    usdot_number TEXT NOT NULL,
+    email        TEXT NOT NULL,          -- stored lowercase
+    added_at     TEXT,
+    UNIQUE (usdot_number, email)
+);
+
 CREATE TABLE IF NOT EXISTS reps (
     rep_id    TEXT PRIMARY KEY,
     name      TEXT NOT NULL,
@@ -97,12 +108,35 @@ class Database:
         conn = self.connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
         finally:
             conn.close()
         if seed:
             from lanevoice.db.seed import seed_if_empty
             seed_if_empty(self)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring an existing database up to the current shape.
+
+        CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
+        anything added after a database was created has to be patched in here.
+        """
+        columns = {r["name"] for r in
+                   conn.execute("PRAGMA table_info(carriers)").fetchall()}
+        # `carriers.contact_email` held a single address before carrier_emails
+        # existed. Fold those into the new table so nothing is lost, then drop
+        # it — a stale duplicate of the truth is worse than no column.
+        if "contact_email" in columns:
+            conn.execute(
+                """INSERT OR IGNORE INTO carrier_emails (usdot_number, email, added_at)
+                   SELECT usdot_number, LOWER(contact_email), datetime('now')
+                     FROM carriers WHERE contact_email IS NOT NULL""")
+            try:
+                conn.execute("ALTER TABLE carriers DROP COLUMN contact_email")
+            except sqlite3.OperationalError:
+                pass    # SQLite < 3.35: leave it, the reads ignore it anyway
 
     def reset(self, seed: bool = True) -> None:
         """Drop the file and recreate — handy for tests and repeatable demos."""

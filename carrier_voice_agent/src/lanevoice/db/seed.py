@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from lanevoice.db.database import Database
 
-# load_id, origin, dest, pickup, equipment, weight, open, ceiling, fraud_low,
+# load_id, origin, dest, pickup, equipment, weight,
+#   open(=Load Board Rate/floor), ceiling(=Max Buy/cap), fraud_low,
 #   rep, status, is_posted, notes
 _LOADS = [
     ("L1001", "Chicago, IL", "Dallas, TX", "2026-07-25", "Dry Van", 42000,
@@ -38,6 +39,23 @@ _CARRIERS = [
     ("DOT5000005", "MC222333", "Banned Freight Co", "active", 1, None, None, 0),
 ]
 
+# Addresses already known for each carrier — every carrier has several, the way
+# a real one does (dispatch, billing, an after-hours desk). Whatever a caller
+# gives on a booking is checked against these and appended if it's new.
+_CARRIER_EMAILS = [
+    ("DOT1000001", "dispatch@blueskylogistics.com"),
+    ("DOT1000001", "billing@blueskylogistics.com"),
+    ("DOT1000001", "afterhours@blueskylogistics.com"),
+    ("DOT2000002", "ops@roadrunnerfreight.com"),
+    ("DOT2000002", "dispatch@roadrunnerfreight.com"),
+    ("DOT3000003", "dispatch@ghostcarrier.com"),
+    ("DOT3000003", "accounts@ghostcarrier.com"),
+    ("DOT4000004", "dispatch@reactivatedhaulers.com"),
+    ("DOT4000004", "safety@reactivatedhaulers.com"),
+    ("DOT5000005", "dispatch@bannedfreightco.com"),
+    ("DOT5000005", "billing@bannedfreightco.com"),
+]
+
 # rep_id, name, phone, available
 _REPS = [
     ("R01", "Sarah Chen", "+15551110101", 1),
@@ -47,13 +65,27 @@ _REPS = [
 
 
 def seed_if_empty(db: Database) -> None:
+    """Fill in anything missing. Every insert is OR IGNORE, so a database that's
+    already half-populated (an older one being migrated, say) tops up instead of
+    tripping over a unique constraint — and existing rows are never clobbered."""
     conn = db.connect()
     try:
         if conn.execute("SELECT COUNT(*) FROM loads").fetchone()[0] > 0:
             return
-        conn.executemany("INSERT INTO loads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", _LOADS)
-        conn.executemany("INSERT INTO carriers VALUES (?,?,?,?,?,?,?,?)", _CARRIERS)
-        conn.executemany("INSERT INTO reps VALUES (?,?,?,?)", _REPS)
+        conn.executemany(
+            "INSERT OR IGNORE INTO loads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", _LOADS)
+        conn.executemany(
+            "INSERT OR IGNORE INTO carriers (usdot_number, mc_number, legal_name, "
+            "authority_status, insurance_on_file, authority_reactivated_days, "
+            "last_verified_at, approved) VALUES (?,?,?,?,?,?,?,?)",
+            _CARRIERS,
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO carrier_emails (usdot_number, email, added_at)"
+            " VALUES (?,?,datetime('now'))",
+            _CARRIER_EMAILS,
+        )
+        conn.executemany("INSERT OR IGNORE INTO reps VALUES (?,?,?,?)", _REPS)
         conn.commit()
     finally:
         conn.close()

@@ -74,7 +74,14 @@ via `.env`:
 | TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `canopylabs/orpheus-v1-english` / `troy` |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
 | Turn buffer (s) | `MIN_ENDPOINTING_DELAY` | `0.8` |
-| Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `6` |
+| Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `8` |
+| Reserve below Max Buy | `NEGOTIATION_BUFFER` | `0` (may reach Max Buy) |
+| Share of their move we return | `NEGOTIATION_RECIPROCITY` | `0.5` (lower = firmer) |
+| Agent's own authority | `NEGOTIATION_DISCRETION_RATE` | `0.6` of floor→Max Buy |
+| Gap not worth haggling | `NEGOTIATION_SETTLE_GAP_RATE` | `0.10` |
+| Gap that triggers the split close | `NEGOTIATION_SPLIT_GAP_RATE` | `0.30` |
+| Best-and-final if they never moved | `NEGOTIATION_STONEWALL_FINAL_RATE` | `0.5` |
+| Pushes before best-and-final | `NEGOTIATION_MAX_HOLDS` | `2` |
 
 Change a model = change one line (or one env var). Nothing else hard-codes it.
 

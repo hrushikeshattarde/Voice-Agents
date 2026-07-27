@@ -28,40 +28,78 @@ and follow one script per call. Watch the terminal — you'll see
 
 ---
 
-> **Booking is a two-step close.** Once you agree on a rate, the agent confirms
-> the pickup and says it's sending a rate con — reply **"yep, I can cover it"** to
-> finalize. If you say you *can't* make the pickup, it hands you to a rep instead.
+> **Booking is a three-step close.** Agree on a rate → the agent confirms the
+> pickup → **you** give the email for the rate con, then it locks it in. If you
+> say you *can't* make the pickup, it hands you to a rep instead.
 
 ## Scenario 1 — Happy path: accept the opening offer
-**Purpose:** confirm the whole flow works end to end.
+**Purpose:** confirm the whole flow works end to end, including the email check.
 
 | You say | Agent should |
 |---|---|
 | "I'm calling about load **L one zero zero one**." | Confirm *Chicago to Dallas, Dry Van*, ask for MC/USDOT |
 | "My MC is **one two three four five six**." | "You're all set, Blue Sky Logistics. I've got this at **$2000** — how's that sound?" |
-| "**Yes, that works.**" | Confirms rate, asks if you can cover the pickup + says it's sending the rate con |
-| "**Yep, I can cover it.**" | "You're locked in on L1001 at **$2000** — rate con's on its way…" |
+| "**Yes, that works.**" | Confirms rate, asks if you can cover the pickup |
+| "**Yep, I can cover it.**" | Asks the question outright — "what email should I send the rate con to?" — and suggests *nothing* |
+| "**Billing at blue sky logistics dot com.**" | Checks it against the carrier's file, then: "You're locked in on L1001 at **$2000**. I'm sending the rate con link to billing@blueskylogistics.com…" |
 
-**Expected outcome:** `booked` at $2000.
+**Expected outcome:** `booked` at $2000, rate con addressed to the email *you*
+gave. The agent asks about the email only — no driver or truck questions.
+
+### How the email is handled
+
+Every carrier has **several** addresses on file (dispatch, billing, after-hours).
+Whatever you say is checked against that list:
+
+* **An address already on file** → matched, used, nothing changes.
+* **A new address** ("booking **at** blue sky freight **dot** com") → used *and
+  appended* to the carrier's file, alongside the ones already there. The next
+  call already knows it. Spoken form is parsed, so you never have to spell it.
+* **"Just use the one you've got"** → it takes the most recent address on file
+  rather than stalling.
+* **No usable address after two tries** → it books the load but records
+  `NOT CAPTURED — needs follow-up before sending`, and drops the "sign it"
+  line entirely. It never invents an address.
+
+Inspect the file at any point with:
+
+```bash
+sqlite3 carrier_agent.db "SELECT usdot_number, email FROM carrier_emails ORDER BY usdot_number, id"
+```
 
 ---
 
-## Scenario 2 — Negotiate: hold firm, then split the difference
-**Purpose:** see the human hold-then-meet-in-the-middle behavior (it does NOT
-just cave to your exact number).
+## Scenario 2 — Negotiate: hold firm, make the carrier come down, then close
+**Purpose:** the agent anchors LOW and never bids against itself. It only moves
+when *you* move, gives back half of what you give, and then closes the deal
+instead of nickel-and-diming it to death.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." | Confirm lane, ask MC |
-| "MC **one two three four five six**." | Offer **$2000** |
-| "I need **twenty-three hundred**." | **Hold:** "$2300's a reach — I'm working with $2000, get closer?" |
-| "**Twenty-three hundred.**" | **Split:** comes up to **~$2150** |
-| "**Still twenty-three hundred.**" | **Split:** comes up to **~$2225** |
-| "**Twenty-three hundred.**" | Meets your number → confirms pickup + rate con |
-| "**Yep, I can make it.**" | Books at **$2300** |
+| "Load **L one zero zero one**." (then MC) | Verify, reveal the load, offer **$2000** |
+| "I need **twenty-five hundred**." | **Hold + discovery:** "$2500's a reach — I'm at $2000. What's got you up there, deadheading in? How close can you get to $2000?" |
+| "**Still twenty-five hundred.**" (no movement) | **Holds again and sells the load,** not the rate: steady freight on the lane, quick loading, same-day paperwork — offers *nothing* new |
+| "**Twenty-four hundred.**" (you come down $100) | Reciprocates with **half** of your move → **$2050** |
+| "**Still twenty-four hundred.**" | **Calls out the imbalance:** "I came up from $2000 to $2050 and you haven't moved" |
+| "**Twenty-three hundred.**" | Another half-step → **$2100** |
+| "**Twenty-two hundred.**" (gap now $100) | **Split close:** "Let's not go back and forth — meet me at **$2150** and I'll book you right now" |
+| "**Twenty-two hundred, final.**" | Takes it: **books at $2200** → confirms pickup + rate con |
 
-**Expected outcome:** `booked` at $2300 (at/under the hidden $2350 cap).
-If you ask *above* $2350 and hold, it makes its best offer, then declines with a note.
+**Expected outcome:** `booked` at **$2200**, under the hidden $2500 Max Buy.
+Things to watch for:
+
+* Repeating the same number earns you nothing — movement is what buys movement.
+* The agent never walks away from a rate it's cleared to pay.
+* Sit immovably on **$2400** (inside Max Buy, above the agent's own $2300
+  authority) and it does *not* cave and does *not* refuse — it hands you to a
+  human rep: "that's above what I can approve on my own, but it's not a no."
+* Sit on **$2800** (above Max Buy) and after a best-and-final it declines with a
+  note, leaving the door open for next time.
+
+Tune firmness with `NEGOTIATION_RECIPROCITY` (how much of your move it returns),
+`NEGOTIATION_DISCRETION_RATE` (how far it commits without a human),
+`NEGOTIATION_SPLIT_GAP_RATE` / `NEGOTIATION_SETTLE_GAP_RATE` (how eagerly it
+closes), and `NEGOTIATION_MAX_HOLDS`.
 
 ---
 

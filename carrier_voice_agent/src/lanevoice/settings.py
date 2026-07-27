@@ -53,8 +53,40 @@ class Settings(BaseSettings):
     max_endpointing_delay: float = Field(default=8.0, validation_alias="MAX_ENDPOINTING_DELAY")
 
     # --- Negotiation policy ------------------------------------------------- #
-    max_negotiation_rounds: int = Field(default=6, validation_alias="MAX_NEGOTIATION_ROUNDS")
-    negotiation_buffer: float = Field(default=150.0, validation_alias="NEGOTIATION_BUFFER")
+    # open_rate = Load Board Rate (floor); ceiling_rate = Max Buy (hard cap).
+    max_negotiation_rounds: int = Field(default=8, validation_alias="MAX_NEGOTIATION_ROUNDS")
+    # Reserve held BELOW the Max Buy. 0 = the agent may go all the way to Max Buy
+    # (never above). Set > 0 to keep some room back for a human.
+    negotiation_buffer: float = Field(default=0.0, validation_alias="NEGOTIATION_BUFFER")
+    # Share of the carrier's OWN concession that the agent gives back. 0.5 = they
+    # come down $200, we go up $100. Lower = firmer, slower to close.
+    negotiation_reciprocity: float = Field(
+        default=0.5, validation_alias="NEGOTIATION_RECIPROCITY"
+    )
+    # How far up the floor->Max Buy span the agent may commit ON ITS OWN. Above
+    # this (but still within Max Buy) the call goes to a human instead — the bot
+    # doesn't spend the top of the range unsupervised. 1.0 = full authority.
+    negotiation_discretion_rate: float = Field(
+        default=0.6, validation_alias="NEGOTIATION_DISCRETION_RATE"
+    )
+    # Gap (as a share of the span) not worth haggling over — just book it.
+    negotiation_settle_gap_rate: float = Field(
+        default=0.10, validation_alias="NEGOTIATION_SETTLE_GAP_RATE"
+    )
+    # Gap (as a share of the span) close enough to play the split-the-difference
+    # close instead of trading nickels.
+    negotiation_split_gap_rate: float = Field(
+        default=0.30, validation_alias="NEGOTIATION_SPLIT_GAP_RATE"
+    )
+    # How much of the remaining room a carrier who has NEVER moved gets in the
+    # best-and-final. Stonewalling must not pay better than negotiating.
+    negotiation_stonewall_final_rate: float = Field(
+        default=0.5, validation_alias="NEGOTIATION_STONEWALL_FINAL_RATE"
+    )
+    # How many times the agent restates its number and asks the carrier to come
+    # down before it puts its best-and-final on the table. The agent only ever
+    # raises its offer in response to the carrier actually moving down.
+    negotiation_max_holds: int = Field(default=2, validation_alias="NEGOTIATION_MAX_HOLDS")
 
     # --- Storage ------------------------------------------------------------ #
     db_path: str = Field(default="carrier_agent.db", validation_alias="DB_PATH")

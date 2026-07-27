@@ -36,6 +36,7 @@ class Decision(str, Enum):
     HOLD = "hold"
     COUNTER = "counter"
     REVIEW = "review"
+    ESCALATE = "escalate"    # within Max Buy but above the agent's own authority
     NO_DEAL = "no_deal"
 
 
@@ -56,8 +57,8 @@ class Load:
     pickup_date: str
     equipment: str
     weight_lbs: int
-    open_rate: float        # advertised/opening (low) offer the agent states
-    ceiling_rate: float     # absolute max we will ever pay
+    open_rate: float        # Load Board Rate — the floor the agent opens/anchors at
+    ceiling_rate: float     # Max Buy — the hard cap; the agent never goes above it
     fraud_low_rate: float   # suspiciously cheap -> fraud review
     assigned_rep_id: str | None
     status: LoadStatus
@@ -83,6 +84,13 @@ class Carrier:
     authority_reactivated_days: int | None = None
     last_verified_at: str | None = None
     approved: bool = True   # approved to work with Circle Logistics
+    # Every address we know for them, newest last. A caller's address is checked
+    # against these and appended if new — carriers legitimately have several.
+    contact_emails: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def latest_email(self) -> str | None:
+        return self.contact_emails[-1] if self.contact_emails else None
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,8 @@ class NegotiationResult:
     final_offer: float | None = None
     within_ceiling: bool | None = None
     is_final: bool = False   # this counter is the agent's best/last offer
+    is_split: bool = False   # this counter is a meet-in-the-middle close
+    hold_number: int = 0     # 1 = first push-back; 2+ = carrier still hasn't moved
 
 
 @dataclass(frozen=True)

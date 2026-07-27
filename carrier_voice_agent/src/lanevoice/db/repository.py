@@ -55,7 +55,7 @@ class Repository:
         )
 
     @staticmethod
-    def _carrier(row: sqlite3.Row) -> Carrier:
+    def _carrier(row: sqlite3.Row, emails: tuple[str, ...] = ()) -> Carrier:
         return Carrier(
             usdot_number=row["usdot_number"],
             mc_number=row["mc_number"],
@@ -65,6 +65,7 @@ class Repository:
             authority_reactivated_days=row["authority_reactivated_days"],
             last_verified_at=row["last_verified_at"],
             approved=bool(row["approved"]),
+            contact_emails=emails,
         )
 
     @staticmethod
@@ -108,9 +109,31 @@ class Repository:
                       OR REPLACE(REPLACE(usdot_number,'DOT',''),' ','')=?""",
                 (q, q),
             ).fetchone()
-            return self._carrier(row) if row else None
+            if not row:
+                return None
+            emails = self._emails(conn, row["usdot_number"])
+            return self._carrier(row, emails)
         finally:
             conn.close()
+
+    @staticmethod
+    def _emails(conn: sqlite3.Connection, usdot_number: str) -> tuple[str, ...]:
+        rows = conn.execute(
+            "SELECT email FROM carrier_emails WHERE usdot_number=? ORDER BY id",
+            (usdot_number,),
+        ).fetchall()
+        return tuple(r["email"] for r in rows)
+
+    def carrier_emails(self, usdot_number: str) -> tuple[str, ...]:
+        """Every address on file for this carrier, oldest first."""
+        conn = self._db.connect()
+        try:
+            return self._emails(conn, usdot_number)
+        finally:
+            conn.close()
+
+    def email_on_file(self, usdot_number: str, email: str) -> bool:
+        return email.strip().lower() in self.carrier_emails(usdot_number)
 
     def get_rep(self, rep_id: str) -> Rep | None:
         conn = self._db.connect()
@@ -169,6 +192,22 @@ class Repository:
 
     def book_load(self, load_id: str) -> None:
         self._execute("UPDATE loads SET status='covered' WHERE load_id=?", (load_id,))
+
+    def add_carrier_email(self, usdot_number: str, email: str) -> bool:
+        """Append an address to the carrier's file. Returns True if it's new.
+
+        Existing addresses are kept — a carrier can have dispatch, billing and a
+        second office, so this accumulates rather than overwrites.
+        """
+        normalized = email.strip().lower()
+        if self.email_on_file(usdot_number, normalized):
+            return False
+        self._execute(
+            "INSERT OR IGNORE INTO carrier_emails (usdot_number, email, added_at)"
+            " VALUES (?,?,?)",
+            (usdot_number, normalized, _now()),
+        )
+        return True
 
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
                  outcome: str, transcript: list | str) -> None:
