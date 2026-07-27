@@ -24,9 +24,8 @@ def test_walk_up_then_book(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC 123456")
-    a.handle("I need 2080")     # hold
-    a.handle("come on 2060")    # counter to 2025
-    a.handle("ok deal")         # book at 2025
+    a.handle("I need 2080")     # high ask -> hold firm at 2000
+    a.handle("come on 2060")    # we concede toward the cap; 2060 is within it -> book
     assert a.summary()["outcome"] == "booked"
 
 

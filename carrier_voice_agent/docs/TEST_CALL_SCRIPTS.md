@@ -41,18 +41,21 @@ and follow one script per call. Watch the terminal — you'll see
 
 ---
 
-## Scenario 2 — Negotiate: agent holds, then walks up, you accept
-**Purpose:** see the hold-then-increment behavior.
+## Scenario 2 — Negotiate: agent holds firm, then makes real concessions
+**Purpose:** see the human hold-then-concede behavior (bigger, decreasing moves
+that converge toward the cap, not tiny fixed steps).
 
 | You say | Agent should |
 |---|---|
 | "Load **L one zero zero one**." | Confirm lane, ask MC |
 | "MC **one two three four five six**." | Offer **$2000** |
-| "I need **twenty-one hundred**." | **Hold:** "Sorry, I can't do $2100. I've got it at $2000. Can you work with that?" |
-| "Come on, **twenty-one hundred**." | **Walk up:** "I can come up to **$2025**…" |
-| "**Okay, deal.**" | Books at **$2025** |
+| "I need **twenty-three hundred**." | **Hold:** pushes back, reacts to $2300, stays at $2000 |
+| "**Twenty-three hundred.**" | **Concede:** comes up to **~$2175** |
+| "**Still twenty-three hundred.**" | **Concede:** comes up to **~$2280** |
+| "**Twenty-three hundred.**" | **Books at $2300** (now within its cap) |
 
-**Expected outcome:** `booked` around $2025.
+**Expected outcome:** `booked` at $2300 (a rate at/under the hidden $2350 cap).
+If you ask *above* $2350 and hold, it makes its best offer, then declines with a note.
 
 ---
 

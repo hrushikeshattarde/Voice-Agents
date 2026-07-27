@@ -105,6 +105,7 @@ class NegotiationResult:
     reason: str | None = None
     final_offer: float | None = None
     within_ceiling: bool | None = None
+    is_final: bool = False   # this counter is the agent's best/last offer
 
 
 @dataclass(frozen=True)

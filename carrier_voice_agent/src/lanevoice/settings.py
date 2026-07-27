@@ -42,8 +42,6 @@ class Settings(BaseSettings):
     # --- Negotiation policy ------------------------------------------------- #
     max_negotiation_rounds: int = Field(default=6, validation_alias="MAX_NEGOTIATION_ROUNDS")
     negotiation_buffer: float = Field(default=150.0, validation_alias="NEGOTIATION_BUFFER")
-    negotiation_step_small: int = Field(default=25, validation_alias="NEGOTIATION_STEP_SMALL")
-    negotiation_step_big: int = Field(default=30, validation_alias="NEGOTIATION_STEP_BIG")
 
     # --- Storage ------------------------------------------------------------ #
     db_path: str = Field(default="carrier_agent.db", validation_alias="DB_PATH")

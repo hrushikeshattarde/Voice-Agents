@@ -30,19 +30,23 @@ from lanevoice.services import (
 from lanevoice.settings import Settings, get_settings
 from lanevoice.voice.phraser import Phraser
 
-CONSENT_LINE = (
-    "Thanks for calling the load desk. Just so you know, this call may be "
-    "recorded for quality purposes. "
-)
+# The agent's persona — used in greetings and passed to the phrasing LLM so the
+# whole call sounds like one consistent human rep.
+REP_NAME = "Alex"
 
 _ACCEPT_WORDS = (
     "that works", "that'll work", "works for me", "deal", "i'll take it",
     "sounds good", "book it", "agreed", "accept", "perfect", "yes", "yeah",
-    "yep", "yup", "ok", "okay", "sure", "fine",
+    "yep", "yup", "ok", "okay", "sure", "fine", "let's do it", "you got it",
 )
 _HUMAN_WORDS = (
-    "talk to a human", "speak to someone", "rep", "representative", "person",
-    "agent please",
+    "talk to a human", "speak to someone", "representative", "a rep",
+    "real person", "agent please",
+)
+# Rejections with no new number — the carrier is holding, so we make our next move.
+_REJECT_WORDS = (
+    "no", "nope", "nah", "can't", "cannot", "too low", "not enough",
+    "come on", "forget it", "pass", "higher", "more than that", "no way",
 )
 
 
@@ -75,17 +79,27 @@ class CarrierSalesAgent:
         self.load = None
         self.carrier = None
         self.neg: NegotiationEngine | None = None
+        self._last_ask: float | None = None
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
         repo.start_call(self.call_id)
 
     # -- phrasing helpers --------------------------------------------------- #
+    def _recent_dialogue(self, n: int = 4) -> str:
+        speaker = {"agent": f"You ({REP_NAME})", "carrier": "Carrier"}
+        return "\n".join(
+            f"{speaker.get(who, who)}: {line}" for who, line in self.transcript[-n:]
+        )
+
     def _say(self, fallback: str, instruction: str | None = None,
              context: str = "") -> str:
         text = fallback
         if self._phraser is not None and instruction is not None:
+            convo = self._recent_dialogue()
+            full_context = f"Recent conversation:\n{convo}\n\n{context}".strip() \
+                if convo else context
             try:
-                text = self._phraser.phrase(instruction, context)
+                text = self._phraser.phrase(instruction, full_context)
             except Exception:  # noqa: BLE001 - phrasing must never break a call
                 text = fallback
         self.transcript.append(("agent", text))
@@ -98,11 +112,12 @@ class CarrierSalesAgent:
     def greeting(self) -> str:
         self.state = CallState.IDENTIFY_LOAD
         return self._say(
-            CONSENT_LINE + "Which load are you calling about? "
-            "You can give me the load ID or the lane.",
-            instruction="Greet a carrier calling about a freight load. Include a "
-            "one-line call-recording disclosure, then ask which load they want "
-            "(load ID or lane). Be brief and professional.",
+            f"Thanks for calling the load desk, this is {REP_NAME} — heads up, the call "
+            "may be recorded for quality. What load can I get you on? You got a load ID "
+            "or a lane for me?",
+            instruction=f"You are {REP_NAME}, a carrier sales rep answering an inbound "
+            "call. Greet warmly and naturally, give a quick one-line 'call may be "
+            "recorded' note, then ask which load they're calling about (load ID or lane).",
         )
 
     def handle(self, user_text: str) -> str:
@@ -196,18 +211,16 @@ class CarrierSalesAgent:
             self.load,
             max_rounds=self._settings.max_negotiation_rounds,
             buffer=self._settings.negotiation_buffer,
-            step_small=self._settings.negotiation_step_small,
-            step_big=self._settings.negotiation_step_big,
         )
         self.state = CallState.STATE_PRICE
         opening = int(self.neg.current_offer)
         self._repo.log_offer(self.call_id, 0, OfferParty.AGENT, opening)
         return self._say(
-            f"You're verified, {self.carrier.legal_name}. "
-            f"I've got this one at ${opening}. Does that work for you?",
-            instruction=f"Confirm the carrier is verified, then OFFER them ${opening} "
-            "for the load and ask if it works. This is an opening offer.",
-            context=f"Carrier {self.carrier.legal_name}. Opening offer ${opening}.",
+            f"Perfect, you're all set, {self.carrier.legal_name}. I've got this one at "
+            f"${opening} — how's that sound?",
+            instruction=f"Tell the carrier they're verified, then float an opening offer of "
+            f"${opening} and ask if it works. Casual and confident.",
+            context=f"Carrier {self.carrier.legal_name}. Your opening offer is ${opening}.",
         )
 
     # -- Steps 4/5: negotiate ---------------------------------------------- #
@@ -215,51 +228,73 @@ class CarrierSalesAgent:
         lowered = text.lower()
         money = parsing.extract_money(text)
 
+        # Explicit "yes" with no number -> accept the offer on the table.
         if money is None and any(w in lowered for w in _ACCEPT_WORDS):
             return self._book(self.neg.current_offer)
         if any(w in lowered for w in _HUMAN_WORDS):
             return self._transfer_and_say(reason="carrier_request")
-        if money is None:
+
+        if money is not None:
+            self._last_ask = money
+            ask = money
+            self._repo.log_offer(
+                self.call_id, self.neg.round + 1, OfferParty.CARRIER, money)
+        elif self._last_ask is not None and any(w in lowered for w in _REJECT_WORDS):
+            # "No" / "come on" with no new number -> they're holding; make our move.
+            ask = self._last_ask
+        else:
             return self._say(
-                f"What rate are you looking for on load {self.load.load_id}?",
-                instruction="Ask the carrier what rate they are looking for.",
+                f"What are you looking to get on {self.load.load_id}?",
+                instruction="Ask the carrier, naturally, what rate they need for this load.",
             )
 
         self.state = CallState.NEGOTIATE
-        self._repo.log_offer(self.call_id, self.neg.round + 1, OfferParty.CARRIER, money)
-        result = self.neg.evaluate(money)
+        return self._apply_negotiation(self.neg.evaluate(ask), ask)
 
+    def _apply_negotiation(self, result, ask: float) -> str:
         if result.decision == Decision.ACCEPT:
             return self._book(result.rate)
+
         if result.decision == Decision.REVIEW:
             self._repo.log_note(
                 self.call_id,
-                f"Suspiciously low ask ${int(money)} on {self.load.load_id} "
+                f"Suspiciously low ask ${int(ask)} on {self.load.load_id} "
                 "(fraud tripwire) — routed to review.",
             )
             return self._transfer_and_say(reason="fraud_review")
+
         if result.decision == Decision.NO_DEAL:
-            return self._no_deal(money, result)
+            return self._no_deal(ask, result)
+
         if result.decision == Decision.HOLD:
             rate = int(result.rate)
             self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
             return self._say(
-                f"Sorry, I can't do ${int(money)} on this one. I've got it at ${rate} "
-                "— can you work with that?",
-                instruction=f"Politely say you can't pay ${int(money)}, and restate your "
-                f"offer of ${rate}. Do NOT reveal any max. Hold firm — friendly but "
-                "not budging yet.",
+                f"Oof, ${int(ask)} is a tough one for this lane — I'm sitting at ${rate} "
+                "right now. Any way you can work with me there?",
+                instruction=f"The carrier wants ${int(ask)}, which is more than you can pay. "
+                f"Push back warmly, react to their number, and hold at your current offer "
+                f"of ${rate}. Never reveal your max. Sound like a real rep, not scripted.",
                 context=f"Hold firm at ${rate}. Never reveal your ceiling/max.",
             )
 
-        # COUNTER: walk our offer up
+        # COUNTER — a real concession up the ladder
         rate = int(result.rate)
         self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
+        if result.is_final:
+            return self._say(
+                f"Alright — tell you what, I'll stretch to ${rate}. That's honestly the "
+                "best I can do on this one. Can we make it happen?",
+                instruction=f"Make your FINAL, best offer of ${rate}. Convey warmly but "
+                "firmly that this is as high as you can go, and ask them to take it. Do "
+                "NOT say it's a hard cap or reveal any internal number.",
+                context=f"Final best offer ${rate}. Never call it your ceiling/max.",
+            )
         return self._say(
-            f"I hear you. I can come up to ${rate} on this one. Can you make that work?",
-            instruction=f"Acknowledge their ask, then raise your offer to ${rate} and "
-            "ask if that works. Never reveal your maximum. Confident, brief.",
-            context=f"Never state your ceiling or max. Your raised offer is ${rate}.",
+            f"Okay, I can move up to ${rate} — that get us closer?",
+            instruction=f"Acknowledge their push, then concede up to ${rate} like you're "
+            "working with them to close it. Vary your wording; ask if that works.",
+            context=f"Your improved offer is ${rate}. Never reveal your max.",
         )
 
     # -- Step 6a: book ------------------------------------------------------ #

@@ -1,16 +1,20 @@
 """Negotiation engine — the safety-critical unit tests (PRD §9.4)."""
 
+import pathlib
+import tempfile
+
 import pytest
 
+from lanevoice.db import Database, Repository
 from lanevoice.domain.models import Decision
 from lanevoice.services import NegotiationEngine
 
 
 @pytest.fixture
 def engine(repo):
-    # L1001: open 2000, ceiling 2500, fraud_low 1400 -> agent_max = 2350
+    # L1001: open 2000, ceiling 2500, buffer 150 -> cap 2350, ladder [2175, 2280, 2350]
     load = repo.get_load("L1001")
-    return NegotiationEngine(load, max_rounds=6, buffer=150, step_small=25, step_big=30)
+    return NegotiationEngine(load, max_rounds=6, buffer=150)
 
 
 def test_accept_at_or_below_opening(engine):
@@ -30,32 +34,38 @@ def test_high_ask_holds_firm_first(engine):
     assert result.rate == 2000              # restates the opening, does not move
 
 
-def test_walk_up_then_accept(engine):
-    assert engine.evaluate(2100).decision == Decision.HOLD
-    step = engine.evaluate(2100)            # now walk up
-    assert step.decision == Decision.COUNTER
-    assert step.rate == 2025
-    done = engine.evaluate(2025)            # carrier meets our raised offer
+def test_human_ladder_counters_then_accepts(engine):
+    assert engine.evaluate(2300).decision == Decision.HOLD
+    c1 = engine.evaluate(2300)
+    assert (c1.decision, c1.rate) == (Decision.COUNTER, 2175)
+    c2 = engine.evaluate(2300)
+    assert (c2.decision, c2.rate) == (Decision.COUNTER, 2280)
+    done = engine.evaluate(2300)            # 2300 is now within our raised offer (2350)
     assert done.decision == Decision.ACCEPT
+    assert done.rate == 2300
+
+
+def test_final_offer_is_flagged(engine):
+    engine.evaluate(3000)                    # HOLD
+    engine.evaluate(3000)                    # COUNTER 2175
+    engine.evaluate(3000)                    # COUNTER 2280
+    final = engine.evaluate(3000)            # COUNTER 2350 = the cap
+    assert final.decision == Decision.COUNTER
+    assert final.rate == 2350
+    assert final.is_final is True
+    assert engine.evaluate(3000).decision == Decision.NO_DEAL
 
 
 def test_never_offers_above_cap_and_walks_away():
-    # Force a tight patience so the stalemate is reached quickly.
-    import pathlib
-    import tempfile
-
-    from lanevoice.db import Database, Repository
-
     tmp = pathlib.Path(tempfile.mkdtemp()) / "t.db"
     repo = Repository(Database(tmp))
     repo._db.reset(seed=True)
-    load = repo.get_load("L1003")           # open 900, ceiling 1250 -> cap 1100
-    eng = NegotiationEngine(load, max_rounds=3, buffer=150, step_small=25, step_big=30)
+    load = repo.get_load("L1003")            # open 900, ceiling 1250 -> cap 1100
+    eng = NegotiationEngine(load, max_rounds=3, buffer=150)
 
-    eng.evaluate(1500)                       # HOLD
-    eng.evaluate(1500)                       # COUNTER (walk up)
-    final = eng.evaluate(1500)               # patience spent -> NO_DEAL
+    eng.evaluate(1500)                        # HOLD
+    eng.evaluate(1500)                        # COUNTER
+    final = eng.evaluate(1500)                # patience spent -> NO_DEAL
     assert final.decision == Decision.NO_DEAL
-    assert final.within_ceiling is False     # 1500 is above the 1250 ceiling
-    # Every offer the agent made stayed at or below the cap.
+    assert final.within_ceiling is False      # 1500 is above the 1250 ceiling
     assert all(o <= eng.agent_max for o in eng.offers_made)

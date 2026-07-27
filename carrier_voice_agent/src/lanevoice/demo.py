@@ -14,6 +14,17 @@ from lanevoice.db import Database, Repository
 from lanevoice.settings import get_settings
 
 
+def _build_phraser(settings):
+    """Use the Groq persona LLM when a key is configured (natural, human wording)."""
+    if not settings.groq_api_key:
+        return None
+    try:
+        from lanevoice.voice import GroqPhraser
+        return GroqPhraser(settings)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _new_agent(reset: bool = True) -> CarrierSalesAgent:
     settings = get_settings()
     db = Database(settings.db_path)
@@ -21,7 +32,7 @@ def _new_agent(reset: bool = True) -> CarrierSalesAgent:
         db.reset(seed=True)
     else:
         db.init(seed=True)
-    return CarrierSalesAgent(Repository(db), phraser=None, settings=settings)
+    return CarrierSalesAgent(Repository(db), _build_phraser(settings), settings)
 
 
 def _scripted(name: str, turns: list[str], max_rounds: int | None = None) -> None:
@@ -61,10 +72,10 @@ def main() -> None:
     _scripted("Carrier accepts the opening offer", [
         "about L1001", "MC 123456", "yeah that works",
     ])
-    _scripted("Agent walks its offer up, carrier then accepts", [
-        "L1001", "MC 123456", "I need 2080", "come on 2060", "ok deal",
+    _scripted("Carrier holds high; agent concedes up the ladder, then books", [
+        "L1001", "MC 123456", "I need 2300", "2300", "2300", "2300",
     ])
-    _scripted("High ask -> hold firm -> walk up -> disconnect + note", [
+    _scripted("High ask -> hold firm -> concede -> walk away with a note", [
         "load 1003", "MC654321", "I need 1500", "no way 1500",
         "come on 1500", "1500 or nothing",
     ], max_rounds=4)
