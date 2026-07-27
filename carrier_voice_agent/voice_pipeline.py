@@ -67,6 +67,45 @@ class HFPhraser:
         return reply.strip().strip('"')
 
 
+class GroqPhraser:
+    """Phrase replies via Groq's fast hosted LLM (default llama-3.1-8b-instant).
+    Reads GROQ_API_KEY from the environment. Like HFPhraser, it ONLY phrases —
+    every consequential decision stays in business_logic.py."""
+
+    def __init__(self, model: str = "llama-3.1-8b-instant"):
+        from groq import Groq
+        self._client = Groq()          # picks up GROQ_API_KEY from env
+        self._model = model
+
+    def phrase(self, instruction: str, context: str = "") -> str:
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": HFPhraser.SYSTEM},
+                {"role": "user", "content":
+                    f"Facts you may use: {context}\n\nInstruction: {instruction}\n\n"
+                    "Say it out loud in 1-2 short spoken sentences."},
+            ],
+            max_tokens=80,
+            temperature=0.6,
+        )
+        return resp.choices[0].message.content.strip().strip('"')
+
+
+def build_phraser(model: str = None):
+    """Pick the phrasing LLM: Groq if GROQ_API_KEY is set (fast), else local Qwen."""
+    import os
+    import logging
+    log = logging.getLogger("carrier-agent")
+    provider = os.getenv("LLM_PROVIDER", "groq" if os.getenv("GROQ_API_KEY") else "local")
+    if provider == "groq":
+        m = model or os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+        log.info("Phrasing LLM: Groq %s", m)
+        return GroqPhraser(m)
+    log.info("Phrasing LLM: local Qwen2.5")
+    return HFPhraser(model or "Qwen/Qwen2.5-1.5B-Instruct")
+
+
 # --------------------------------------------------------------------------- #
 # STT — faster-whisper
 # --------------------------------------------------------------------------- #

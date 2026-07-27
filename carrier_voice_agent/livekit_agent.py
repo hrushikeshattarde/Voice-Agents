@@ -69,7 +69,7 @@ try:
 except ImportError:
     from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
-from voice_pipeline import WhisperSTT, build_tts, HFPhraser
+from voice_pipeline import WhisperSTT, build_tts, build_phraser
 from conversation import CarrierSalesAgent
 
 
@@ -136,11 +136,25 @@ USE_LLM = os.getenv("AGENT_USE_LLM") == "1"
 # Prewarm: load the heavy models ONCE per worker process, before any call —
 # so the caller isn't sitting in silence while weights download/load.
 # --------------------------------------------------------------------------- #
+def make_stt():
+    """Groq whisper-large-v3-turbo when GROQ_API_KEY is set (fast + accurate on
+    phone audio); otherwise local faster-whisper. Set STT_PROVIDER=local to force."""
+    if os.getenv("GROQ_API_KEY") and os.getenv("STT_PROVIDER", "groq").lower() != "local":
+        try:
+            from livekit.plugins import groq as lk_groq
+            logger.info("STT provider: Groq (whisper-large-v3-turbo)")
+            return lk_groq.STT(model="whisper-large-v3-turbo")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Groq STT unavailable (%s); using local Whisper", e)
+    logger.info("STT provider: local faster-whisper")
+    return LocalWhisperSTT()
+
+
 def prewarm(proc):
     proc.userdata["vad"] = silero.VAD.load()
-    proc.userdata["stt"] = LocalWhisperSTT()
+    proc.userdata["stt"] = make_stt()
     proc.userdata["tts"] = LocalKokoroTTS()
-    proc.userdata["phraser"] = HFPhraser() if USE_LLM else None
+    proc.userdata["phraser"] = build_phraser() if USE_LLM else None
 
 
 # --------------------------------------------------------------------------- #
