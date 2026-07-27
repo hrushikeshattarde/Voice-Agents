@@ -1,6 +1,6 @@
 # Test Call Scripts — every scenario
 
-Call **+1 240 212 8297** with the worker running (`uv run python livekit_agent.py dev`)
+Call your LiveKit number with the worker running (`uv run lanevoice-worker dev`)
 and follow one script per call. Watch the terminal — you'll see
 `GREETING → …`, `CALLER said → …`, `AGENT reply → …` for each turn.
 
@@ -151,11 +151,11 @@ Keep repeating the high number when it counters.
 
 ## After a call — check what was logged
 ```bash
-uv run python -c "import database as db; c=db.connect(); [print(dict(r)) for r in c.execute('SELECT call_id,outcome,load_id FROM calls')]; print('--- notes ---'); [print(r['note']) for r in c.execute('SELECT note FROM call_notes')]"
+uv run python -c "import sqlite3; c=sqlite3.connect('carrier_agent.db'); c.row_factory=sqlite3.Row; [print(dict(r)) for r in c.execute('SELECT call_id,outcome,load_id FROM calls')]; print('--- notes ---'); [print(r['note']) for r in c.execute('SELECT note FROM call_notes')]"
 ```
 
 ## If the agent keeps saying "I didn't catch a load ID"
-That's tiny.en mishearing digits over phone audio (a CPU/model limit, not a bug).
-Try saying it as **"load L, ten oh one"** or **"L, one thousand one"**, slowly. If
-it's consistently frustrating, tell me and I'll add digit-biasing + confirmation
-prompts (the accuracy work), or move the worker to a cloud GPU.
+Groq's `whisper-large-v3-turbo` is accurate, but spoken digits over phone audio
+can still slip. Say it slowly — **"load L, one, zero, zero, one."** If a specific
+number is consistently misheard, tell me and I'll add digit-biasing + a read-back
+confirmation step.

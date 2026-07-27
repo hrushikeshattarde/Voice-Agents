@@ -3,3 +3,12 @@
 __pycache__/
 *.py[cod]
 carrier_agent.db
+
+# build / packaging
+build/
+dist/
+*.egg-info/
+
+# test / tooling caches
+.pytest_cache/
+.ruff_cache/

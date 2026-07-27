@@ -1,88 +1,101 @@
-# LaneVoice — In-House Carrier-Sales Voice AI (simple build)
+# LaneVoice — In-House Carrier-Sales Voice AI
 
-A minimal, open-source implementation of the PRD's inbound carrier-sales flow:
-**identify load → verify carrier → negotiate rate (open low, walk up, never above the ceiling) → book, warm-transfer, or decline**,
-with a full audit trail in a database.
+An inbound carrier-sales voice agent: it answers a phone call, identifies the
+load, verifies the carrier, negotiates the rate, and **books / warm-transfers /
+declines** — with a full audit trail.
 
-Built to run on **Google Colab** with **free Hugging Face models** and no paid
-APIs for testing. Real phone calls use **LiveKit + Twilio** (deployment scaffold included).
+**Stack:** LiveKit (telephony + SIP) · **Groq** for STT / LLM / TTS ·
+SQLite + typed, deterministic Python business logic.
 
 ---
 
-## What's in here
+## Project layout
 
-| File | Role |
-|---|---|
-| `database.py` | SQLite data layer — loads, carriers, reps, calls, offers, transfers (+ seed data) |
-| `business_logic.py` | **The deterministic "product"** — load lookup, carrier verify (mock FMCSA), the **server-side negotiation engine** (opens low, walks up ~$25–30/round, hard cap at ceiling−150, no-deal above ceiling), rep/transfer resolution |
-| `conversation.py` | Call **state machine** (PRD §3). LLM only *phrases*; it never decides prices |
-| `voice_pipeline.py` | Free HF models: **Whisper** (STT) + **Qwen2.5** (phrasing) + **Kokoro** (TTS) |
-| `run_demo.py` | Text-mode simulation — verify all logic with **zero models / zero keys** |
-| `livekit_agent.py` | **Deployment scaffold**: same brain wired to LiveKit Agents + Twilio SIP |
-| `Voice_AI_Carrier_Agent_Colab.ipynb` | One-click Colab notebook (setup → text demo → voice demo) |
+```
+src/lanevoice/
+├── settings.py            # all config (env-driven, typed) — one place to change models
+├── logging_config.py
+├── parsing.py             # extract load IDs / MC-DOT / money from utterances
+├── domain/                # typed models + enums (Load, Carrier, NegotiationResult, ...)
+├── db/                    # Database (schema/seed) + Repository (typed data access)
+├── services/              # the deterministic "product": loads, verification,
+│                          #   negotiation engine, transfer
+├── conversation/          # CarrierSalesAgent — the call state machine (the brain)
+├── voice/                 # GroqTTS + GroqPhraser
+├── telephony/             # LiveKit worker (STT plugin + TTS adapter + lifecycle)
+└── demo.py                # text-mode simulation (no keys)
+tests/                     # pytest: parsing, negotiation, verification, conversation
+docs/                      # LIVE_SETUP.md, TEST_CALL_SCRIPTS.md
+sip_setup/                 # LiveKit inbound-trunk + dispatch-rule JSON
+Dockerfile · Makefile · pyproject.toml
+```
 
 ### Design guarantee (PRD §4 / §9.4)
-The LLM is the **conversational interface only**. Every consequential decision —
-is this MC valid, is this offer acceptable, book or transfer — is plain Python in
-`business_logic.py`, validated server-side against the live ceiling. A caller
-**cannot talk the model above the ceiling** because the model has no authority to book.
+The LLM is the **conversational interface only**. Load lookup, carrier
+verification, offer accept/reject vs. the ceiling, book, and transfer are all
+deterministic Python in `services/`. A caller **cannot talk the model into a bad
+outcome** because the model has no authority to cause one — proven by the unit
+tests in `tests/`.
 
 ---
 
-## Quick start (Colab — 0 API keys)
+## Quick start
 
-1. Upload this folder to Colab (or open `Voice_AI_Carrier_Agent_Colab.ipynb`).
-2. Runtime → Change runtime type → **GPU** (T4 is fine; CPU works but slower).
-3. Run the cells top to bottom:
-   - **Text demo** runs instantly (no models).
-   - **Voice demo** downloads the free HF models, then you type a carrier line and
-     *hear* the agent reply; or upload/record a short WAV to test real STT.
-
-Quick local check (no models needed):
 ```bash
-python run_demo.py            # scripted scenarios
-python run_demo.py --chat     # you play the carrier
+make install          # uv sync --extra dev
+make test             # 18 unit tests, no keys needed
+make demo             # text simulation of every scenario
 ```
 
+To take real calls, add credentials then run the worker:
+```bash
+cp .env.example .env  # fill in LiveKit + Groq keys
+make worker           # uv run lanevoice-worker dev
+```
+SIP wiring: [docs/LIVE_SETUP.md](docs/LIVE_SETUP.md) ·
+call scripts: [docs/TEST_CALL_SCRIPTS.md](docs/TEST_CALL_SCRIPTS.md).
+
+Console entry points (installed by `uv sync`):
+`lanevoice-worker` · `lanevoice-demo` · `lanevoice-initdb`.
+
+**Full run guide (every command + every case):** [docs/USAGE.md](docs/USAGE.md).
+
 ---
 
-## API keys — what you need, and when
+## Configuration
 
-### To test everything in Colab (text + local voice): **NONE.**
-Whisper, Qwen2.5, and Kokoro are all free, ungated, and run locally.
+Everything is in [src/lanevoice/settings.py](src/lanevoice/settings.py), overridable
+via `.env`:
 
-### To take real phone calls (LiveKit + Twilio deployment):
+| Setting | Env var | Default |
+|---|---|---|
+| STT model | `STT_MODEL` | `whisper-large-v3-turbo` |
+| LLM model | `LLM_MODEL` | `llama-3.1-8b-instant` |
+| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `playai-tts` / `Celeste-PlayAI` |
+| Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
+| Turn buffer (s) | `MIN_ENDPOINTING_DELAY` | `0.8` |
+| Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `6` |
 
-| Service | Keys / values | Why | Cost |
-|---|---|---|---|
-| **LiveKit** (open source; Cloud has a free tier) | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Media transport + SIP bridge that your agent worker joins | Free tier, then usage-based |
-| **Twilio** | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, a **Voice phone number**, an **Elastic SIP Trunk** | PSTN — the actual phone number carriers dial | Pay per number + per-minute |
-| **Hugging Face** (optional) | `HF_TOKEN` | Only if you swap in a **gated** model (e.g. Llama). Qwen/Whisper/Kokoro need no token | Free |
-| **FMCSA QCMobile** (optional, for *real* carrier verification) | `FMCSA_WEBKEY` | Replace the mock `verify_carrier()` with live authority/insurance data | Free (requires Login.gov) |
-| **ngrok** (optional) | `NGROK_AUTHTOKEN` | Only if you expose a webhook from Colab for experiments | Free tier |
+Change a model = change one line (or one env var). Nothing else hard-codes it.
 
-> The LiveKit worker dials **out** to LiveKit Cloud, so the GPU host needs **no inbound
-> ports** — that's why real calls run on a small GPU box, not Colab.
+## API keys
 
-Set them as environment variables (or Colab secrets):
+| Service | Vars | Purpose |
+|---|---|---|
+| **LiveKit** ([cloud.livekit.io](https://cloud.livekit.io)) | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | telephony + SIP + phone number |
+| **Groq** ([console.groq.com](https://console.groq.com), free tier) | `GROQ_API_KEY` | STT + LLM + TTS |
+
+`make demo` and `make test` need neither.
+
+## Deploy
 ```bash
-export LIVEKIT_URL="wss://<project>.livekit.cloud"
-export LIVEKIT_API_KEY="..."
-export LIVEKIT_API_SECRET="..."
-export TWILIO_ACCOUNT_SID="..."
-export TWILIO_AUTH_TOKEN="..."
+make docker           # build image
+# run on any host with outbound internet (no inbound ports needed):
+docker run --env-file .env lanevoice:latest
 ```
 
----
-
-## From demo to real calls (later)
-
-1. Get the logic right in Colab (text + voice demo).
-2. Provision LiveKit Cloud + a Twilio number & SIP trunk (steps at the bottom of `livekit_agent.py`).
-3. Deploy `livekit_agent.py` on a small GPU host: `python livekit_agent.py start`.
-4. Call your Twilio number.
-
-## Deliberately out of scope for v1 (per PRD non-goals)
-Outbound calling, multi-load calls, live Transport Pro integration (seed DB stands in
-for the load mirror), and production-grade fraud scoring. Verification here is a **mock**
-you replace with FMCSA + a commercial fallback (PRD §8.2).
+## Out of scope (v1)
+Outbound calling, multi-load calls, live Transport Pro integration (seed DB
+stands in for the load mirror), production fraud scoring. Carrier verification is
+a **mock** you replace with FMCSA + a commercial fallback — the decision logic
+stays.

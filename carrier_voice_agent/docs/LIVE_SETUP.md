@@ -75,30 +75,29 @@ puts it in a `call-…` room → your worker answers.
 
 ### C1. Install dependencies (on the machine that will run the worker)
 ```bash
-pip install "livekit-agents>=1.0" livekit-plugins-silero python-dotenv \
-            faster-whisper kokoro soundfile transformers torch
+uv sync
 ```
-Kokoro needs espeak-ng: Linux `sudo apt-get install -y espeak-ng` ·
-macOS `brew install espeak-ng` · Windows: install from the espeak-ng releases page.
+No local ML models — STT/LLM/TTS all run on Groq, so there's nothing heavy to
+download and no GPU needed.
 
 ### C2. Initialize the database once
 ```bash
-python database.py
+uv run lanevoice-initdb
 ```
 
 ### C3. Start the worker
 ```bash
-python livekit_agent.py dev        # dev mode, verbose logs — use this first
+uv run lanevoice-worker dev     # dev mode, verbose logs — use this first
 ```
 You should see it connect to LiveKit and wait for jobs. (If it prints "Missing
 required env vars", your `.env` isn't filled in — see Part A.)
 
 For production later:
 ```bash
-python livekit_agent.py start
+uv run lanevoice-worker start
 ```
 
-### C4. Call your Twilio number ☎️
+### C4. Call your number ☎️
 The agent greets you, asks for a load, verifies your MC/DOT, and negotiates.
 Watch the terminal for the live transcript; the call is logged to `carrier_agent.db`.
 
@@ -109,17 +108,15 @@ Watch the terminal for the live transcript; the call is logged to `carrier_agent
 - [ ] SIP enabled on LiveKit; SIP URI copied
 - [ ] `lk sip inbound create` + `lk sip dispatch create` succeeded
 - [ ] Twilio SIP trunk Origination URI = LiveKit SIP URI; number attached
-- [ ] `python livekit_agent.py dev` is running and connected
+- [ ] `uv run lanevoice-worker dev` is running and connected
 - [ ] Dial the number → agent answers
 
-## If the call connects but the agent is silent / slow
-- **Slow / long pauses:** you're on CPU. Use a GPU host, or set a smaller model
-  (`WhisperSTT("tiny.en")`, and `build_pipeline(with_llm=False)` for template
-  replies) to confirm the wiring first.
+## If the call connects but the agent is silent / errors
+- **Silent / TTS error:** Groq's `playai-tts` needs a one-time terms acceptance in
+  the Groq console. Accept it, or set a different `GROQ_TTS_MODEL` in `.env`.
 - **Dead air / no answer:** the worker isn't picking up the room — confirm it's
   running and that the dispatch rule was created (`lk sip dispatch list`).
-- **Call fails to connect at all:** the Twilio Origination URI doesn't match the
-  LiveKit SIP URI, or the number isn't attached to the trunk (Part B4).
+- **`Missing required env vars`:** fill `.env` (LiveKit + `GROQ_API_KEY`).
 
 ## Cost note
 LiveKit free tier + Twilio per-minute apply. The HF models are free. A cloud GPU
