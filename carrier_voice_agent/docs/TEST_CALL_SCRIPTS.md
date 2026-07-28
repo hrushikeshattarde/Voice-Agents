@@ -11,12 +11,17 @@ and follow one script per call. Watch the terminal — you'll see
 - There's a ~2-second pause before the agent replies (the turn buffer) — that's normal; let it think.
 
 ## Sample data cheat-sheet
-| Load | Lane | Agent opens at | Won't pay above | Fraud-low |
-|---|---|---|---|---|
-| **L1001** | Chicago → Dallas | $2000 | $2350 | under $1400 |
-| **L1002** | Atlanta → Miami | $1400 | $1700 | under $1000 |
-| **L1003** | LA → Phoenix | $900 | $1100 | under $650 |
-| L1004 | Newark → Boston | — | — | (already covered) |
+| Load | Lane | Agent opens at | Commits on its own up to | Max Buy (hard cap) | Fraud-low |
+|---|---|---|---|---|---|
+| **L1001** | Chicago → Dallas | $2000 | $2300 | $2500 | under $1400 |
+| **L1002** | Atlanta → Miami | $1400 | $1670 | $1850 | under $1000 |
+| **L1003** | LA → Phoenix | $900 | $1110 | $1250 | under $650 |
+| L1004 | Newark → Boston | — | — | — | (already covered) |
+
+Between the agent's own authority and Max Buy is a **human's** call: it won't pay
+that itself, but it won't refuse you either — it warm-transfers. Above Max Buy is
+the only genuine no-deal. L1002 also has special requirements it reads out and
+asks you to confirm *before* it quotes a rate.
 
 | MC / DOT number | Carrier | Result |
 |---|---|---|
@@ -69,37 +74,48 @@ sqlite3 carrier_agent.db "SELECT usdot_number, email FROM carrier_emails ORDER B
 
 ---
 
-## Scenario 2 — Negotiate: hold firm, make the carrier come down, then close
-**Purpose:** the agent anchors LOW and never bids against itself. It only moves
-when *you* move, gives back half of what you give, and then closes the deal
-instead of nickel-and-diming it to death.
+## Scenario 2 — Negotiate: make the carrier do the walking, then close once
+**Purpose:** the agent anchors LOW and **never answers your concession with a
+concession of its own**. Every time you come down it credits the move, restates
+its own number and asks how close you can get — a carrier who is still coming
+down can usually come down again. Only when you stop moving (or tell it your
+number is your best) does it put money on the table, and then it spends **once**,
+decisively.
 
 | You say | Agent should |
 |---|---|
 | "Load **L one zero zero one**." (then MC) | Verify, reveal the load, offer **$2000** |
 | "I need **twenty-five hundred**." | **Hold + discovery:** "$2500's a reach — I'm at $2000. What's got you up there, deadheading in? How close can you get to $2000?" |
-| "**Still twenty-five hundred.**" (no movement) | **Holds again and sells the load,** not the rate: steady freight on the lane, quick loading, same-day paperwork — offers *nothing* new |
-| "**Twenty-four hundred.**" (you come down $100) | Reciprocates with **half** of your move → **$2050** |
-| "**Still twenty-four hundred.**" | **Calls out the imbalance:** "I came up from $2000 to $2050 and you haven't moved" |
-| "**Twenty-three hundred.**" | Another half-step → **$2100** |
-| "**Twenty-two hundred.**" (gap now $100) | **Split close:** "Let's not go back and forth — meet me at **$2150** and I'll book you right now" |
-| "**Twenty-two hundred, final.**" | Takes it: **books at $2200** → confirms pickup + rate con |
+| "**Still twenty-five hundred.**" (no movement) | **Holds again and sells the load,** not the rate — one non-price point, then "what's the best you can actually do?" Offers *nothing* new |
+| "**Twenty-four hundred.**" (you come down $100) | **Asks, doesn't pay:** "Okay, $2400's better — but I'm still at **$2000**. How close can you actually get to me on it?" |
+| "**Twenty-three hundred.**" | **Asks again**, with a *different* selling point: "You're coming my way, but $2300's still short — I'm at **$2000**. Where do you actually need to be on it?" |
+| "**Twenty-two hundred.**" | **Its one closing move:** "Let's not go back and forth on it. I'll come to **$2100**, and I'll book you right now at that." |
+| "**Twenty-two hundred, final.**" | "Final" ends the asking → **books at $2200** → confirms pickup + rate con |
 
-**Expected outcome:** `booked` at **$2200**, under the hidden $2500 Max Buy.
-Things to watch for:
+**Expected outcome:** `booked` at **$2200**, under the hidden $2500 Max Buy — and
+the agent named only **two** numbers all call ($2000 and $2100). Watch for:
 
-* Repeating the same number earns you nothing — movement is what buys movement.
+* **No ladder.** It will not go $2000 → $2050 → $2100 → $2150 chasing you down.
+  Its own number stays put until it closes.
+* Repeating the same number earns you nothing — and *moving* earns you a
+  question, not a counter-offer.
+* Say "**that's my best**", "**2400 firm**", "**no less**" or "**take it or
+  leave it**" and it stops asking and makes its move. Withhold that and it keeps
+  pushing you — which is the point.
 * The agent never walks away from a rate it's cleared to pay.
 * Sit immovably on **$2400** (inside Max Buy, above the agent's own $2300
-  authority) and it does *not* cave and does *not* refuse — it hands you to a
-  human rep: "that's above what I can approve on my own, but it's not a no."
-* Sit on **$2800** (above Max Buy) and after a best-and-final it declines with a
-  note, leaving the door open for next time.
+  authority) and it does *not* cave and does *not* refuse — best-and-final at
+  **$2150**, then a human: "that's above what I can approve on my own, but it's
+  not a no."
+* Sit on **$2800** (above Max Buy) and after the **$2150** best-and-final it
+  declines with a note, leaving the door open for next time.
 
-Tune firmness with `NEGOTIATION_RECIPROCITY` (how much of your move it returns),
-`NEGOTIATION_DISCRETION_RATE` (how far it commits without a human),
-`NEGOTIATION_SPLIT_GAP_RATE` / `NEGOTIATION_SETTLE_GAP_RATE` (how eagerly it
-closes), and `NEGOTIATION_MAX_HOLDS`.
+Tune firmness with `NEGOTIATION_MAX_PULLS` (how many times it asks you to come
+closer before spending anything — raise it to squeeze harder, `0` to close on
+your first move), `NEGOTIATION_RECIPROCITY` (how much of the remaining gap its
+one closing move covers), `NEGOTIATION_DISCRETION_RATE` (how far it commits
+without a human), `NEGOTIATION_SPLIT_GAP_RATE` / `NEGOTIATION_SETTLE_GAP_RATE`
+(how eagerly it closes), and `NEGOTIATION_MAX_HOLDS`.
 
 ---
 
@@ -123,14 +139,18 @@ Keep repeating the high number when it counters.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero three**." | Confirm *LA to Phoenix, Flatbed*, ask MC |
-| "MC **six five four three two one**." | Offer **$900** |
-| "I need **fifteen hundred**." | **Hold:** "…I've got it at $900…" |
-| "**Fifteen hundred**, no less." | Walk up: "…come up to $930…" |
-| "Still **fifteen hundred**." | Walk up: "…$960…" |
-| (keep refusing ~2 more times) | Eventually: "I've come up as far as I can… I won't be able to make it work today." → **ends call** |
+| "Load **L one zero zero three**." | Acknowledge L1003, ask MC/USDOT |
+| "MC **six five four three two one**." | Reveal *LA to Phoenix, Flatbed*, offer **$900** |
+| "I need **fifteen hundred**." | **Hold + discovery:** "$1500's a reach — I'm at $900… how close can you get to $900?" |
+| "**Fifteen hundred**, no less." | **Holds again**, sells the load, asks for your best — still **$900** |
+| "Still **fifteen hundred**." | **Best-and-final $1005** — note it is *not* the full $1110 it could authorise, because you never moved |
+| "Still **fifteen hundred**." | "I've come up as far as I can… I can't make it work today." → **ends call** |
 
-**Expected outcome:** `no_deal`, and a note in the DB: *"NO DEAL on L1003… carrier held at $1500… walked up to $… above ceiling."*
+**Expected outcome:** `no_deal` in 4 negotiation turns, and a note in the DB:
+*"NO DEAL on L1003… carrier held at $1500, which is ABOVE Max Buy $1250…"*.
+Stonewalling deliberately earns you **less** than negotiating would have
+(`NEGOTIATION_STONEWALL_FINAL_RATE`) — come down even once and the best-and-final
+is bigger.
 
 ---
 

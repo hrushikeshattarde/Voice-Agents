@@ -33,7 +33,8 @@ class OfferParty(str, Enum):
 
 class Decision(str, Enum):
     ACCEPT = "accept"
-    HOLD = "hold"
+    HOLD = "hold"           # carrier hasn't moved — restate our number
+    PULL = "pull"           # carrier moved — credit it, ask them to come closer
     COUNTER = "counter"
     REVIEW = "review"
     ESCALATE = "escalate"    # within Max Buy but above the agent's own authority
@@ -125,6 +126,7 @@ class NegotiationResult:
     is_final: bool = False   # this counter is the agent's best/last offer
     is_split: bool = False   # this counter is a meet-in-the-middle close
     hold_number: int = 0     # 1 = first push-back; 2+ = carrier still hasn't moved
+    pull_number: int = 0     # 1 = first "how close can you get?"; 2+ = pressing again
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,8 @@ from lanevoice.services import NegotiationEngine
 def engine(repo):
     # L1001: floor 2000, Max Buy 2500, no buffer. Shipped defaults ->
     #   max_offer (own authority) 2300, settle_gap $50, split_gap $150,
-    #   reciprocity 0.5 (they move $200, we move $100).
+    #   max_holds 2, max_pulls 2, reciprocity 0.5 (our one closing move covers
+    #   half the remaining gap).
     load = repo.get_load("L1001")
     return NegotiationEngine(load, buffer=0)
 
@@ -57,52 +58,84 @@ def test_repeating_the_same_ask_earns_no_concession(engine):
     assert engine.offers_made == []          # we put no new money on the table
 
 
-def test_concession_is_a_fraction_of_the_carriers_own_move(engine):
-    """Reciprocity: they give $200, we give $100 back — never more than they did."""
+def test_carrier_movement_earns_another_ask_not_a_counter(engine):
+    """The core of the strategy: they came down $200 and we spend NOTHING. We
+    restate our number and put the next move back on them — a carrier who is
+    still walking can usually keep walking."""
     assert engine.evaluate(2500).decision == Decision.HOLD
-    c1 = engine.evaluate(2300)               # they came down $200
-    assert c1.decision == Decision.COUNTER
-    assert c1.rate == 2100                   # we came up $100
-    # Anchored: our counter stays closer to OUR opening than to their ask.
-    assert c1.rate < (2000 + 2300) / 2
+    pull = engine.evaluate(2300)             # they came down $200
+    assert pull.decision == Decision.PULL
+    assert pull.pull_number == 1
+    assert pull.rate == 2000                 # still our opening — we did not move
+    assert engine.offers_made == []          # no new money on the table
 
 
-def test_never_concedes_more_than_the_carrier_did(engine):
+def test_a_nibble_does_not_buy_a_counter_either(engine):
+    """A $30 tickle used to buy a $15 step up. Now it buys another question."""
     engine.evaluate(2400)                    # HOLD
     result = engine.evaluate(2370)           # they gave up only $30
-    assert result.rate - 2000 <= 30          # so we give at most $30 back
+    assert result.decision == Decision.PULL
+    assert result.rate == 2000
+    assert engine.offers_made == []
 
 
-def test_small_gap_triggers_the_split_close(engine):
-    """Once they're close, a rep stops nickel-and-diming and splits it."""
+def test_the_closing_move_comes_after_the_pulling(engine):
+    """Once we've made them walk twice (max_pulls), we stop asking and make ONE
+    decisive offer — not a ladder of $50 steps."""
     engine.evaluate(2500)                    # HOLD
-    engine.evaluate(2300)                    # -> we counter 2100
-    result = engine.evaluate(2200)           # gap is now $100 (<= split_gap 150)
+    assert engine.evaluate(2300).decision == Decision.PULL   # pull 1
+    assert engine.evaluate(2200).decision == Decision.PULL   # pull 2
+    result = engine.evaluate(2150)           # out of pulls -> close it
     assert result.decision == Decision.COUNTER
     assert result.is_split
-    assert result.rate == 2150               # midpoint of 2100 and 2200
+    assert result.rate == 2075               # half the remaining $150 gap
+    assert engine.offers_made == [2075]      # exactly one offer, ever
+
+
+def test_a_reachable_gap_is_closed_without_pulling_first(engine):
+    """If their move lands close enough to close in one go, don't keep asking —
+    reps close a $150 gap, they don't interrogate it."""
+    engine.evaluate(2150)                    # HOLD (gap 150 == split_gap)
+    result = engine.evaluate(2120)           # they move, still inside split_gap
+    assert result.decision == Decision.COUNTER
+    assert result.is_split
+    assert result.rate == 2060               # 2000 + half of the $120 gap
+
+
+def test_declaring_a_best_number_stops_the_pulling(engine):
+    """'That's my best' is the signal to stop asking. Pressing a carrier who has
+    already given their best just burns the call — we close or we let it go."""
+    engine.evaluate(2500)                    # HOLD
+    result = engine.evaluate(2300, carrier_final=True)
+    assert result.decision == Decision.COUNTER   # straight to our closing move
+    assert engine.pulls == 0                     # never asked them to come down again
+    assert engine.carrier_final
 
 
 def test_the_transcript_that_should_have_booked(engine):
     """The reported call: carrier walks 2500 -> 2200, which is inside Max Buy.
-    That load gets covered — it must not end in a no-deal."""
+    That load gets covered — it must not end in a no-deal. Under the pull
+    strategy we make them do the walking first and only offer once."""
     engine.evaluate(2500)                    # HOLD
     engine.evaluate(2500)                    # HOLD (still nothing from them)
-    engine.evaluate(2400)                    # they move -> we counter
-    engine.evaluate(2300)                    # they move -> we counter
-    engine.evaluate(2200)                    # close -> split
-    final = engine.evaluate(2200)            # they hold at 2200
+    engine.evaluate(2400)                    # they move -> PULL, we spend nothing
+    engine.evaluate(2300)                    # they move -> PULL again
+    engine.evaluate(2200)                    # out of pulls -> our one offer, 2100
+    engine.evaluate(2200)                    # they sit -> HOLD
+    engine.evaluate(2200)                    # they sit -> HOLD
+    final = engine.evaluate(2200)            # out of holds -> best-and-final
     assert final.decision == Decision.ACCEPT
     assert final.rate == 2200
     assert final.rate <= engine.ceiling
+    assert len(engine.offers_made) <= 2      # one close + one best-and-final, no ladder
 
 
 def test_books_when_carrier_comes_down_to_us(engine):
     engine.evaluate(2500)                    # HOLD
-    counter = engine.evaluate(2300)          # they moved -> our counter (2100)
-    dropped = engine.evaluate(counter.rate - 50)   # carrier drops below our offer
+    held = engine.evaluate(2300)             # they moved -> we PULL, still at 2000
+    dropped = engine.evaluate(held.rate - 50)      # carrier drops below our offer
     assert dropped.decision == Decision.ACCEPT
-    assert dropped.rate == counter.rate - 50  # book at the carrier's lower number
+    assert dropped.rate == held.rate - 50    # book at the carrier's lower number
 
 
 def test_stonewalling_earns_less_than_negotiating(engine):
@@ -141,11 +174,11 @@ def test_never_walks_away_from_a_rate_it_can_pay(engine):
 
 def test_movement_resets_our_patience(engine):
     """Two holds don't burn the call down: a carrier who then starts moving gets
-    a normal counter, not a best-and-final ultimatum."""
+    asked to keep coming, not hit with a best-and-final ultimatum."""
     engine.evaluate(2500)                    # HOLD
     engine.evaluate(2500)                    # HOLD
     result = engine.evaluate(2400)           # they finally move
-    assert result.decision == Decision.COUNTER
+    assert result.decision == Decision.PULL
     assert not result.is_final
     assert engine.holds == 0
 

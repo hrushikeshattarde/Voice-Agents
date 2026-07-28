@@ -58,8 +58,10 @@ class Settings(BaseSettings):
     # Reserve held BELOW the Max Buy. 0 = the agent may go all the way to Max Buy
     # (never above). Set > 0 to keep some room back for a human.
     negotiation_buffer: float = Field(default=0.0, validation_alias="NEGOTIATION_BUFFER")
-    # Share of the carrier's OWN concession that the agent gives back. 0.5 = they
-    # come down $200, we go up $100. Lower = firmer, slower to close.
+    # Share of the REMAINING GAP the agent covers with its one closing move. 0.5
+    # meets the carrier in the middle; lower closes firmer. The agent never walks
+    # its own number up step by step — it holds, asks the carrier to come closer
+    # (see NEGOTIATION_MAX_PULLS), then makes a single decisive offer.
     negotiation_reciprocity: float = Field(
         default=0.5, validation_alias="NEGOTIATION_RECIPROCITY"
     )
@@ -83,10 +85,14 @@ class Settings(BaseSettings):
     negotiation_stonewall_final_rate: float = Field(
         default=0.5, validation_alias="NEGOTIATION_STONEWALL_FINAL_RATE"
     )
-    # How many times the agent restates its number and asks the carrier to come
-    # down before it puts its best-and-final on the table. The agent only ever
-    # raises its offer in response to the carrier actually moving down.
+    # How many times the agent restates its number and asks a carrier who is NOT
+    # moving to come down, before it puts its best-and-final on the table.
     negotiation_max_holds: int = Field(default=2, validation_alias="NEGOTIATION_MAX_HOLDS")
+    # How many times a carrier who IS moving gets credited and asked to come
+    # closer before the agent spends anything. This is the core of the strategy:
+    # a concession from the carrier earns another ask, not a counter-offer.
+    # Raise it to squeeze harder; 0 makes the agent close on their first move.
+    negotiation_max_pulls: int = Field(default=2, validation_alias="NEGOTIATION_MAX_PULLS")
 
     # --- Storage ------------------------------------------------------------ #
     db_path: str = Field(default="carrier_agent.db", validation_alias="DB_PATH")

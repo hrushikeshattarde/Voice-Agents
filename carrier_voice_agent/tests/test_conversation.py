@@ -88,8 +88,9 @@ def test_phraser_cannot_drop_our_offer(repo):
     a.handle("L1001")
     a.handle("MC 123456")
     a.handle("I want 2500")              # hold
-    reply = a.handle("2400")             # they moved $100 -> we counter at $2050
-    assert "$2050" in reply              # our number is spoken, not implied away
+    reply = a.handle("2400")             # they moved $100 -> we PULL, still at $2000
+    assert "$2000" in reply              # our number is spoken, not implied away
+    assert "meet you there" not in reply  # the LLM's "I'll take yours" was discarded
     assert a.state.value == "negotiate"  # we did NOT slide into booking at $2400
 
 
@@ -185,6 +186,54 @@ def test_holds_its_number_until_the_carrier_moves(repo):
     ).fetchall()
     conn.close()
     assert {int(r["amount"]) for r in agent_offers} == {2000}   # never raised itself
+
+
+def test_agent_makes_the_carrier_come_down_instead_of_laddering(repo):
+    """The rep behaviour: a carrier who keeps moving gets asked to keep moving.
+    Across a whole grind the agent puts at most TWO numbers on the table — its
+    opening and the single move it makes to close — never a $50-at-a-time
+    walk-up that trades its own margin for their nickels."""
+    a = _agent(repo, max_rounds=8)
+    a.greeting()
+    a.handle("L1001")
+    a.handle("MC 123456")
+    replies = [a.handle(t) for t in ("I need 2500", "2450", "2400", "2350")]
+    # Each of their moves is answered with a question, not a concession.
+    assert sum("how close" in r.lower() for r in replies) >= 1
+    assert any("best you can" in r.lower() or "need to be" in r.lower() for r in replies)
+    conn = repo._db.connect()
+    offers = {int(r["amount"]) for r in conn.execute(
+        "SELECT amount FROM negotiation_offers WHERE offered_by='agent'").fetchall()}
+    conn.close()
+    assert len(offers) <= 2          # the opening, plus one closing move
+    assert min(offers) == 2000       # and it never abandoned its anchor
+
+
+def test_a_declared_best_number_is_closed_not_pushed_again(repo):
+    """'That's my best' ends the asking. Running the same 'how close can you
+    get?' play at a carrier who already answered it is what makes a bot obvious —
+    the agent makes its move instead."""
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1001")
+    a.handle("MC 123456")
+    a.handle("I need 2400")                        # hold + discovery question
+    reply = a.handle("2300, that's my best")       # -> our closing offer
+    assert "how close" not in reply.lower()
+    assert "$2150" in reply                        # 2000 + half the remaining $300
+    assert a.neg.pulls == 0                        # never asked them to walk again
+
+
+def test_the_same_pitch_is_never_repeated_at_the_caller(repo):
+    """Non-price levers are spent one per turn. Hearing the identical selling
+    line two or three times in one call is the most bot-like thing there is."""
+    a = _agent(repo, max_rounds=8)
+    a.greeting()
+    a.handle("L1001")
+    a.handle("MC 123456")
+    replies = [a.handle(t) for t in ("I need 2500", "2500", "2400", "2300", "2200")]
+    for lever in ("first in line", "sit on their dock", "same day"):
+        assert sum(lever in r for r in replies) <= 1, f"repeated pitch: {lever}"
 
 
 def _to_email_step(repo, load="about L1001", mc="MC 123456"):

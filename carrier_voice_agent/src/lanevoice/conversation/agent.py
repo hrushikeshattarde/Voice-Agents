@@ -35,13 +35,16 @@ from lanevoice.voice.phraser import Phraser
 # whole call sounds like one consistent human rep.
 REP_NAME = "Alex"
 
-# Non-price levers a rep leans on when a carrier is stuck on their number. These
-# are spoken to real carriers, so keep them to things the brokerage will actually
+# Non-price levers a rep leans on when a carrier is stuck on their number. ONE
+# per turn, and never the same one twice on a call — a pitch delivered verbatim
+# two or three times is the most bot-like thing a caller can hear. These are
+# spoken to real carriers, so keep them to things the brokerage will actually
 # honour — no payment-term promises unless the desk really offers them.
 VALUE_LEVERS = (
-    "we run this lane regularly, so covering this one keeps you first in line "
-    "for the next; the shipper loads quick, so you're not sitting on a dock; "
-    "and paperwork gets turned around same day"
+    "we run this lane every week, so covering this one keeps you first in line "
+    "for the next",
+    "the shipper loads quick, so you're not going to sit on their dock all day",
+    "we turn paperwork around same day, so you're not chasing us to get paid",
 )
 
 _ACCEPT_WORDS = (
@@ -53,6 +56,34 @@ _HUMAN_WORDS = (
     "talk to a human", "speak to someone", "representative", "a rep",
     "real person", "agent please",
 )
+# The carrier calls their number their best. A rep stops asking at that point and
+# either closes it or lets it go — pressing a fourth time just burns the call.
+# Deliberately narrow: "final" and "firm" only count when they're attached to the
+# RATE, so "what's the final mile", "is the delivery firm" and "let me confirm
+# with my driver" don't hand the carrier our money early.
+_DECLARES_FINAL_RE = re.compile(
+    r"\b(?:that'?s|it'?s) (?:my|the) best\b"
+    r"|\bmy best\b"
+    r"|\bbest i can (?:do|go)\b"
+    r"|\ball i can do\b"
+    r"|\b(?:lowest|as low as) i can\b"
+    r"|\bbottom line\b"
+    r"|\btake it or leave it\b"
+    r"|\b(?:can'?t|won'?t|cannot) go (?:any )?lower\b"
+    r"|\b(?:no|nothing) (?:lower|less)\b"
+    r"|\bfinal (?:offer|number|answer)\b"
+    r"|\b(?:that'?s|it'?s) final\b"
+    r"|\d\s*,?\s*final\b"                      # "2400 final"
+    r"|\b(?:i'?m|we'?re|that'?s|it'?s) firm\b"
+    r"|\bfirm at \$?\d{3,}"                    # "firm at 2400"
+    r"|\d\s*,?\s*firm\b"                       # "2400 firm"
+)
+
+
+def _declares_final(text: str) -> bool:
+    return bool(_DECLARES_FINAL_RE.search(text.lower()))
+
+
 # Rejections with no new number — the carrier is holding, so we make our next move.
 _REJECT_WORDS = (
     "no", "nope", "nah", "can't", "cannot", "too low", "not enough",
@@ -171,6 +202,7 @@ class CarrierSalesAgent:
         self._booking_email: str | None = None   # where the rate con link goes
         self._email_is_new = False               # wasn't on file -> we saved it
         self._email_asks = 0                     # re-asks when we didn't catch one
+        self._levers_used = 0                    # non-price pitches already spent
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
         repo.start_call(self.call_id)
@@ -217,6 +249,13 @@ class CarrierSalesAgent:
 
     def _log_user(self, text: str) -> None:
         self.transcript.append(("carrier", text))
+
+    def _next_lever(self) -> str:
+        """A fresh non-price selling point each time we lean on one, so the same
+        pitch never gets repeated at the caller."""
+        lever = VALUE_LEVERS[min(self._levers_used, len(VALUE_LEVERS) - 1)]
+        self._levers_used += 1
+        return lever
 
     # -- entry points ------------------------------------------------------- #
     def greeting(self) -> str:
@@ -378,6 +417,7 @@ class CarrierSalesAgent:
             split_gap_rate=self._settings.negotiation_split_gap_rate,
             stonewall_final_rate=self._settings.negotiation_stonewall_final_rate,
             max_holds=self._settings.negotiation_max_holds,
+            max_pulls=self._settings.negotiation_max_pulls,
         )
         self.state = CallState.STATE_PRICE
         opening = int(self.neg.current_offer)
@@ -453,7 +493,8 @@ class CarrierSalesAgent:
             )
 
         self.state = CallState.NEGOTIATE
-        return self._apply_negotiation(self.neg.evaluate(ask), ask)
+        return self._apply_negotiation(
+            self.neg.evaluate(ask, carrier_final=_declares_final(text)), ask)
 
     def _apply_negotiation(self, result, ask: float) -> str:
         if result.decision == Decision.ACCEPT:
@@ -479,14 +520,52 @@ class CarrierSalesAgent:
                 f"{self.load.destination.split(',')[0]}, {self.load.equipment}.")
         self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
 
+        # On a HOLD or a PULL nothing new goes on the table — the whole point is
+        # that the next concession is theirs, so the LLM must not soften it with a
+        # number of its own.
+        no_new_number = (
+            f"You may name ONLY two numbers: their ${ask_i} and your ${rate}. Do NOT "
+            "invent, offer, or hint at any other figure, and do NOT split the "
+            "difference — you are not moving on this turn. Never reveal your max."
+        )
+
+        # PULL — they came down, and we do NOT pay them for it. Credit the move,
+        # restate our number, and put the next one back on them. A carrier who is
+        # still coming down can usually come down again; answering every step of
+        # theirs with a step of ours is how a desk gives away its margin.
+        if result.decision == Decision.PULL:
+            if result.pull_number <= 1:
+                return self._say(
+                    f"Okay, ${ask_i}'s better — but I'm still at ${rate}. How close can "
+                    "you actually get to me on it?",
+                    instruction=f"The carrier came down to ${ask_i}. Give them ONE short "
+                    f"beat of credit for moving, restate that YOUR number is still "
+                    f"${rate}, and ask how close they can get to ${rate}. You are NOT "
+                    "countering and NOT raising your offer — the next move is theirs, so "
+                    f"end on the question. {no_new_number}",
+                    context=f"{lane} You're holding at ${rate}; they just moved to "
+                    f"${ask_i}. {no_new_number}",
+                    amounts={rate, ask_i},
+                    must_say=rate,
+                )
+            lever = self._next_lever()
+            return self._say(
+                f"You're coming my way, but ${ask_i}'s still short for me — I'm at "
+                f"${rate}. Look, {lever}. Where do you actually need to be on it?",
+                instruction=f"The carrier moved again, to ${ask_i}, but it's still short "
+                f"of your ${rate}. Do NOT counter and do NOT raise your offer. Sell the "
+                f"load on this one non-price point: {lever}. Then ask where they actually "
+                f"need to be to make it work. Firm and friendly, no begging. "
+                f"{no_new_number}",
+                context=f"{lane} You're holding at ${rate}; they're at ${ask_i}. "
+                f"Value to sell: {lever}. {no_new_number}",
+                amounts={rate, ask_i},
+                must_say=rate,
+            )
+
         # HOLD — stay on our number and make THEM come down. No new figure, no
         # splitting the difference: we don't bid against ourselves.
         if result.decision == Decision.HOLD:
-            no_new_number = (
-                f"You may name ONLY two numbers: their ${ask_i} and your ${rate}. Do NOT "
-                "invent, offer, or hint at any other figure, and do NOT split the "
-                "difference — you are not moving on this turn. Never reveal your max."
-            )
             if result.hold_number <= 1 and self.neg.concessions:
                 # We've already moved and they haven't. Say so — the imbalance IS
                 # the argument, and repeating the discovery question sounds canned.
@@ -524,58 +603,49 @@ class CarrierSalesAgent:
                 )
             # Second push: they still haven't moved, so sell the load, not the
             # rate. Levers are free; dollars are not.
+            lever = self._next_lever()
             return self._say(
                 f"You're still at ${ask_i} and I'm still at ${rate} — I need something "
-                f"from you here. Look, {VALUE_LEVERS}. What's the best you can actually "
-                "do on this one?",
+                f"from you here. Look, {lever}. What's the best you can actually do on "
+                "this one?",
                 instruction=f"The carrier repeated ${ask_i} without moving. Point out "
                 f"you're both where you started and you're still at ${rate}. Instead of "
-                "raising your number, sell the load on ONE of these non-price points: "
-                f"{VALUE_LEVERS}. Then press them for the best number they can actually "
-                f"do. Firm, friendly, no begging. {no_new_number}",
+                "raising your number, sell the load on this one non-price point: "
+                f"{lever}. Then press them for the best number they can actually do. "
+                f"Firm, friendly, no begging. {no_new_number}",
                 context=f"{lane} You're holding at ${rate}; they haven't moved. "
-                f"Value to sell: {VALUE_LEVERS}. {no_new_number}",
+                f"Value to sell: {lever}. {no_new_number}",
                 amounts={rate, ask_i},
                 must_say=rate,
             )
 
-        # COUNTER — they moved, so we move: a fraction of what they just gave.
+        # COUNTER — our ONE closing move. We've held and made them walk; now we
+        # spend once, decisively, and ask for the load in the same breath.
         if result.is_split:
-            # The classic close: stop trading nickels, cut it down the middle
-            # and ask for the load on the spot.
             return self._say(
-                f"Alright, we're close — let's not go back and forth over it. Meet me at "
-                f"${rate} and I'll book you right now.",
-                instruction=f"You and the carrier are close ({ask_i} vs your new ${rate}). "
-                f"Offer to meet in the middle at ${rate} and ask for the load RIGHT NOW — "
-                "'do that and I'll get you covered on this one'. Confident and final-ish "
-                f"without saying it's your last offer. Name no dollar figure other than "
-                f"${rate} and their ${ask_i}.",
-                context=f"{lane} Your split-the-difference offer is ${rate}. Never reveal "
-                "your max.",
+                f"Alright — let's not go back and forth on it. I'll come to ${rate}, and "
+                f"I'll book you right now at that.",
+                instruction=f"The carrier is at ${ask_i}. Make your one move: you'll come "
+                f"to ${rate}, and ask for the load RIGHT NOW — 'say yes and I'll get you "
+                "covered on this one'. This is you coming to them, so own it. Confident "
+                "and final-ish without saying it's your last offer. Do NOT describe it as "
+                f"splitting anything. Name no dollar figure other than ${rate} and their "
+                f"${ask_i}.",
+                context=f"{lane} Your closing offer is ${rate}. Never reveal your max.",
                 amounts={rate, ask_i},
                 must_say=rate,
             )
-        if result.is_final:
-            return self._say(
-                f"Alright — tell you what, I'll stretch to ${rate}. That's honestly the "
-                "best I can do on this one. Say yes and it's yours.",
-                instruction=f"Make your FINAL, best offer of ${rate}. Convey warmly but "
-                "firmly that this is as high as you can go on this load, and ask them to "
-                "take it right now. Do NOT say it's a hard cap or reveal any internal "
-                f"number. Name no dollar figure other than ${rate} and their ${ask_i}.",
-                context=f"{lane} Final best offer ${rate}. Never call it your ceiling/max.",
-                amounts={rate, ask_i},
-                must_say=rate,
-            )
+        # The only other way money goes on the table is the best-and-final. The
+        # engine never produces a plain incremental counter any more — it holds,
+        # pulls, closes once, then makes its best number.
         return self._say(
-            f"Okay, you moved so I'll move — I can do ${rate}. That get us there?",
-            instruction=f"They came down, so reciprocate with a SMALLER step: your new "
-            f"offer is ${rate}. Credit them for moving, state ${rate} out loud, and ask if "
-            f"that gets it done. You are NOT taking their ${ask_i}, so never say you'll "
-            "'meet them there' or agree to their number. Vary your wording. Name no dollar "
-            f"figure other than ${rate} and their ${ask_i}.",
-            context=f"{lane} Your improved offer is ${rate}. Never reveal your max.",
+            f"Alright — tell you what, I'll stretch to ${rate}. That's honestly the "
+            "best I can do on this one. Say yes and it's yours.",
+            instruction=f"Make your FINAL, best offer of ${rate}. Convey warmly but "
+            "firmly that this is as high as you can go on this load, and ask them to "
+            "take it right now. Do NOT say it's a hard cap or reveal any internal "
+            f"number. Name no dollar figure other than ${rate} and their ${ask_i}.",
+            context=f"{lane} Final best offer ${rate}. Never call it your ceiling/max.",
             amounts={rate, ask_i},
             must_say=rate,
         )
