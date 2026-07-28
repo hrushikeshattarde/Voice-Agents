@@ -9,11 +9,7 @@ this exact decision + fraud-flag logic. USDOT is treated as primary (§8.3).
 from __future__ import annotations
 
 from lanevoice.db.repository import Repository
-from lanevoice.domain.models import (
-    AuthorityStatus,
-    VerificationAction,
-    VerificationResult,
-)
+from lanevoice.domain.models import VerificationAction, VerificationResult
 
 # A carrier whose authority was reactivated within this window is a fraud signal.
 _REACTIVATION_WINDOW_DAYS = 90
@@ -33,7 +29,10 @@ class CarrierVerificationService:
             )
 
         risk_flags: list[str] = []
-        if carrier.authority_status != AuthorityStatus.ACTIVE:
+        # ACTIVE authority is the company requirement. INACTIVE and SUSPENDED both
+        # stop here, and so does any status the feed sent that we couldn't read
+        # (AuthorityStatus fails closed to SUSPENDED).
+        if not carrier.authority_status.can_haul:
             risk_flags.append(f"authority_{carrier.authority_status.value}")
         if not carrier.insurance_on_file:
             risk_flags.append("insurance_lapse")
@@ -44,7 +43,7 @@ class CarrierVerificationService:
             risk_flags.append("recently_reactivated")
 
         hard_fail = (
-            carrier.authority_status != AuthorityStatus.ACTIVE
+            not carrier.authority_status.can_haul
             or not carrier.insurance_on_file
         )
 

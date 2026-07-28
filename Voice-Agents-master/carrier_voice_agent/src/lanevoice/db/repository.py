@@ -52,6 +52,14 @@ class Repository:
             status=LoadStatus(row["status"]),
             is_posted=bool(row["is_posted"]),
             notes=row["notes"],
+            miles=row["miles"],
+            commodity=row["commodity"],
+            pieces=row["pieces"],
+            dimensions=row["dimensions"],
+            pickup_window=row["pickup_window"],
+            delivery_date=row["delivery_date"],
+            delivery_window=row["delivery_window"],
+            load_type=row["load_type"] or "full truckload",
         )
 
     @staticmethod

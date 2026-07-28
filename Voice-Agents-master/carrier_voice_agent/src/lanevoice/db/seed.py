@@ -12,28 +12,48 @@ if TYPE_CHECKING:
 
 # load_id, origin, dest, pickup, equipment, weight,
 #   open(=Load Board Rate/floor), ceiling(=Max Buy/cap), fraud_low,
-#   rep, status, is_posted, notes
+#   rep, status, is_posted, notes,
+#   miles, commodity, pieces, dimensions, pickup_window,
+#   delivery_date, delivery_window, load_type
+#
+# Everything from `miles` on is what a carrier asks about the moment they hear
+# the lane — how far, what's on it, when does it deliver, what are the windows.
+# A rep volunteers all of it in one breath; without it the agent gets interrogated.
 _LOADS = [
-    ("L1001", "Chicago, IL", "Dallas, TX", "2026-07-25", "Dry Van", 42000,
-     2000, 2500, 1400, "R01", "open", 1, None),
-    ("L1002", "Atlanta, GA", "Miami, FL", "2026-07-24", "Reefer", 38000,
+    ("L1001", "Chicago, IL", "Dallas, TX", "2026-08-03", "Dry Van", 42000,
+     2000, 2500, 1400, "R01", "open", 1, None,
+     925, "packaged food goods", 26, None, "7 AM to 2 PM",
+     "2026-08-05", "8 AM to 12 PM", "full truckload"),
+    ("L1002", "Atlanta, GA", "Miami, FL", "2026-08-04", "Reefer", 38000,
      1400, 1850, 1000, "R02", "open", 1,
      "This reefer has to run at zero degrees the whole way, and it's a strict "
-     "8 A.M. pickup appointment — the driver has to be on time."),
-    ("L1003", "Los Angeles, CA", "Phoenix, AZ", "2026-07-26", "Flatbed", 45000,
-     900, 1250, 650, "R01", "open", 1, None),
-    ("L1004", "Newark, NJ", "Boston, MA", "2026-07-23", "Dry Van", 30000,
-     700, 950, 500, "R03", "covered", 1, None),
+     "8 A.M. pickup appointment — the driver has to be on time.",
+     665, "frozen poultry", 22, None, "8 AM appointment",
+     "2026-08-06", "6 AM to 11 AM", "full truckload"),
+    ("L1003", "Los Angeles, CA", "Phoenix, AZ", "2026-08-03", "Flatbed", 45000,
+     900, 1250, 650, "R01", "open", 1, None,
+     375, "steel tubing", 14, "20 ft long x 4 ft wide x 3 ft high",
+     "6 AM to 3 PM", "2026-08-04", "7 AM to 1 PM", "full truckload"),
+    ("L1004", "Newark, NJ", "Boston, MA", "2026-08-02", "Dry Van", 30000,
+     700, 950, 500, "R03", "covered", 1, None,
+     225, "retail freight", 18, None, "9 AM to 4 PM",
+     "2026-08-03", "8 AM to 2 PM", "full truckload"),
     # Not posted -> the agent won't proceed with it.
-    ("L1005", "Denver, CO", "Kansas City, MO", "2026-07-28", "Dry Van", 36000,
-     1100, 1400, 800, "R02", "open", 0, None),
+    ("L1005", "Denver, CO", "Kansas City, MO", "2026-08-06", "Dry Van", 36000,
+     1100, 1400, 800, "R02", "open", 0, None,
+     600, "paper products", 30, None, "10 AM to 5 PM",
+     "2026-08-07", "7 AM to 12 PM", "full truckload"),
 ]
 
 # usdot, mc, name, authority, insured, reactivated_days, last_verified, approved
+# Authority is one of active / inactive / suspended. Only ACTIVE gets a rate —
+# anything else is a hard stop (see AuthorityStatus).
 _CARRIERS = [
     ("DOT1000001", "MC123456", "Blue Sky Logistics LLC", "active", 1, None, None, 1),
     ("DOT2000002", "MC654321", "Roadrunner Freight Inc", "active", 1, None, None, 1),
-    ("DOT3000003", "MC999888", "Ghost Carrier LLC", "revoked", 0, None, None, 1),
+    ("DOT3000003", "MC999888", "Ghost Carrier LLC", "suspended", 0, None, None, 1),
+    # Authority lapsed rather than pulled — still not haulable for us.
+    ("DOT6000006", "MC555444", "Dormant Transport LLC", "inactive", 1, None, None, 1),
     ("DOT4000004", "MC777111", "Reactivated Haulers", "active", 1, 12, None, 1),
     # Verified/insured, but NOT approved to work with Circle Logistics.
     ("DOT5000005", "MC222333", "Banned Freight Co", "active", 1, None, None, 0),
@@ -52,6 +72,7 @@ _CARRIER_EMAILS = [
     ("DOT3000003", "accounts@ghostcarrier.com"),
     ("DOT4000004", "dispatch@reactivatedhaulers.com"),
     ("DOT4000004", "safety@reactivatedhaulers.com"),
+    ("DOT6000006", "dispatch@dormanttransport.com"),
     ("DOT5000005", "dispatch@bannedfreightco.com"),
     ("DOT5000005", "billing@bannedfreightco.com"),
 ]
@@ -73,7 +94,11 @@ def seed_if_empty(db: Database) -> None:
         if conn.execute("SELECT COUNT(*) FROM loads").fetchone()[0] > 0:
             return
         conn.executemany(
-            "INSERT OR IGNORE INTO loads VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", _LOADS)
+            "INSERT OR IGNORE INTO loads (load_id, origin, destination, pickup_date, "
+            "equipment, weight_lbs, open_rate, ceiling_rate, fraud_low_rate, "
+            "assigned_rep_id, status, is_posted, notes, miles, commodity, pieces, "
+            "dimensions, pickup_window, delivery_date, delivery_window, load_type) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", _LOADS)
         conn.executemany(
             "INSERT OR IGNORE INTO carriers (usdot_number, mc_number, legal_name, "
             "authority_status, insurance_on_file, authority_reactivated_days, "
