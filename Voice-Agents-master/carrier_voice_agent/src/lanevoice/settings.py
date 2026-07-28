@@ -45,7 +45,20 @@ class Settings(BaseSettings):
     )
 
     # --- Agent behavior ----------------------------------------------------- #
-    use_llm: bool = Field(default=False, validation_alias="USE_LLM")
+    # The agent has no scripted replies: every line it speaks is composed by the
+    # LLM from the dialogue, the facts and a directive. Turning this off leaves it
+    # unable to talk, so it is only useful for offline tests that drive the state
+    # machine with a stub composer.
+    use_llm: bool = Field(default=True, validation_alias="USE_LLM")
+    # Sanctioned wording is retried before we give up on a turn: the engine's
+    # numbers are non-negotiable, so a reply that leaks a rate or drops our offer
+    # gets re-prompted with the specific breach named.
+    llm_attempts: int = Field(default=3, validation_alias="LLM_ATTEMPTS")
+    llm_temperature: float = Field(default=0.5, validation_alias="LLM_TEMPERATURE")
+    # Enough room for the full load pitch (lane, dates, windows, commodity,
+    # miles, rate) in one turn; short turns simply come back short.
+    llm_max_tokens: int = Field(default=220, validation_alias="LLM_MAX_TOKENS")
+    llm_read_max_tokens: int = Field(default=120, validation_alias="LLM_READ_MAX_TOKENS")
     allow_interruptions: bool = Field(default=True, validation_alias="ALLOW_INTERRUPTIONS")
     # Wait this long after the caller stops before replying. Higher = fewer
     # cut-offs / fragment replies on a noisy phone line.

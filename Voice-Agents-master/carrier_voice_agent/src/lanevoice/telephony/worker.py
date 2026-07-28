@@ -40,7 +40,7 @@ from lanevoice.conversation import CarrierSalesAgent
 from lanevoice.db import Database, Repository
 from lanevoice.logging_config import get_logger, setup_logging
 from lanevoice.settings import get_settings
-from lanevoice.voice import GroqPhraser, GroqTTS
+from lanevoice.voice import GroqComposer, GroqTTS, StubComposer
 
 # Runtime setup (kept below imports so linting stays clean). load_dotenv() runs
 # before get_settings() so a local .env populates the environment first.
@@ -100,7 +100,9 @@ def prewarm(proc):
         prompt=_settings.stt_prompt,   # bias Whisper toward freight vocabulary
     )
     proc.userdata["tts"] = GroqTTSPlugin()
-    proc.userdata["phraser"] = GroqPhraser(_settings) if _settings.use_llm else None
+    # The agent has no scripted lines, so the composer is what lets it talk at all.
+    proc.userdata["composer"] = (
+        GroqComposer(_settings) if _settings.use_llm else StubComposer(_settings))
 
     # Background-noise / echo removal tuned for 8 kHz phone audio. Optional:
     # if the native lib isn't available on this host, carry on without it.
@@ -114,9 +116,9 @@ def prewarm(proc):
 
 
 class CarrierAgent(Agent):
-    def __init__(self, repo: Repository, phraser):
+    def __init__(self, repo: Repository, composer):
         super().__init__(instructions="Carrier sales agent (logic in conversation layer).")
-        self.brain = CarrierSalesAgent(repo, phraser, _settings)
+        self.brain = CarrierSalesAgent(repo, composer, _settings)
 
     async def on_enter(self):
         greeting = self.brain.greeting()
@@ -154,7 +156,7 @@ async def entrypoint(ctx: JobContext):
     nc = ud.get("noise_cancellation")
     room_input = RoomInputOptions(noise_cancellation=nc) if nc else RoomInputOptions()
     await session.start(
-        agent=CarrierAgent(ud["repo"], ud.get("phraser")),
+        agent=CarrierAgent(ud["repo"], ud["composer"]),
         room=ctx.room,
         room_input_options=room_input,
     )

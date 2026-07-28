@@ -23,15 +23,48 @@ that itself, but it won't refuse you either — it warm-transfers. Above Max Buy
 the only genuine no-deal. L1002 also has special requirements it reads out and
 asks you to confirm *before* it quotes a rate.
 
-| MC / DOT number | Carrier | Result |
-|---|---|---|
-| **MC 123456** | Blue Sky Logistics | ✅ verified |
-| **MC 654321** | Roadrunner Freight | ✅ verified |
-| **MC 999888** | Ghost Carrier | ❌ revoked → review |
-| **MC 777111** | Reactivated Haulers | ⚠️ risk flag → transfer |
-| (any unknown #) | — | ❌ not found → review |
+| MC / DOT number | Carrier | Authority | Result |
+|---|---|---|---|
+| **MC 123456** | Blue Sky Logistics | ACTIVE | ✅ proceeds |
+| **MC 654321** | Roadrunner Freight | ACTIVE | ✅ proceeds |
+| **MC 999888** | Ghost Carrier | SUSPENDED | ❌ blocked → review |
+| **MC 555444** | Dormant Transport | INACTIVE | ❌ blocked → review |
+| **MC 777111** | Reactivated Haulers | ACTIVE | ⚠️ risk flag → transfer |
+| **MC 222333** | Banned Freight | ACTIVE | ❌ not approved → declined |
+| (any unknown #) | — | — | ❌ not found → review |
+
+**Only ACTIVE authority gets a rate.** That's the company requirement, so INACTIVE
+and SUSPENDED are both hard stops — the call ends before any load detail or number
+is discussed, and the reason is logged rather than explained to the caller. Any
+status the vetting feed sends that we don't recognise is read as SUSPENDED, never
+guessed as ACTIVE.
 
 ---
+
+## The call order (this changed)
+
+```
+greeting → load/reference number → MC or USDOT → WHERE AND WHEN THE TRUCK IS EMPTY
+        → load details + rate → negotiate → confirm pickup → email → rate con
+```
+
+Two things to know before you dial:
+
+**Nothing about the load comes out until the empty call is done.** The agent reads
+your reference number back, takes your MC, verifies you, confirms your company
+name, and then asks where your truck is getting empty and when. Only after that
+does it tell you the lane, the dates, the commodity, the miles and its number. If
+you answer only half the question ("empty in Towson, Arizona") it asks for the
+other half rather than re-asking the whole thing.
+
+**There are no scripted replies.** Every line the agent says is written by the LLM
+from the facts it's allowed to use, after reading what you actually just said — so
+the wording will differ every call, and it will answer questions you throw in
+sideways ("how much does it weigh?", "when's it deliver?") instead of ploughing
+on. What it cannot do is choose a number: the negotiation engine decides every
+rate, and a reply naming any figure it wasn't given is rejected and re-prompted.
+Ask it something outside its facts — detention, lumpers, payment terms — and it
+should say it'll check, not invent an answer.
 
 > **Booking is a three-step close.** Agree on a rate → the agent confirms the
 > pickup → **you** give the email for the rate con, then it locks it in. If you
@@ -40,16 +73,24 @@ asks you to confirm *before* it quotes a rate.
 ## Scenario 1 — Happy path: accept the opening offer
 **Purpose:** confirm the whole flow works end to end, including the email check.
 
+Wording will vary — assert on what it *does*, not how it says it.
+
 | You say | Agent should |
 |---|---|
-| "I'm calling about load **L one zero zero one**." | Confirm *Chicago to Dallas, Dry Van*, ask for MC/USDOT |
-| "My MC is **one two three four five six**." | "You're all set, Blue Sky Logistics. I've got this at **$2000** — how's that sound?" |
-| "**Yes, that works.**" | Confirms rate, asks if you can cover the pickup |
-| "**Yep, I can cover it.**" | Asks the question outright — "what email should I send the rate con to?" — and suggests *nothing* |
-| "**Billing at blue sky logistics dot com.**" | Checks it against the carrier's file, then: "You're locked in on L1001 at **$2000**. I'm sending the rate con link to billing@blueskylogistics.com…" |
+| "I'm calling about load **L one zero zero one**." | Read **L1001** back digit by digit to confirm, then ask for MC/USDOT. Says **nothing** about the lane yet |
+| "My MC is **one two three four five six**." | Check your company name back ("Blue Sky Logistics?"), then ask **where your truck is getting empty and when** |
+| "**Empty in Dallas, Texas today.**" | *Now* the load comes out: full truckload Chicago to Dallas, picks up with its window, delivers with its window, packaged food goods, 26 pieces, 42,000 lbs, dry van, ~925 miles — then "I've got it at **$2000**", then asks if you want it |
+| "**Yes, that works.**" | Confirms the rate, asks if you can cover that pickup |
+| "**Yep, I can cover it.**" | Asks which email to send the rate con to, and suggests *nothing* |
+| "**Billing at blue sky logistics dot com.**" | Checks it against the carrier's file, confirms booked at **$2000**, and names the address the con is going to |
 
 **Expected outcome:** `booked` at $2000, rate con addressed to the email *you*
 gave. The agent asks about the email only — no driver or truck questions.
+
+Worth trying mid-call: ask "**how many miles is it?**" or "**when's it deliver?**"
+after the rundown. It should answer from the load's facts and then get back to
+what it was doing. Ask "**do you offer quick pay?**" and it should say it'll check
+rather than making terms up.
 
 ### How the email is handled
 
@@ -84,8 +125,8 @@ decisively.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." (then MC) | Verify, reveal the load, offer **$2000** |
-| "I need **twenty-five hundred**." | **Hold + discovery:** "$2500's a reach — I'm at $2000. What's got you up there, deadheading in? How close can you get to $2000?" |
+| "Load **L one zero zero one**." (then MC, then the empty call) | Verify, give the full load rundown, ask **$2000** |
+| "I need **twenty-five hundred**." | **Hold + discovery:** can't get to $2500, it's at **$2000**, and — because it took your empty call — it references *where your truck already is* rather than asking again, then asks how close you can get to $2000 |
 | "**Still twenty-five hundred.**" (no movement) | **Holds again and sells the load,** not the rate — one non-price point, then "what's the best you can actually do?" Offers *nothing* new |
 | "**Twenty-four hundred.**" (you come down $100) | **Asks, doesn't pay:** "Okay, $2400's better — but I'm still at **$2000**. How close can you actually get to me on it?" |
 | "**Twenty-three hundred.**" | **Asks again**, with a *different* selling point: "You're coming my way, but $2300's still short — I'm at **$2000**. Where do you actually need to be on it?" |
@@ -124,8 +165,10 @@ without a human), `NEGOTIATION_SPLIT_GAP_RATE` / `NEGOTIATION_SETTLE_GAP_RATE`
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero two**." | Confirm *Atlanta to Miami, Reefer*, ask MC |
-| "MC **six five four three two one**." | Offer **$1400** |
+| "Load **L one zero zero two**." | Read the number back, ask MC |
+| "MC **six five four three two one**." | Ask the empty call |
+| "**Empty in Atlanta, Georgia today.**" | Give the load, read out the **zero-degree reefer + strict 8 AM** requirement, ask if you can do it |
+| "**Yeah, I can run it that cold.**" | *Now* quotes **$1400** |
 | "I'll do it for **thirteen fifty**." | Takes it → confirms pickup + rate con |
 | "**Yep, I can cover it.**" | Books at **$1350** |
 
@@ -139,8 +182,9 @@ Keep repeating the high number when it counters.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero three**." | Acknowledge L1003, ask MC/USDOT |
-| "MC **six five four three two one**." | Reveal *LA to Phoenix, Flatbed*, offer **$900** |
+| "Load **L one zero zero three**." | Read the number back, ask MC/USDOT |
+| "MC **six five four three two one**." | Ask the empty call |
+| "**Empty in Ontario, California right now.**" | Give the load (LA to Phoenix, flatbed, steel tubing, ~375 mi), ask **$900** |
 | "I need **fifteen hundred**." | **Hold + discovery:** "$1500's a reach — I'm at $900… how close can you get to $900?" |
 | "**Fifteen hundred**, no less." | **Holds again**, sells the load, asks for your best — still **$900** |
 | "Still **fifteen hundred**." | **Best-and-final $1005** — note it is *not* the full $1110 it could authorise, because you never moved |
@@ -159,20 +203,20 @@ is bigger.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." | Confirm lane, ask MC |
-| "MC **one two three four five six**." | Offer **$2000** |
+| "Load **L one zero zero one**." (then MC, then the empty call) | Give the load, ask **$2000** |
 | "I'll haul it for **nine hundred**." | "Let me connect you with **Sarah Chen**…" (routed to review) |
 
 **Expected outcome:** `transferred` (fraud review); note logged.
 
 ---
 
-## Scenario 6 — Revoked authority → blocked, not hung up
-**Purpose:** a bad carrier can't negotiate, but is sent to review, not dropped.
+## Scenario 6 — Non-ACTIVE authority → blocked, not hung up
+**Purpose:** only ACTIVE authority gets a rate. Try **MC 999888** (SUSPENDED) and
+**MC 555444** (INACTIVE) — both stop here, before any load detail or number.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." | Confirm lane, ask MC |
+| "Load **L one zero zero one**." | Read the number back, ask MC |
 | "MC **nine nine nine eight eight eight**." | "I'm not able to verify active authority and insurance… routing this to our team for review." |
 
 **Expected outcome:** `rejected` (human review).
@@ -184,7 +228,7 @@ is bigger.
 
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." | Confirm lane, ask MC |
+| "Load **L one zero zero one**." | Read the number back, ask MC |
 | "MC **seven seven seven one one one**." | "I want to get you to a rep to finish verification — connecting you…" |
 
 **Expected outcome:** `transferred`.
@@ -195,7 +239,7 @@ is bigger.
 | You say | Agent should |
 |---|---|
 | "I want load **L nine nine nine nine**." | "I couldn't find L9999. Open loads are L1001, L1002, L1003. Which one?" |
-| "**L one zero zero one**." | Continues normally (confirm lane, ask MC) |
+| "**L one zero zero one**." | Continues normally (reads the number back, asks MC) |
 
 ---
 
@@ -209,8 +253,7 @@ is bigger.
 ## Scenario 10 — Caller asks for a human
 | You say | Agent should |
 |---|---|
-| "Load **L one zero zero one**." | Confirm lane, ask MC |
-| "MC **one two three four five six**." | Offer $2000 |
+| "Load **L one zero zero one**." (then MC, then the empty call) | Give the load, ask $2000 |
 | "**Can I just talk to a rep?**" | "Let me connect you with **Sarah Chen**…" |
 
 **Expected outcome:** `transferred` (carrier request).

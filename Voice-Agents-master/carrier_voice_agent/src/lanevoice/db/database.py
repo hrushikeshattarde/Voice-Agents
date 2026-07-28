@@ -24,7 +24,16 @@ CREATE TABLE IF NOT EXISTS loads (
     assigned_rep_id TEXT,
     status          TEXT NOT NULL DEFAULT 'open',
     is_posted       INTEGER NOT NULL DEFAULT 1,   -- only proceed if posted
-    notes           TEXT                          -- special requirements to read to the carrier
+    notes           TEXT,                         -- special requirements to read to the carrier
+    -- What a carrier asks about once they've heard the lane. All spoken aloud.
+    miles           INTEGER,
+    commodity       TEXT,
+    pieces          INTEGER,
+    dimensions      TEXT,
+    pickup_window   TEXT,                         -- "6 AM to 3 PM"
+    delivery_date   TEXT,
+    delivery_window TEXT,
+    load_type       TEXT NOT NULL DEFAULT 'full truckload'
 );
 
 CREATE TABLE IF NOT EXISTS carriers (
@@ -123,6 +132,23 @@ class Database:
         CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
         anything added after a database was created has to be patched in here.
         """
+        # Columns added to `loads` after the first release. ALTER TABLE ADD COLUMN
+        # is the only safe move here: it keeps existing rows and their rates.
+        load_columns = {r["name"] for r in
+                        conn.execute("PRAGMA table_info(loads)").fetchall()}
+        for name, ddl in (
+            ("miles", "INTEGER"),
+            ("commodity", "TEXT"),
+            ("pieces", "INTEGER"),
+            ("dimensions", "TEXT"),
+            ("pickup_window", "TEXT"),
+            ("delivery_date", "TEXT"),
+            ("delivery_window", "TEXT"),
+            ("load_type", "TEXT NOT NULL DEFAULT 'full truckload'"),
+        ):
+            if name not in load_columns:
+                conn.execute(f"ALTER TABLE loads ADD COLUMN {name} {ddl}")
+
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}
         # `carriers.contact_email` held a single address before carrier_emails

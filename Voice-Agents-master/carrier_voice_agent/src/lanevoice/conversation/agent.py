@@ -2,10 +2,21 @@
 CarrierSalesAgent — the call state machine (PRD §3).
 
 Independent of audio I/O: feed it carrier utterances, get back agent speech.
-The LLM (phraser) only rewords; every decision comes from the services.
 
-    GREETING -> IDENTIFY_LOAD -> VERIFY_CARRIER -> STATE_PRICE
-             -> NEGOTIATE -> DONE (booked | transferred | rejected | no_deal)
+There are no scripted replies here. Each state decides what the turn must ACHIEVE
+and which facts and dollar figures may be spoken, and the composer writes the
+words after reading what the caller actually said. Every decision — which load,
+whether the authority clears, what rate — is made here or in the services; the
+model chooses only the wording, and a reply that names money it wasn't given is
+rejected and re-prompted.
+
+    GREETING -> IDENTIFY_LOAD -> VERIFY_CARRIER -> ASK_EMPTY
+             -> [CHECK_REQUIREMENTS] -> STATE_PRICE -> NEGOTIATE
+             -> CONFIRM_BOOKING -> CONFIRM_EMAIL
+             -> DONE (booked | transferred | rejected | no_deal)
+
+Nothing about the load is shared — with the caller or with the composer — until
+VERIFY_CARRIER clears (ACTIVE authority only) and ASK_EMPTY is answered.
 """
 
 from __future__ import annotations
@@ -14,7 +25,7 @@ import enum
 import re
 import uuid
 
-from lanevoice import parsing
+from lanevoice import formatting, parsing
 from lanevoice.db.repository import Repository
 from lanevoice.domain.models import (
     CallOutcome,
@@ -22,6 +33,7 @@ from lanevoice.domain.models import (
     OfferParty,
     VerificationAction,
 )
+from lanevoice.logging_config import get_logger
 from lanevoice.services import (
     CarrierVerificationService,
     LoadService,
@@ -29,10 +41,27 @@ from lanevoice.services import (
     TransferService,
 )
 from lanevoice.settings import Settings, get_settings
-from lanevoice.voice.phraser import Phraser
+from lanevoice.voice.composer import TurnComposer
 
-# The agent's persona — used in greetings and passed to the phrasing LLM so the
-# whole call sounds like one consistent human rep.
+# The one written line in the system. Reached only when the composer cannot
+# produce a turn that respects the engine's numbers — see `_cannot_compose`.
+_LAST_RESORT = ("Sorry, let me get you over to one of our reps who can pick this "
+                "up. One moment.")
+
+logger = get_logger(__name__)
+
+# Failures that will happen again identically on the next attempt: a bad key, a
+# model that doesn't exist, a revoked token. Retrying these burns two more round
+# trips of dead air on a live call and changes nothing, so we stop at the first.
+_UNRETRYABLE = re.compile(
+    r"authentication|invalid[\s_-]*api[\s_-]*key|unauthorized|permission|forbidden"
+    r"|model[\s_-]*(?:not[\s_-]*found|decommissioned)|does not exist"
+    r"|\b40[134]\b",
+    re.IGNORECASE,
+)
+
+# The agent's persona — handed to the composer as a fact so the whole call sounds
+# like one consistent human rep.
 REP_NAME = "Alex"
 
 # Non-price levers a rep leans on when a carrier is stuck on their number. ONE
@@ -96,11 +125,11 @@ _CANNOT_COVER = (
 )
 
 
-# The engine owns every rate. If the phrasing LLM slips in a figure we never
+# The engine owns every rate. If the composer slips in a figure we never
 # authorized (e.g. splitting the difference on its own — "can you meet me at
-# 2200?"), that's a rate leak: we detect it and speak the deterministic template
-# instead. Bare numbers count, not just $-prefixed ones — a spoken rate doesn't
-# need a dollar sign to move the negotiation.
+# 2200?"), that's a rate leak: the turn is rejected and re-prompted with the
+# breach named. Bare numbers count, not just $-prefixed ones — a spoken rate
+# doesn't need a dollar sign to move the negotiation.
 _DOLLAR_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d+)?)")
 _NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
@@ -121,6 +150,33 @@ def _dollar_amounts(text: str) -> set[int]:
 
 def _numbers(text: str) -> set[int]:
     return _to_ints(_NUMBER_RE.findall(text))
+
+
+def _speakable(amounts: set[int] | None) -> str:
+    """How the turn's money allowance reads to the composer."""
+    if amounts is None:
+        return "any figure already shown in FACTS"
+    if not amounts:
+        return ""
+    return ", ".join(f"${a}" for a in sorted(amounts))
+
+
+def _breach(spoken: str, amounts: set[int] | None, must_say: int | None,
+            source: str, speakable: str) -> str | None:
+    """The fault to send back, or None if the turn is safe to speak.
+
+    Naming the specific breach beats re-rolling the same prompt: the model is far
+    likelier to fix "you said a number you weren't given" than to spontaneously
+    stop doing it.
+    """
+    if amounts is not None and _rate_leak(spoken, amounts, source):
+        allowed = speakable or "NO dollar amount at all"
+        return (f"You named money you were not given. The only money you may say "
+                f"this turn is: {allowed}. Say it again with no other figure in it.")
+    if must_say is not None and must_say not in _numbers(spoken):
+        return (f"You left out ${must_say}, which this turn has to state as YOUR "
+                f"number. Say it again and put ${must_say} in it explicitly.")
+    return None
 
 
 def _rate_leak(text: str, allowed: set[int], source: str) -> bool:
@@ -169,6 +225,7 @@ class CallState(str, enum.Enum):
     GREETING = "greeting"
     IDENTIFY_LOAD = "identify_load"
     VERIFY_CARRIER = "verify_carrier"
+    ASK_EMPTY = "ask_empty"                     # when/where the truck frees up
     CHECK_REQUIREMENTS = "check_requirements"   # narrate load notes, confirm carrier can do it
     STATE_PRICE = "state_price"
     NEGOTIATE = "negotiate"
@@ -181,11 +238,11 @@ class CarrierSalesAgent:
     def __init__(
         self,
         repo: Repository,
-        phraser: Phraser | None = None,
+        composer: TurnComposer,
         settings: Settings | None = None,
     ):
         self._repo = repo
-        self._phraser = phraser
+        self._composer = composer
         self._settings = settings or get_settings()
 
         self._loads = LoadService(repo)
@@ -203,49 +260,130 @@ class CarrierSalesAgent:
         self._email_is_new = False               # wasn't on file -> we saved it
         self._email_asks = 0                     # re-asks when we didn't catch one
         self._levers_used = 0                    # non-price pitches already spent
+        self._empty_location: str | None = None  # where their truck frees up
+        self._empty_when: str | None = None      # and when
+        self._empty_followups = 0                # re-asks for the half we missed
+        self._empty_raw: list[str] = []           # exactly what they said, for the note
+        self._load_revealed = False               # gate: load facts reach the LLM only after this
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
         repo.start_call(self.call_id)
 
-    # -- phrasing helpers --------------------------------------------------- #
-    def _recent_dialogue(self, n: int = 4) -> str:
-        speaker = {"agent": f"You ({REP_NAME})", "carrier": "Carrier"}
+    # -- speaking ----------------------------------------------------------- #
+    def _dialogue(self) -> str:
+        """The whole call so far. The composer needs all of it: a caller's
+        question three turns ago is still theirs to have answered."""
+        speaker = {"agent": f"You ({REP_NAME})", "carrier": "Caller"}
         return "\n".join(
-            f"{speaker.get(who, who)}: {line}" for who, line in self.transcript[-n:]
+            f"{speaker.get(who, who)}: {line}" for who, line in self.transcript
         )
 
-    def _say(self, fallback: str, instruction: str | None = None,
-             context: str = "", amounts: set[int] | None = None,
-             must_say: int | None = None) -> str:
-        """`amounts` = the only dollar figures this turn is allowed to speak.
-        Pass an empty set for turns that must name no rate at all; pass None to
-        skip the check on turns where money never comes up.
+    def _standing_facts(self) -> str:
+        """Facts that stay true for the rest of the call, so any turn can field a
+        question thrown in sideways — "how much does it weigh?", "when's it
+        deliver?" — instead of ploughing on with its own agenda.
 
-        `must_say` = a rate the turn MUST put on the table. Without it the LLM can
-        drop our number and imply we took theirs ("you came down to $2400, I'll
-        meet you there") — so if it's missing we speak the template instead."""
-        text = fallback
-        if self._phraser is not None and instruction is not None:
-            convo = self._recent_dialogue()
-            full_context = f"Recent conversation:\n{convo}\n\n{context}".strip() \
-                if convo else context
+        The load only appears here once it has actually been revealed. Before the
+        empty call the composer must not even know the lane, or it will happily
+        volunteer it to a carrier we haven't cleared yet.
+        """
+        rows = []
+        if self.carrier:
+            rows.append(f"Caller's company: {self.carrier.legal_name}")
+        summary = self._empty_summary()
+        if summary:
+            rows.append(f"Their truck: {summary}")
+        if self._load_revealed and self.load:
+            rows.append(f"The load under discussion:\n{self.load.facts()}")
+        return "\n".join(rows)
+
+    def _say(self, directive: str, facts: str = "",
+             amounts: set[int] | None = None, must_say: int | None = None) -> str:
+        """Compose this turn with the LLM and speak it.
+
+        There is no scripted line behind this. `directive` says what the turn has
+        to ACHIEVE and `facts` says what may be said; the model writes the words,
+        having read what the caller actually just said. That is the whole point —
+        the reply is shaped by the call, not chosen from a list of sentences.
+
+        What the model does not get to choose is money. `amounts` is the exact set
+        of dollar figures this turn may utter (empty set = none at all; None =
+        money isn't in play this turn), and `must_say` is a rate the turn is
+        REQUIRED to state, so a reply can't quietly drop our offer and imply we
+        took theirs. A breach is re-prompted with the specific fault named; if
+        every attempt breaches, the call goes to a person rather than to a script.
+        """
+        facts = "\n".join(p for p in (facts, self._standing_facts()) if p)
+        # The leak check reads the directive and FACTS only — never the dialogue,
+        # or the model could recycle an old number as if it were a fresh offer.
+        source = f"{directive} {facts}"
+        speakable = _speakable(amounts)
+        correction = ""
+
+        attempts = max(1, self._settings.llm_attempts)
+        why = "no attempt was made"
+        for attempt in range(1, attempts + 1):
             try:
-                phrased = self._phraser.phrase(instruction, full_context)
-            except Exception:  # noqa: BLE001 - phrasing must never break a call
-                phrased = ""
-            # Leak check runs against the instruction + FACTS only — never the
-            # recent dialogue, or the LLM could recycle an old number as a new offer.
-            if (
-                phrased
-                and (
-                    amounts is None
-                    or not _rate_leak(phrased, amounts, f"{instruction} {context}")
+                spoken = self._composer.compose(
+                    directive=directive,
+                    facts=facts,
+                    dialogue=self._dialogue(),
+                    speakable=speakable,
+                    correction=correction,
                 )
-                and (must_say is None or must_say in _numbers(phrased))
-            ):
-                text = phrased
-        self.transcript.append(("agent", text))
-        return text
+            except Exception as exc:  # noqa: BLE001 - a flaky API must not drop the call
+                # Never silent: an unreachable model and a model that keeps
+                # inventing rates both end in a handoff, and whoever reads the log
+                # needs to know which one they're looking at.
+                why = f"{type(exc).__name__}: {exc}"
+                logger.warning("composer failed (attempt %d/%d) in state %s — %s",
+                               attempt, attempts, self.state.value, why)
+                if _UNRETRYABLE.search(str(exc)) or _UNRETRYABLE.search(
+                        type(exc).__name__):
+                    logger.error(
+                        "composer cannot be reached and retrying will not help. "
+                        "Check GROQ_API_KEY and LLM_MODEL in your .env, or set "
+                        "USE_LLM=false to drive the flow with the offline stub.")
+                    break
+                continue
+            if not spoken.strip():
+                why = "the composer returned nothing"
+                correction = "You returned nothing at all. Say your turn out loud."
+                continue
+            breach = _breach(spoken, amounts, must_say, source, speakable)
+            if breach is None:
+                self.transcript.append(("agent", spoken))
+                return spoken
+            why = breach
+            logger.warning("rejected composed turn in state %s — %s",
+                           self.state.value, breach)
+            correction = breach
+
+        return self._cannot_compose(why)
+
+    def _cannot_compose(self, why: str) -> str:
+        """We could not produce a turn we're allowed to speak, or the model is down.
+
+        This is the one line in the system that is written rather than composed,
+        and it exists because the alternative on a live call is dead air. It does
+        not try to carry the conversation on — it hands the call to a person and
+        records exactly why, which is the honest outcome when we can't speak safely.
+        """
+        logger.error("handing call %s to a rep: could not compose a turn in state "
+                     "%s (%s)", self.call_id, self.state.value, why)
+        self._repo.log_note(
+            self.call_id,
+            f"Could not compose a compliant turn in state {self.state.value} "
+            f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
+            f"Last failure: {why}",
+        )
+        rep_id = None
+        if self.load is not None:
+            resolution = self._transfers.resolve(self.load)
+            rep_id = resolution.rep.rep_id if resolution.rep else None
+        self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id)
+        self.transcript.append(("agent", _LAST_RESORT))
+        return _LAST_RESORT
 
     def _log_user(self, text: str) -> None:
         self.transcript.append(("carrier", text))
@@ -261,12 +399,12 @@ class CarrierSalesAgent:
     def greeting(self) -> str:
         self.state = CallState.IDENTIFY_LOAD
         return self._say(
-            f"Thanks for calling the load desk, this is {REP_NAME} — heads up, the call "
-            "may be recorded for quality. What load can I get you on? You got a load ID "
-            "or a lane for me?",
-            instruction=f"You are {REP_NAME}, a carrier sales rep answering an inbound "
-            "call. Greet warmly and naturally, give a quick one-line 'call may be "
-            "recorded' note, then ask which load they're calling about (load ID or lane).",
+            "Answer the inbound call. Name the company, give your first name, and ask "
+            "what you can help with — that's it. Real desks answer short; do not "
+            "deliver a speech, do not list what you do, and do not ask for a load "
+            "number yet. One sentence.",
+            facts=f"Your name: {REP_NAME}. Brokerage: Circle Logistics.",
+            amounts=set(),
         )
 
     def handle(self, user_text: str) -> str:
@@ -274,6 +412,7 @@ class CarrierSalesAgent:
         handler = {
             CallState.IDENTIFY_LOAD: self._identify_load,
             CallState.VERIFY_CARRIER: self._verify_carrier,
+            CallState.ASK_EMPTY: self._ask_empty,
             CallState.CHECK_REQUIREMENTS: self._check_requirements,
             CallState.STATE_PRICE: self._negotiate,
             CallState.NEGOTIATE: self._negotiate,
@@ -288,46 +427,52 @@ class CarrierSalesAgent:
         load_id = parsing.extract_load_id(text)
         if not load_id:
             return self._say(
-                "I didn't catch a load ID. Could you repeat it? For example, L1001.",
-                instruction="Politely say you didn't catch the load ID and ask them "
-                "to repeat it, giving 'L1001' as an example format.",
+                "You didn't catch a load or reference number in what they just said. Ask "
+                "for it — if they described a lane or a posting instead of a number, ask "
+                "whether the posting shows a reference number. Do not invent a load, and "
+                "do not read them the open list yet.",
+                facts="Example of the number format: L1001.",
+                amounts=set(),
             )
         # Only load ID NUMBERS are shared before verification — never lanes/details.
         result = self._loads.lookup(load_id)
         open_ids = ", ".join(self._loads.open_load_ids())
-        _no_details = ("List ONLY these load ID numbers and nothing else — do NOT "
-                       f"mention any city, state, lane, equipment, rate, or details: {open_ids}")
+        no_details = (
+            "You may say these load numbers and NOTHING else about them — no city, "
+            f"state, lane, equipment, date, commodity or rate: {open_ids}"
+        )
         if not result.found:
             return self._say(
-                f"I don't see load {load_id}. The open ones right now are {open_ids}. "
-                "Which would you like?",
-                instruction=f"Say you couldn't find load {load_id}, then offer the open "
-                f"loads by ID only. {_no_details}",
+                f"You have no load {load_id} on the board. Tell them so and offer the "
+                f"open ones by number, then ask which they want. {no_details}",
+                amounts=set(),
             )
         if not result.posted:
             return self._say(
-                f"Load {load_id} isn't posted right now, so I can't book that one. "
-                f"Open ones are {open_ids}. Which would you like?",
-                instruction=f"Say load {load_id} isn't posted/available, then offer the "
-                f"open loads by ID only. {_no_details}",
+                f"Load {load_id} exists but isn't posted, so you can't book it. Say that "
+                f"much, offer the open ones by number, ask which they want. {no_details}",
+                amounts=set(),
             )
         if not result.available:
             return self._say(
-                f"Load {load_id} is already covered. Other open ones are {open_ids}.",
-                instruction=f"Say load {load_id} is already covered, then offer the open "
-                f"loads by ID only. {_no_details}",
+                f"Load {load_id} is already covered. Tell them, offer the other open ones "
+                f"by number, and ask which they want. {no_details}",
+                amounts=set(),
             )
 
-        # Valid, posted, open — but DON'T reveal any details yet. Verify first.
+        # Valid, posted, open — but nothing about it comes out yet. Read the number
+        # back first: the caller is holding a posting and needs to know we're both
+        # looking at the same load before they hand over their MC.
         self.load = result.load
         self.state = CallState.VERIFY_CARRIER
         return self._say(
-            f"Got it, {result.load.load_id}. Before I go over it, can I grab your MC or "
-            "USDOT number?",
-            instruction=f"Acknowledge you've got load {result.load.load_id} (just the ID). "
-            "Do NOT mention the lane, cities, equipment, pickup, or any details yet — you "
-            "share those only after verifying. Ask for their MC or USDOT number.",
-            context=f"Load {result.load.load_id}. Do NOT reveal any load details yet.",
+            f"Read the load number {load_id} back to them digit by digit to confirm you "
+            f"have the right one, then ask for their MC or USDOT number. Say NOTHING "
+            "about the lane, cities, equipment, dates or rate — none of that comes out "
+            "until they're verified.",
+            facts=f"Load number: {load_id}. Read back as: "
+            f"{formatting.spell_digits(load_id)}",
+            amounts=set(),
         )
 
     # -- Step 3: verify carrier -------------------------------------------- #
@@ -335,21 +480,29 @@ class CarrierSalesAgent:
         _, number = parsing.extract_mc_dot(text)
         if not number:
             return self._say(
-                "I didn't get that. Please say your MC or USDOT number slowly.",
-                instruction="Say you didn't catch the number and ask them to repeat "
-                "their MC or USDOT number slowly.",
+                "You didn't catch a number. Say so and ask them to give you their MC or "
+                "USDOT number again, slowly.",
+                amounts=set(),
             )
         result = self._verifier.verify(number)
 
         if not result.verified:
+            # Authority is not ACTIVE, or insurance isn't on file. Either way this
+            # carrier cannot haul for us and there is no rate conversation to have.
+            self._repo.log_note(
+                self.call_id,
+                f"Verification failed on {number} "
+                f"({result.carrier.legal_name if result.carrier else 'not found'}): "
+                f"{result.reason}, flags {list(result.risk_flags)} — no rate discussed.",
+            )
             self._finish(CallOutcome.REJECTED)
             return self._say(
-                "I'm not able to verify active authority and insurance on that number, "
-                "so I can't discuss rate right now. I'm routing this to our team for "
-                "review and someone will follow up. Thanks for calling.",
-                instruction="Firmly but politely explain you cannot verify active "
-                "authority/insurance so you cannot discuss rate, and that it is being "
-                "routed to a human for review. Do not reveal internal fraud logic.",
+                "You cannot confirm active operating authority and insurance for them, so "
+                "you cannot talk about this load or its rate at all. Tell them that "
+                "plainly, say it's going to your team to review and someone will follow "
+                "up, and close the call politely. Do NOT say which check failed, do not "
+                "speculate about why, and do not suggest how they might get around it.",
+                amounts=set(),
             )
 
         self.carrier = result.carrier
@@ -363,11 +516,10 @@ class CarrierSalesAgent:
             )
             self._finish(CallOutcome.REJECTED)
             return self._say(
-                "I'm sorry, but it looks like we're not set up to work with your company "
-                "on our end, so I won't be able to book this one. Thanks for calling.",
-                instruction="Politely tell the carrier your brokerage isn't set up to work "
-                "with their company, so you can't book with them. Do not explain why or "
-                "reveal internal lists. Keep it brief and professional.",
+                "Your brokerage isn't set up to work with their company, so you can't book "
+                "this one with them. Tell them briefly and politely and close the call. Do "
+                "NOT explain why, do not mention any list, and do not offer a workaround.",
+                amounts=set(),
             )
 
         if result.action == VerificationAction.HUMAN_REVIEW:
@@ -378,29 +530,90 @@ class CarrierSalesAgent:
             )
             self._transfer(reason="verification_review")
             return self._say(
-                "Thanks. I want to get you to a rep directly to finish verification — "
-                "one moment while I connect you.",
-                instruction="Tell the carrier you're connecting them to a human rep to "
-                "finish verification. Keep it smooth and non-accusatory.",
+                "You're putting them through to a rep to finish getting them set up. Say "
+                "so smoothly and keep it moving — nothing accusatory, no detail about what "
+                "flagged, and do not discuss the load or a rate.",
+                amounts=set(),
             )
 
-        # Approved & verified — NOW it's safe to share the load. If the load has
-        # special requirements, present it + read them out and confirm BEFORE rate.
-        ld = self.load
-        details = (f"{ld.load_id}, {ld.origin.split(',')[0]} to {ld.destination.split(',')[0]}, "
-                   f"{ld.equipment}, picking up {ld.pickup_date}")
-        if ld.notes:
+        # Approved & verified — but the load STILL doesn't come out yet. A rep's
+        # next question is the empty call: where the truck frees up and when. It
+        # tells us whether they can even make the pickup, and it's the answer we
+        # lean on later when they push on rate.
+        self.state = CallState.ASK_EMPTY
+        return self._say(
+            "You've found them in the system. Check their company name back with them as "
+            "a question, then ask where their truck is getting empty and when. Never read "
+            "the MC or USDOT digits back. Say NOTHING about the lane, cities, equipment, "
+            "dates or rate — that comes after you know where their truck is.",
+            amounts=set(),
+        )
+
+    # -- The empty call: when and where does the truck free up? ------------- #
+    def _ask_empty(self, text: str) -> str:
+        """Real desks ask this before quoting anything. Both halves matter, and
+        callers routinely give one — so we follow up on the half we missed rather
+        than re-asking the whole question."""
+        self._empty_raw.append(text.strip())
+        self._empty_location = self._empty_location or parsing.extract_empty_location(text)
+        self._empty_when = self._empty_when or parsing.extract_empty_when(text)
+
+        if self._empty_followups < 2 and not (self._empty_location and self._empty_when):
+            self._empty_followups += 1
+            if self._empty_location:
+                return self._say(
+                    "They told you WHERE the truck empties but not WHEN. Acknowledge the "
+                    "place in two or three words and ask when it's going to be empty. Do "
+                    "not ask where again. Nothing about the load or the rate yet.",
+                    amounts=set(),
+                )
+            if self._empty_when:
+                return self._say(
+                    "They told you WHEN the truck empties but not WHERE. Acknowledge the "
+                    "timing in two or three words and ask what city and state it's empty "
+                    "in. Do not ask when again. Nothing about the load or the rate yet.",
+                    amounts=set(),
+                )
+            return self._say(
+                "You caught neither the place nor the timing in that. Say you didn't catch "
+                "it and ask again where their truck is getting empty and when. Nothing "
+                "about the load or the rate yet.",
+                amounts=set(),
+            )
+
+        self._repo.log_note(
+            self.call_id,
+            f"Empty call for {self.load.load_id}: "
+            f"where={self._empty_location or 'NOT CAPTURED'}, "
+            f"when={self._empty_when or 'NOT CAPTURED'} "
+            f"(raw: {' | '.join(self._empty_raw)!r})",
+        )
+        return self._reveal_load()
+
+    def _empty_summary(self) -> str:
+        """What we know about their truck, for the phrasing context."""
+        if self._empty_location and self._empty_when:
+            return f"Their truck is empty in {self._empty_location} {self._empty_when}."
+        if self._empty_location:
+            return f"Their truck is empty in {self._empty_location}."
+        if self._empty_when:
+            return f"Their truck is empty {self._empty_when}."
+        return ""
+
+    def _reveal_load(self) -> str:
+        """Empty call done — now the load comes out. If it has special
+        requirements, read them and confirm BEFORE talking rate."""
+        self._load_revealed = True       # from here the composer may quote the load
+        if self.load.notes:
             self.state = CallState.CHECK_REQUIREMENTS
             return self._say(
-                f"You're verified, {self.carrier.legal_name}. Here's the load — {details}. "
-                f"One thing though — {ld.notes} Can you handle that?",
-                instruction=f"Tell the carrier {self.carrier.legal_name} they're verified "
-                "(by company name, never the MC number). NOW share the load details: "
-                f"{details}. Then read the special requirements verbatim: \"{ld.notes}\" "
-                "and ask if they can do it.",
-                context=f"Carrier {self.carrier.legal_name}. Load {details}. "
-                f"Requirements: {ld.notes}",
-                amounts=set(),   # rate comes only after they confirm the requirements
+                "Give them the load: what it is, the lane, when it picks up and delivers "
+                "with the appointment windows, the commodity and piece count, the "
+                "equipment, and the miles. One flowing rundown, the way a rep reads it off "
+                "a screen — not a list. THEN read them the special requirements and ask "
+                "straight out whether they can do that. Say NOTHING about rate yet; that "
+                "comes only once they've said they can meet the requirements.",
+                amounts=set(),
             )
         return self._present_offer(with_details=True)
 
@@ -422,28 +635,24 @@ class CarrierSalesAgent:
         self.state = CallState.STATE_PRICE
         opening = int(self.neg.current_offer)
         self._repo.log_offer(self.call_id, 0, OfferParty.AGENT, opening)
-        ld = self.load
-        details = (f"{ld.load_id}, {ld.origin.split(',')[0]} to {ld.destination.split(',')[0]}, "
-                   f"{ld.equipment}, picking up {ld.pickup_date}")
         if with_details:
+            self._load_revealed = True
             return self._say(
-                f"You're verified, {self.carrier.legal_name}. Here's the load — {details}. "
-                f"I've got it at ${opening}. That work?",
-                instruction=f"Tell the carrier {self.carrier.legal_name} they're verified "
-                f"(company name, not the MC number), share the load: {details}, then float "
-                f"YOUR opening offer — say you've got it at ${opening} (your number, not "
-                f"theirs: \"I've got it at ${opening}\", never \"you're at ${opening}\") — "
-                f"and ask if it works. Name no dollar figure other than ${opening}.",
-                context=f"Carrier {self.carrier.legal_name}. Load {details}. Opening ${opening}.",
+                "Give them the load: what it is, the lane, when it picks up and delivers "
+                "with the appointment windows, the commodity and piece count, the "
+                "equipment, and the miles. One flowing rundown, the way a rep reads it off "
+                f"a screen — not a list. Then put YOUR number on it: you're asking "
+                f"${opening} on this one. It is YOUR asking rate, not theirs — \"I've got "
+                f"it at ${opening}\", never \"you're at ${opening}\". Finish by asking if "
+                "they want the load. They already know they're verified, so don't tell "
+                "them again.",
                 amounts={opening},
                 must_say=opening,
             )
         return self._say(
-            f"Great. On rate, I've got this one at ${opening}. Can you work with that?",
-            instruction=f"Float YOUR opening offer — say you've got it at ${opening} (your "
-            f"number, not theirs) — and ask if it works. Brief; the load details were "
-            f"already given. Name no dollar figure other than ${opening}.",
-            context=f"Opening offer ${opening}. Never read back the MC number.",
+            f"They already have the load details, so go straight to rate: you're asking "
+            f"${opening} on this one — your number, not theirs — and ask whether that "
+            "works for them. Short.",
             amounts={opening},
             must_say=opening,
         )
@@ -458,10 +667,10 @@ class CarrierSalesAgent:
             )
             self._finish(CallOutcome.NO_DEAL)
             return self._say(
-                "No worries — since you can't cover those requirements, I can't book this "
-                "one with you today. Thanks for calling, and let's catch the next one.",
-                instruction="Politely say that since they can't meet the load's "
-                "requirements you can't book it with them, and close warmly. 1-2 sentences.",
+                "They've said they can't meet this load's requirements, so you can't book "
+                "it with them. Say that without making them feel bad about it, leave the "
+                "door open for the next one, and close the call. Two sentences, no rate.",
+                amounts=set(),
             )
         return self._present_offer()
 
@@ -485,10 +694,12 @@ class CarrierSalesAgent:
             # "No" / "come on" with no new number -> they're holding; make our move.
             ask = self._last_ask
         else:
+            # No number and no rejection — they said something else entirely
+            # (a question, a comment). Answer it, then steer back to their number.
             return self._say(
-                f"What are you looking to get on {self.load.load_id}?",
-                instruction=f"Ask the carrier, naturally, what rate they need on load "
-                f"{self.load.load_id}. Do NOT name any dollar figure yourself.",
+                "They didn't give you a rate. Deal with whatever they actually just said "
+                "first — if it's a question you can answer from FACTS, answer it — then "
+                "ask what they need to get on this load. Do not name a figure yourself.",
                 amounts=set(),
             )
 
@@ -536,29 +747,23 @@ class CarrierSalesAgent:
         if result.decision == Decision.PULL:
             if result.pull_number <= 1:
                 return self._say(
-                    f"Okay, ${ask_i}'s better — but I'm still at ${rate}. How close can "
-                    "you actually get to me on it?",
-                    instruction=f"The carrier came down to ${ask_i}. Give them ONE short "
-                    f"beat of credit for moving, restate that YOUR number is still "
-                    f"${rate}, and ask how close they can get to ${rate}. You are NOT "
-                    "countering and NOT raising your offer — the next move is theirs, so "
-                    f"end on the question. {no_new_number}",
-                    context=f"{lane} You're holding at ${rate}; they just moved to "
-                    f"${ask_i}. {no_new_number}",
+                    f"They came down to ${ask_i}. Give them one short beat of credit for "
+                    f"moving, restate that YOUR number is still ${rate}, and ask how close "
+                    f"they can get to ${rate}. You are NOT countering and NOT raising your "
+                    f"offer — the next move is theirs, so end on the question. "
+                    f"{no_new_number}",
+                    facts=f"{lane} You are holding at ${rate}. They just moved to ${ask_i}.",
                     amounts={rate, ask_i},
                     must_say=rate,
                 )
             lever = self._next_lever()
             return self._say(
-                f"You're coming my way, but ${ask_i}'s still short for me — I'm at "
-                f"${rate}. Look, {lever}. Where do you actually need to be on it?",
-                instruction=f"The carrier moved again, to ${ask_i}, but it's still short "
-                f"of your ${rate}. Do NOT counter and do NOT raise your offer. Sell the "
-                f"load on this one non-price point: {lever}. Then ask where they actually "
-                f"need to be to make it work. Firm and friendly, no begging. "
-                f"{no_new_number}",
-                context=f"{lane} You're holding at ${rate}; they're at ${ask_i}. "
-                f"Value to sell: {lever}. {no_new_number}",
+                f"They moved again, to ${ask_i}, still short of your ${rate}. Do NOT "
+                f"counter and do NOT raise your offer. Sell the load on this one non-price "
+                f"point: {lever}. Then ask where they actually need to be to make it work. "
+                f"Firm and friendly, no begging. {no_new_number}",
+                facts=f"{lane} You are holding at ${rate}. They are at ${ask_i}. "
+                f"Non-price point to use: {lever}",
                 amounts={rate, ask_i},
                 must_say=rate,
             )
@@ -571,33 +776,36 @@ class CarrierSalesAgent:
                 # the argument, and repeating the discovery question sounds canned.
                 opened = int(self.neg.floor)
                 return self._say(
-                    f"Hang on — I came up from ${opened} to ${rate} and you're still at "
-                    f"${ask_i}. I need you to come my way now. What's it take?",
-                    instruction=f"You already moved from ${opened} up to ${rate}; the "
-                    f"carrier is still sitting on ${ask_i}. Point that out — you've moved, "
-                    "they haven't — and ask them to come to you now. Don't be rude about "
-                    f"it. {no_new_number} You may also mention your opening ${opened}.",
-                    context=f"{lane} You opened at ${opened}, you're now at ${rate}, they "
-                    f"haven't moved off ${ask_i}. {no_new_number}",
+                    f"You already moved from ${opened} up to ${rate}; they are still "
+                    f"sitting on ${ask_i}. Point the imbalance out — you've moved, they "
+                    f"haven't — and ask them to come your way now. Not rude about it. "
+                    f"{no_new_number} You may also mention your opening ${opened}.",
+                    facts=f"{lane} You opened at ${opened} and are now at ${rate}. They "
+                    f"have not moved off ${ask_i}.",
                     amounts={rate, ask_i, opened},
                     must_say=rate,
                 )
             if result.hold_number <= 1:
                 # A rep's first move on a high ask isn't a counter — it's a question.
-                # Find out what's driving their number before spending a dollar.
+                # We took the empty call earlier, so we already know where their truck
+                # is: use it instead of asking them the same thing twice.
+                if self._empty_location:
+                    probe_note = (f"You ALREADY know their truck empties in "
+                                  f"{self._empty_location} — do NOT ask where they're "
+                                  "coming out of. Refer to it and ask what's driving "
+                                  "their number.")
+                else:
+                    probe_note = ("Ask ONE short question about what's driving their "
+                                  "number — where they're coming out of, or whether "
+                                  "they're deadheading in.")
                 return self._say(
-                    f"Yeah, ${ask_i}'s a reach for me on this one — I'm at ${rate}. "
-                    "What's got you up there, are you deadheading in? Tell me how close "
-                    f"you can get to ${rate}.",
-                    instruction=f"The carrier asked for ${ask_i}. Don't call their number "
-                    "too-high or 'above market' (you don't want to bluff a number you "
-                    f"might pay). Say you can't get to ${ask_i}, restate that YOUR number "
-                    f"is ${rate}, ask ONE short question about what's driving their number "
-                    "(where they're coming out of / whether they're deadheading in), and "
-                    f"ask how close they can get to ${rate}. The target you name must be "
-                    f"${rate}, never ${ask_i} — you are asking THEM to come down to you, "
-                    f"not offering to come up. {no_new_number}",
-                    context=f"{lane} You're holding at ${rate}. {no_new_number}",
+                    f"They asked for ${ask_i}. Say you can't get there and restate that "
+                    f"YOUR number is ${rate}. {probe_note} Then ask how close they can get "
+                    f"to ${rate}. The target you name is ${rate}, never ${ask_i} — you are "
+                    f"asking THEM to come down to you, not offering to come up. Do not "
+                    f"call their number too high or above market: you might end up paying "
+                    f"it. {no_new_number}",
+                    facts=f"{lane} You are holding at ${rate}.",
                     amounts={rate, ask_i},
                     must_say=rate,
                 )
@@ -605,16 +813,13 @@ class CarrierSalesAgent:
             # rate. Levers are free; dollars are not.
             lever = self._next_lever()
             return self._say(
-                f"You're still at ${ask_i} and I'm still at ${rate} — I need something "
-                f"from you here. Look, {lever}. What's the best you can actually do on "
-                "this one?",
-                instruction=f"The carrier repeated ${ask_i} without moving. Point out "
-                f"you're both where you started and you're still at ${rate}. Instead of "
-                "raising your number, sell the load on this one non-price point: "
-                f"{lever}. Then press them for the best number they can actually do. "
-                f"Firm, friendly, no begging. {no_new_number}",
-                context=f"{lane} You're holding at ${rate}; they haven't moved. "
-                f"Value to sell: {lever}. {no_new_number}",
+                f"They repeated ${ask_i} without moving. Point out you're both where you "
+                f"started and that you're still at ${rate}. Instead of raising your number, "
+                f"sell the load on this one non-price point: {lever}. Then press them for "
+                f"the best number they can actually do. Firm, friendly, no begging. "
+                f"{no_new_number}",
+                facts=f"{lane} You are holding at ${rate}. They have not moved. "
+                f"Non-price point to use: {lever}",
                 amounts={rate, ask_i},
                 must_say=rate,
             )
@@ -623,15 +828,13 @@ class CarrierSalesAgent:
         # spend once, decisively, and ask for the load in the same breath.
         if result.is_split:
             return self._say(
-                f"Alright — let's not go back and forth on it. I'll come to ${rate}, and "
-                f"I'll book you right now at that.",
-                instruction=f"The carrier is at ${ask_i}. Make your one move: you'll come "
-                f"to ${rate}, and ask for the load RIGHT NOW — 'say yes and I'll get you "
-                "covered on this one'. This is you coming to them, so own it. Confident "
-                "and final-ish without saying it's your last offer. Do NOT describe it as "
-                f"splitting anything. Name no dollar figure other than ${rate} and their "
+                f"They're at ${ask_i}. Make your one move: you'll come to ${rate}, and ask "
+                f"for the load right there and then — say yes and you'll get them covered. "
+                f"This is you coming to them, so own it. Confident and near-final without "
+                f"saying it's your last offer. Do NOT describe it as splitting anything or "
+                f"meeting in the middle. Say no figure other than ${rate} and their "
                 f"${ask_i}.",
-                context=f"{lane} Your closing offer is ${rate}. Never reveal your max.",
+                facts=f"{lane} Your closing offer is ${rate}. Never reveal your maximum.",
                 amounts={rate, ask_i},
                 must_say=rate,
             )
@@ -639,13 +842,11 @@ class CarrierSalesAgent:
         # engine never produces a plain incremental counter any more — it holds,
         # pulls, closes once, then makes its best number.
         return self._say(
-            f"Alright — tell you what, I'll stretch to ${rate}. That's honestly the "
-            "best I can do on this one. Say yes and it's yours.",
-            instruction=f"Make your FINAL, best offer of ${rate}. Convey warmly but "
-            "firmly that this is as high as you can go on this load, and ask them to "
-            "take it right now. Do NOT say it's a hard cap or reveal any internal "
-            f"number. Name no dollar figure other than ${rate} and their ${ask_i}.",
-            context=f"{lane} Final best offer ${rate}. Never call it your ceiling/max.",
+            f"Make your final, best offer: ${rate}. Warm but firm — this is as high as you "
+            f"can go on this load — and ask them to take it now. Do NOT call it a cap or a "
+            f"maximum and do not reveal any internal number. Say no figure other than "
+            f"${rate} and their ${ask_i}.",
+            facts=f"{lane} Final best offer ${rate}. Never call it your ceiling or maximum.",
             amounts={rate, ask_i},
             must_say=rate,
         )
@@ -657,18 +858,12 @@ class CarrierSalesAgent:
         self._agreed_rate = rate
         self.state = CallState.CONFIRM_BOOKING
         self._repo.log_offer(self.call_id, self.neg.round, OfferParty.AGENT, rate)
-        ld = self.load
-        city = ld.origin.split(",")[0]
         return self._say(
-            f"Alright, ${int(rate)} it is. Can you cover the pickup in {city} on "
-            f"{ld.pickup_date} with a {ld.equipment}? If so I'll shoot the rate con over "
-            "for you to sign — that locks it in.",
-            instruction=f"You've agreed on ${int(rate)} for the {ld.equipment} load, "
-            f"{ld.origin} to {ld.destination}, pickup {ld.pickup_date}. Confirm the rate, "
-            f"ask if they can cover that pickup (date/location/equipment), and say you'll "
-            "send the rate confirmation to sign to lock it in. Direct and warm.",
-            context=f"Agreed rate ${int(rate)}. Pickup {ld.pickup_date} in {city}. "
-            f"Equipment {ld.equipment}.",
+            f"You've agreed on ${int(rate)}. Say the number back so it's on the record, "
+            f"then ask whether they can cover that pickup — the day, the place and the "
+            f"equipment — and tell them you'll send the rate confirmation over to sign, "
+            f"which is what locks it in. Direct and warm.",
+            facts=f"Agreed rate: ${int(rate)}",
             amounts={int(rate)},
             must_say=int(rate),
         )
@@ -696,11 +891,11 @@ class CarrierSalesAgent:
         # against the record afterwards.
         self.state = CallState.CONFIRM_EMAIL
         return self._say(
-            "Perfect — what email should I send the rate con to?",
-            instruction="YOU (the rep) are sending the rate confirmation link to the "
-            "carrier. Ask which email address to send it to. Never imply the carrier sends "
-            "anything. Do NOT invent, guess or suggest an email address — wait for theirs. "
-            "Do NOT ask for a driver name, truck or trailer number. One short sentence.",
+            "They can cover the pickup. Ask which email address to send the rate "
+            "confirmation to. YOU are sending it to THEM — never imply they send you "
+            "anything. Do NOT invent, guess or suggest an address, and do not read one off "
+            "their file: wait for them to say it. Don't ask for a driver name or a truck "
+            "number. One short question.",
             amounts=set(),
         )
 
@@ -733,10 +928,9 @@ class CarrierSalesAgent:
         if self._email_asks < 1:
             self._email_asks += 1
             return self._say(
-                "Sorry, I didn't catch that — what's the best email for the rate con?",
-                instruction="You didn't get a usable email address. Say you didn't catch "
-                "it and ask again for the best address to send the rate confirmation to. "
-                "One short sentence. Do NOT invent or guess an address.",
+                "You didn't get a usable email address out of that. Say you didn't catch it "
+                "and ask again for the best address for the rate confirmation. One short "
+                "sentence. Do NOT invent, guess or suggest an address.",
                 amounts=set(),
             )
 
@@ -761,30 +955,25 @@ class CarrierSalesAgent:
         rate = int(self._agreed_rate)
         self._repo.book_load(self.load.load_id)
         self._finish(CallOutcome.BOOKED)
-        # Name the address the link is going to — that read-back is the carrier's
-        # last chance to catch a wrong one before the con lands in a dead inbox.
         if self._booking_email:
-            added = " I've added it to your file." if self._email_is_new else ""
-            closing = (f" I'm sending the rate con link to {self._booking_email} now."
-                       f"{added} Sign it and you're set.")
-            email_note = (f"Tell them the rate confirmation link is going to "
-                          f"{self._booking_email} — say that address exactly, do not "
-                          "alter or invent one. ")
+            # Naming the address out loud is the carrier's last chance to catch a
+            # wrong one before the con lands in an inbox nobody reads.
+            email_note = (f"Tell them the rate confirmation is going to "
+                          f"{self._booking_email} — say that address exactly as written, "
+                          "do not alter or improve it — and to sign it. ")
             if self._email_is_new:
                 email_note += "Mention you've saved that address to their file. "
+            facts = f"Rate confirmation goes to: {self._booking_email}"
         else:
             # Nothing to sign yet — don't pretend a con is on its way.
-            closing = (" Text me an email when you get a second and I'll fire the rate "
-                       "con over to sign.")
-            email_note = ("You still don't have their email, so ask them to send it over "
-                          "so you can get the rate con out. Do NOT invent an address, and "
-                          "do NOT say the rate confirmation is already on its way. ")
+            email_note = ("You still don't have an email for them, so ask them to send one "
+                          "over so you can get the rate confirmation out. Do NOT invent an "
+                          "address and do NOT say the confirmation is already on its way. ")
+            facts = "You have no email address for them."
         return self._say(
-            f"You're locked in on {self.load.load_id} at ${rate}.{closing} "
-            "Thanks, drive safe.",
-            instruction=f"Confirm they're booked on {self.load.load_id} at ${rate} and "
-            f"remind them to sign the rate con. {email_note}Close warmly and briefly.",
-            context=f"Rate con link goes to: {self._booking_email or 'unknown'}.",
+            f"Confirm they're booked on this load at ${rate}. {email_note}Close warmly and "
+            f"briefly — they're a driver who wants to get moving.",
+            facts=facts,
             amounts={rate},
             must_say=rate,
         )
@@ -803,36 +992,33 @@ class CarrierSalesAgent:
             who = resolution.rep.name if resolution.rep else None
             if who is None:
                 return self._say(
-                    "That number's above what I can approve on my own. My guys are all on "
-                    "calls, so let me get one of them to call you right back on it — "
-                    "don't take another load just yet.",
-                    instruction="Tell the carrier their number is above what you can "
-                    "approve yourself, that no one's free this second, and that a rep "
-                    "will call them right back about this load. Keep it hopeful — the "
-                    "deal is not dead. Do NOT name any dollar figure.",
+                    "Their number is above what you can approve on your own, and nobody "
+                    "senior is free this second. Tell them that, and that a rep will call "
+                    "them straight back on this load — ask them to sit tight rather than "
+                    "taking something else. Keep it hopeful: this is not a no. Name NO "
+                    "dollar figure.",
                     amounts=set(),
                 )
             return self._say(
-                f"That's above what I can approve on my own, but it's not a no — let me "
-                f"get you {who}, who can sign off on it. Hold with me one second.",
-                instruction=f"Tell the carrier their number is above what YOU can approve "
-                f"on your own, that it is NOT a no, and that you're putting them through "
-                f"to {who} who can approve it. Keep it warm and hopeful. Do NOT name any "
-                "dollar figure and do NOT mention limits, caps or maximums.",
+                f"Their number is above what YOU can approve on your own, but it is NOT a "
+                f"no. Tell them that and that you're putting them through to {who}, who can "
+                f"sign off on it. Warm and hopeful. Name NO dollar figure and do not "
+                f"mention limits, caps or maximums.",
+                facts=f"Rep taking the call: {who}",
                 amounts=set(),
             )
         if resolution.rep is None:
             return self._say(
-                "Everyone's on the phone right now. I've logged a callback task and a "
-                "rep will call you right back. Thanks for your patience.",
-                instruction="Explain no rep is available, that you've logged a callback, "
-                "and someone will call them back shortly.",
+                "No rep is free right now. Tell them you've logged a callback and someone "
+                "will get straight back to them. Brief and apologetic without grovelling. "
+                "Name NO dollar figure.",
+                amounts=set(),
             )
         return self._say(
-            f"Let me connect you with {resolution.rep.name}, who handles this load. "
-            "One moment.",
-            instruction=f"Tell the carrier you're connecting them to {resolution.rep.name} "
-            "who handles this load.",
+            f"Tell them you're putting them through to {resolution.rep.name}, who handles "
+            f"this load, and to hold a moment. Name NO dollar figure.",
+            facts=f"Rep taking the call: {resolution.rep.name}",
+            amounts=set(),
         )
 
     # -- Above the agent's own authority -> hand it to a human -------------- #
@@ -867,15 +1053,10 @@ class CarrierSalesAgent:
         )
         self._finish(CallOutcome.NO_DEAL)
         return self._say(
-            "I've come up as far as I can go on this one and we're still apart, so I "
-            "can't make it work today. Keep my number though — if your situation changes "
-            "or you're back through here, call me and I'll get you on something. "
-            "Drive safe.",
-            instruction="Politely say you've come up as far as you can and you're still "
-            "apart, so you can't make this one work today. Then leave the door open: ask "
-            "them to call you back if their number changes or when they're back in the "
-            "area, since you have freight regularly. Do NOT reveal any numbers. Warm, "
-            "2 sentences.",
+            "You've come up as far as you can and you're still apart, so this one isn't "
+            "happening today. Say so, then leave the door properly open — you run freight "
+            "through there regularly, so ask them to call you if their number moves or when "
+            "they're back through. Warm, two sentences. Reveal NO numbers.",
             amounts=set(),
         )
 
