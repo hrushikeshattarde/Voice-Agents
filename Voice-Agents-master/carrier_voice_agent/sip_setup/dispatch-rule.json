@@ -1,0 +1,10 @@
+{
+  "dispatch_rule": {
+    "name": "carrier-calls",
+    "rule": {
+      "dispatchRuleIndividual": {
+        "roomPrefix": "call-"
+      }
+    }
+  }
+}
