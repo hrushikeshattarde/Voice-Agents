@@ -164,6 +164,11 @@ class Database:
             except sqlite3.OperationalError:
                 pass    # SQLite < 3.35: leave it, the reads ignore it anyway
 
+    def seed_reps(self) -> None:
+        """Populate only the transfer list — see `seed.seed_reps`."""
+        from lanevoice.db.seed import seed_reps
+        seed_reps(self)
+
     def reset(self, seed: bool = True) -> None:
         """Drop the file and recreate — handy for tests and repeatable demos."""
         self.path.unlink(missing_ok=True)
@@ -172,8 +177,10 @@ class Database:
 
 def main() -> None:
     """`lanevoice-initdb` entry point."""
+    from lanevoice.env import load_env
     from lanevoice.settings import get_settings
 
+    load_env()
     settings = get_settings()
     db = Database(settings.db_path)
     db.init(seed=True)

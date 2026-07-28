@@ -56,7 +56,12 @@ def spell_digits(value: str) -> str:
     """Read a reference number back one digit at a time.
 
     Confirming "2519181" as "two million five hundred..." is useless to a caller
-    checking it against a posting; they need it grouped as digits, the way the
-    number was read to them in the first place.
+    checking it against a posting; they need it one digit at a time, the way it
+    was read to them in the first place.
+
+    Separated by SPACES, not hyphens. This string ends up in the composer's facts
+    and usually reaches the voice verbatim, and the voice reads hyphenated digits
+    as part of the number — "L-1-0-0-3" is spoken "L 1 0 0 0 0 3" while the
+    transcript still looks right, which is a horrible thing to debug by ear.
     """
-    return "-".join(ch for ch in str(value) if ch.isalnum())
+    return " ".join(ch for ch in str(value) if ch.isalnum())

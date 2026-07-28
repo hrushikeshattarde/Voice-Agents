@@ -1,8 +1,21 @@
 """
-Text-mode simulation of the full call flow — no API keys, no models.
+Text-mode simulation of the full call flow — you type, the agent answers.
 
-    lanevoice-demo            # scripted scenarios
-    lanevoice-demo --chat     # interactive: you play the carrier
+    lanevoice-demo                    # scripted scenarios, offline seed data
+    lanevoice-demo --chat             # interactive, offline seed data
+    lanevoice-demo --chat --live      # interactive against REAL Transport Pro
+    lanevoice-demo --chat --live --facts    # ...and show the data behind each turn
+
+`--live` is the one to reach for when the question is "is it pulling the right
+information". It runs the whole call against the live board — the same repository
+the phone worker uses — so a real load number, a real MC and a real email address
+go through exactly the path a caller would take. Nothing is written to Transport
+Pro until a booking is actually agreed, at which point an offer IS posted; use a
+test load if that matters.
+
+`--facts` prints the FACTS block behind every turn: the only load, carrier and
+rate values the agent was allowed to speak. That is the fetched data, verbatim,
+which is usually what you actually want to see.
 """
 
 from __future__ import annotations
@@ -10,9 +23,59 @@ from __future__ import annotations
 import sys
 
 from lanevoice.conversation import CarrierSalesAgent
+from lanevoice.datasource import build_repository
 from lanevoice.db import Database, Repository
+from lanevoice.env import load_env
 from lanevoice.logging_config import setup_logging
-from lanevoice.settings import get_settings
+from lanevoice.settings import get_settings as _get_settings
+
+
+def get_settings(live: bool = False):
+    """Settings for the demo, pinned to the seed data unless `--live`.
+
+    The scripted scenarios are written against the seeded loads (`L1001`), so
+    they always run on SQLite regardless of `DATA_SOURCE` — including the load
+    number format the agent listens for. Point those at the live board and every
+    scripted turn would be talking about freight that doesn't exist.
+
+    `--live` is the deliberate exception: it honours `DATA_SOURCE` so an
+    interactive call can be driven against the real system of record.
+    """
+    settings = _get_settings()
+    return settings if live else settings.model_copy(update={"data_source": "sqlite"})
+
+
+class _ShowFacts:
+    """Wraps a composer and prints the data each turn was built from.
+
+    The agent hands the composer a DIRECTIVE (what the turn must achieve), FACTS
+    (everything it is allowed to state) and SPEAKABLE (the only dollar figures it
+    may utter). FACTS is the fetched load and carrier data, so printing it is the
+    most direct answer to "did it pull the right information" — more direct than
+    the sentence that comes out, which is the model's paraphrase of it.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def compose(self, directive, facts="", dialogue="", speakable="", correction=""):
+        # ASCII only. A Windows console is cp1252 by default, and a box-drawing
+        # character here raises UnicodeEncodeError inside the composer call — which
+        # the agent quite correctly reads as "the composer is broken" and hands the
+        # call to a rep. A debugging aid must not be able to end a call.
+        if facts:
+            print("\n      +-- FACTS the agent may speak this turn " + "-" * 25)
+            for line in facts.splitlines():
+                print(f"      | {line}")
+            print("      +" + "-" * 64)
+        if speakable:
+            print(f"      $ may say: {speakable}")
+        return self._inner.compose(directive=directive, facts=facts,
+                                   dialogue=dialogue, speakable=speakable,
+                                   correction=correction)
+
+    def read(self, dialogue, fields):
+        return self._inner.read(dialogue, fields)
 
 
 def _build_composer(settings):
@@ -41,14 +104,27 @@ def _build_composer(settings):
         return StubComposer(settings)
 
 
-def _new_agent(reset: bool = True) -> CarrierSalesAgent:
-    settings = get_settings()
+def _new_agent(live: bool = False, show_facts: bool = False) -> CarrierSalesAgent:
+    settings = get_settings(live)
+    composer = _build_composer(settings)
+    if show_facts:
+        composer = _ShowFacts(composer)
+
+    if live:
+        # The same repository the phone worker builds, so this exercises the real
+        # lookup path rather than a demo-shaped imitation of it.
+        settings.require("transport_pro_url", "transport_pro_username",
+                         "transport_pro_password")
+        print(f"[data: LIVE Transport Pro at {settings.transport_pro_url}]")
+        print(f"[selling loads with status: "
+              f"{', '.join(sorted(settings.open_load_statuses)) or '(none)'} "
+              f"— and postingInfo.isPosted true]")
+        return CarrierSalesAgent(build_repository(settings), composer, settings)
+
     db = Database(settings.db_path)
-    if reset:
-        db.reset(seed=True)
-    else:
-        db.init(seed=True)
-    return CarrierSalesAgent(Repository(db), _build_composer(settings), settings)
+    db.reset(seed=True)
+    print("[data: offline seed database — load numbers look like L1001]")
+    return CarrierSalesAgent(Repository(db), composer, settings)
 
 
 def _scripted(name: str, turns: list[str], max_rounds: int | None = None) -> None:
@@ -68,24 +144,40 @@ def _scripted(name: str, turns: list[str], max_rounds: int | None = None) -> Non
     print(f"--> {agent.summary()}")
 
 
-def _interactive() -> None:
-    agent = _new_agent(reset=True)
+def _interactive(live: bool = False, show_facts: bool = False) -> None:
+    agent = _new_agent(live=live, show_facts=show_facts)
+    print("[you are the carrier. Ctrl-C or an empty EOF ends the call.]\n")
     print(f"AGENT : {agent.greeting()}")
     while agent.state.value != "done":
         try:
             turn = input("CALLER: ")
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
+            print()
             break
         print(f"AGENT : {agent.handle(turn)}")
-    print("Summary:", agent.summary())
+    print("\nSummary:", agent.summary())
 
 
 def main() -> None:
+    live = "--live" in sys.argv
+    show_facts = "--facts" in sys.argv
+    # First, and before any get_settings(): that result is cached, so an .env
+    # loaded afterwards would have no effect on this process.
+    load_env(verbose=True)
     # Without this, a composer that can't reach its model fails silently and the
     # call just ends up with a rep for no visible reason.
-    setup_logging(get_settings().log_level)
-    if "--chat" in sys.argv:
-        _interactive()
+    setup_logging(get_settings(live).log_level)
+
+    # `--live` only makes sense interactively: the scripted scenarios below are
+    # written against seeded load numbers that do not exist on a real board.
+    if "--chat" in sys.argv or live:
+        try:
+            _interactive(live=live, show_facts=show_facts)
+        except RuntimeError as exc:
+            # Almost always missing credentials. A stack trace here tells you
+            # nothing you didn't already know and hides the one useful line.
+            print(f"\nCannot start: {exc}")
+            raise SystemExit(2) from None
         return
 
     # The address they give is already on Blue Sky's file -> matched, used as is.
@@ -94,11 +186,20 @@ def main() -> None:
         "yeah that works", "yep, I can cover it",
         "billing at blue sky logistics dot com",
     ])
-    # An address we've never seen -> used AND appended to the carrier's file.
-    _scripted("Carrier gives a new email -> added to their file", [
+    # An address that isn't on their account -> queried once, then handed to a
+    # rep. Nothing gets booked and nobody is told they're booked: the booking
+    # link only ever goes somewhere already on the carrier's record.
+    _scripted("Email not on the carrier's account -> no booking", [
         "L1003", "MC654321", "empty in Phoenix, Arizona right now",
         "that works", "yep can cover it",
         "send it to newdesk at roadrunner freight dot com",
+        "no, newdesk at roadrunner freight dot com",
+    ])
+    # The same call, with an address that IS on their account -> booked.
+    _scripted("Email matches the account -> booked, link goes there", [
+        "L1003", "MC654321", "empty in Phoenix, Arizona right now",
+        "that works", "yep can cover it",
+        "send it to ops at roadrunner freight dot com",
     ])
     # Reciprocity then the close: the agent holds while the carrier stonewalls,
     # trades halves once they start moving, splits the last gap, and books it.

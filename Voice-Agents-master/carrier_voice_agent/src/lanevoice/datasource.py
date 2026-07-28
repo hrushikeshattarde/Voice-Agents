@@ -1,0 +1,63 @@
+"""
+Where the agent's loads and carriers come from.
+
+One function, so the worker, the demo and the tests all resolve `DATA_SOURCE`
+the same way and nothing else in the codebase has to know which backend is live.
+
+    DATA_SOURCE=transportpro   the live Public API (needs TRANSPORT_PRO_*)
+    DATA_SOURCE=sqlite         the offline seed data
+
+The local SQLite database is opened either way: with Transport Pro it holds the
+call audit trail (calls, offers, notes, handoffs) and the warm-transfer rep list,
+neither of which the Public API has an endpoint for.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from lanevoice.db import Database, Repository
+from lanevoice.logging_config import get_logger
+from lanevoice.settings import Settings, get_settings
+
+if TYPE_CHECKING:
+    from lanevoice.integrations.transportpro import TransportProRepository
+
+logger = get_logger(__name__)
+
+
+def build_repository(
+    settings: Settings | None = None,
+) -> Repository | TransportProRepository:
+    """The repository the conversation layer should use, per `DATA_SOURCE`.
+
+    Seeding the sample loads and carriers is skipped in Transport Pro mode — the
+    real board is the source, and seeded L1001s sitting alongside it would be a
+    trap for whoever debugs this next. The rep table is always seeded, because
+    that is the transfer list.
+    """
+    settings = settings or get_settings()
+    live = settings.uses_transport_pro
+
+    db = Database(settings.db_path)
+    db.init(seed=not live)
+    if live:
+        db.seed_reps()
+    audit = Repository(db)
+
+    if not live:
+        logger.info("Data source: local SQLite seed data (%s)", settings.db_path)
+        return audit
+
+    # Imported here so the offline path never needs httpx or a base URL.
+    from lanevoice.integrations.transportpro import (
+        TransportProClient,
+        TransportProRepository,
+    )
+
+    settings.require("transport_pro_url", "transport_pro_username",
+                     "transport_pro_password")
+    client = TransportProClient(settings)
+    logger.info("Data source: Transport Pro at %s (audit trail in %s)",
+                settings.transport_pro_url, settings.db_path)
+    return TransportProRepository(client, audit, settings)

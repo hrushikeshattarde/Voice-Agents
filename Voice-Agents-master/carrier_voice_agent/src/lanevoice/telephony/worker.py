@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 
 import numpy as np
-from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -37,14 +36,17 @@ except ImportError:  # pragma: no cover
 
 from lanevoice import parsing
 from lanevoice.conversation import CarrierSalesAgent
-from lanevoice.db import Database, Repository
+from lanevoice.datasource import build_repository
+from lanevoice.db import Repository
+from lanevoice.env import load_env
 from lanevoice.logging_config import get_logger, setup_logging
 from lanevoice.settings import get_settings
 from lanevoice.voice import GroqComposer, GroqTTS, StubComposer
 
-# Runtime setup (kept below imports so linting stays clean). load_dotenv() runs
-# before get_settings() so a local .env populates the environment first.
-load_dotenv()
+# Runtime setup (kept below imports so linting stays clean). load_env() runs
+# before get_settings() so a .env — found by searching upward from the working
+# directory, not just in it — populates the environment first.
+load_env()
 _settings = get_settings()
 setup_logging(_settings.log_level)
 logger = get_logger("lanevoice.worker")
@@ -85,9 +87,10 @@ class _TTSStream(lk_tts.ChunkedStream):
 # Worker lifecycle
 # --------------------------------------------------------------------------- #
 def prewarm(proc):
-    db = Database(_settings.db_path)
-    db.init(seed=True)
-    proc.userdata["repo"] = Repository(db)
+    # Transport Pro or the offline seed data, per DATA_SOURCE. Built once per
+    # worker process and shared by every call it handles — the repository caches
+    # reads briefly and handles its own concurrency.
+    proc.userdata["repo"] = build_repository(_settings)
     # VAD tuned to ignore background noise: require clearer, slightly longer
     # speech before it counts as a turn (defaults are 0.5 / 0.05s — too twitchy
     # for a noisy phone line).

@@ -1,9 +1,29 @@
 """
-Carrier verification service (PRD §8).
+Carrier verification (PRD §8) — the gate every call passes before a rate exists.
 
-This is a MOCK backed by the seed DB. In production, replace the lookup with a
-call to FMCSA QCMobile + a commercial fallback (Highway / RMIS / DAT), but keep
-this exact decision + fraud-flag logic. USDOT is treated as primary (§8.3).
+The desk requirement is a single sentence: the carrier's MC/USDOT has to be in
+the system as ACTIVE. INACTIVE and SUSPENDED are both hard stops, and so is any
+status the source sent that we couldn't read as one of the three
+(`AuthorityStatus` fails closed to SUSPENDED — it never guesses ACTIVE).
+
+The outcomes are deliberately three, not two, because they are three different
+things and a carrier hears something different for each:
+
+    PROCEED       active, insured, on file       -> the load comes out
+    DECLINE       the source says not active     -> they don't meet the
+                                                   requirements to work with us
+    HUMAN_REVIEW  we don't KNOW that they're     -> a person looks at it
+                  not active
+
+That last row is the one worth guarding. "Their authority is inactive" and "we
+could not find a status field on their record" are the same absence of a yes, but
+telling a legitimate carrier they fail our requirements because our own mapping
+missed a field is a false accusation, and it is the kind of thing a carrier
+repeats to other brokers. `Carrier.authority_reported` separates them: a record
+whose status we could not read at all goes to a human.
+
+Where carriers come from (SQLite seed or the Transport Pro API) makes no
+difference here — that is the repository's job. This logic is the same either way.
 """
 
 from __future__ import annotations
@@ -22,6 +42,8 @@ class CarrierVerificationService:
     def verify(self, mc_or_dot: str) -> VerificationResult:
         carrier = self._repo.get_carrier(mc_or_dot)
         if carrier is None:
+            # Could equally be a misheard digit as a carrier we don't have, so
+            # this is not a decline — the agent asks again, then hands it over.
             return VerificationResult(
                 verified=False,
                 action=VerificationAction.HUMAN_REVIEW,
@@ -29,11 +51,12 @@ class CarrierVerificationService:
             )
 
         risk_flags: list[str] = []
-        # ACTIVE authority is the company requirement. INACTIVE and SUSPENDED both
-        # stop here, and so does any status the feed sent that we couldn't read
-        # (AuthorityStatus fails closed to SUSPENDED).
-        if not carrier.authority_status.can_haul:
-            risk_flags.append(f"authority_{carrier.authority_status.value}")
+        if not carrier.authority_reported:
+            risk_flags.append("authority_not_reported")
+        elif not carrier.authority_status.can_haul:
+            risk_flags.append(
+                f"authority_{carrier.authority_status.value}"
+                f"[{carrier.raw_authority_status}]")
         if not carrier.insurance_on_file:
             risk_flags.append("insurance_lapse")
         if (
@@ -42,12 +65,8 @@ class CarrierVerificationService:
         ):
             risk_flags.append("recently_reactivated")
 
-        hard_fail = (
-            not carrier.authority_status.can_haul
-            or not carrier.insurance_on_file
-        )
-
-        if hard_fail:
+        # We couldn't read a status at all — that's our problem, not theirs.
+        if not carrier.authority_reported:
             return VerificationResult(
                 verified=False,
                 action=VerificationAction.HUMAN_REVIEW,
@@ -55,10 +74,52 @@ class CarrierVerificationService:
                 high_risk=True,
                 approved=carrier.approved,
                 risk_flags=tuple(risk_flags),
-                reason="authority_or_insurance",
+                reason="authority_not_reported",
             )
 
-        # Authority/insurance are fine, but is the carrier approved to work with us?
+        # Mid-onboarding (Transport Pro's `REVIEW`). Not a failure — nothing has
+        # been decided yet — so it is not a decline. Onboarding can often finish
+        # this on the call, which is exactly what a rep is for.
+        if not carrier.authority_status.is_definite:
+            return VerificationResult(
+                verified=False,
+                action=VerificationAction.HUMAN_REVIEW,
+                carrier=carrier,
+                high_risk=True,
+                approved=carrier.approved,
+                risk_flags=tuple(risk_flags),
+                reason="authority_pending_review",
+            )
+
+        # The source system says they are not active. This is the one the caller
+        # is told about, in the vague terms the desk uses: they don't currently
+        # meet the requirements to work with us.
+        if not carrier.authority_status.can_haul:
+            return VerificationResult(
+                verified=False,
+                action=VerificationAction.DECLINE,
+                carrier=carrier,
+                high_risk=True,
+                approved=carrier.approved,
+                risk_flags=tuple(risk_flags),
+                reason="authority_not_active",
+            )
+
+        # Active authority but no insurance on file. Also a hard stop, but it is
+        # routinely a paperwork lag rather than a dead carrier, and a rep can
+        # often fix it on the call — so it goes to a person, not to a decline.
+        if not carrier.insurance_on_file:
+            return VerificationResult(
+                verified=False,
+                action=VerificationAction.HUMAN_REVIEW,
+                carrier=carrier,
+                high_risk=True,
+                approved=carrier.approved,
+                risk_flags=tuple(risk_flags),
+                reason="insurance_lapse",
+            )
+
+        # Authority and insurance are fine. Are they approved to work with us?
         if not carrier.approved:
             return VerificationResult(
                 verified=True,

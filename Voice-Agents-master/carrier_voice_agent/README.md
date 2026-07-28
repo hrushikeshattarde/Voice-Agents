@@ -5,7 +5,8 @@ load, verifies the carrier, negotiates the rate, and **books / warm-transfers /
 declines** — with a full audit trail.
 
 **Stack:** LiveKit (telephony + SIP) · **Groq** for STT / LLM / TTS ·
-SQLite + typed, deterministic Python business logic.
+**Transport Pro** Public API as the system of record · typed, deterministic
+Python business logic.
 
 ---
 
@@ -21,10 +22,13 @@ src/lanevoice/
 ├── services/              # the deterministic "product": loads, verification,
 │                          #   negotiation engine, transfer
 ├── conversation/          # CarrierSalesAgent — the call state machine (the brain)
+├── integrations/          # Transport Pro: client, mappers, repository, tpcheck
+├── datasource.py          # picks the backend from DATA_SOURCE
 ├── voice/                 # GroqTTS + GroqComposer (writes every spoken turn)
 ├── telephony/             # LiveKit worker (STT plugin + TTS adapter + lifecycle)
 └── demo.py                # text-mode simulation (no keys)
-tests/                     # pytest: parsing, negotiation, verification, conversation
+tests/                     # pytest: parsing, negotiation, verification, conversation,
+                           #   Transport Pro client / mappers / repository / full calls
 docs/                      # LIVE_SETUP.md, TEST_CALL_SCRIPTS.md
 sip_setup/                 # LiveKit inbound-trunk + dispatch-rule JSON
 Dockerfile · Makefile · pyproject.toml
@@ -49,14 +53,44 @@ make demo             # text simulation of every scenario
 
 To take real calls, add credentials then run the worker:
 ```bash
-cp .env.example .env  # fill in LiveKit + Groq keys
+cp .env.example .env  # fill in LiveKit + Groq + Transport Pro
 make worker           # uv run lanevoice-worker dev
 ```
+`make demo` and `make test` run entirely offline on the seed data
+(`DATA_SOURCE=sqlite`) and need no credentials at all.
+
+### Checking it pulls the right data
+
+Three commands, cheapest first — no phone needed for any of them.
+
+```bash
+lanevoice-tpcheck --load 2520571 --mc 343195 --raw
+```
+Read-only. Authenticates, fetches that load and that carrier, and prints the raw
+payload beside what the mappers made of it — status, `isPosted`, the floor and
+max buy, the lane, the notes, the addresses on the account. When something won't
+work it names the setting or the constant to change.
+
+```bash
+lanevoice-demo --chat --live --facts
+```
+The whole call in the terminal: you type as the carrier, against the **real**
+board, through the same repository the phone worker uses. `--facts` prints the
+data behind every turn — the only load, carrier and rate values the agent was
+allowed to speak. Drop `--live` to run the same thing on seed data.
+
+> `--live` posts a real offer to Transport Pro if you take a booking all the way
+> through. Use a test load if that matters.
+
+```bash
+make test
+```
+257 tests, offline. Includes the two real production load payloads.
 SIP wiring: [docs/LIVE_SETUP.md](docs/LIVE_SETUP.md) ·
 call scripts: [docs/TEST_CALL_SCRIPTS.md](docs/TEST_CALL_SCRIPTS.md).
 
 Console entry points (installed by `uv sync`):
-`lanevoice-worker` · `lanevoice-demo` · `lanevoice-initdb`.
+`lanevoice-worker` · `lanevoice-demo` · `lanevoice-initdb` · `lanevoice-tpcheck`.
 
 **Full run guide (every command + every case):** [docs/USAGE.md](docs/USAGE.md).
 
@@ -69,6 +103,13 @@ via `.env`:
 
 | Setting | Env var | Default |
 |---|---|---|
+| **Data source** | `DATA_SOURCE` | `transportpro` (or `sqlite` for offline) |
+| Transport Pro API root | `TRANSPORT_PRO_URL` | — (required) |
+| Transport Pro login | `TRANSPORT_PRO_USERNAME` / `_PASSWORD` | — (required) |
+| **Load statuses the agent sells** | `TRANSPORT_PRO_OPEN_LOAD_STATUSES` | `ready to dispatch` |
+| API timeout (s) | `TRANSPORT_PRO_TIMEOUT` | `10.0` |
+| Fraud tripwire, share of board rate | `TRANSPORT_PRO_FRAUD_LOW_RATIO` | `0.5` |
+| Load numbers read aloud on a miss | `TRANSPORT_PRO_MAX_OFFERED_LOADS` | `5` |
 | STT model | `STT_MODEL` | `whisper-large-v3-turbo` |
 | LLM model | `LLM_MODEL` | `llama-3.1-8b-instant` |
 | TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `canopylabs/orpheus-v1-english` / `troy` |
@@ -91,8 +132,9 @@ Change a model = change one line (or one env var). Nothing else hard-codes it.
 |---|---|---|
 | **LiveKit** ([cloud.livekit.io](https://cloud.livekit.io)) | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | telephony + SIP + phone number |
 | **Groq** ([console.groq.com](https://console.groq.com), free tier) | `GROQ_API_KEY` | STT + LLM + TTS |
+| **Transport Pro** Public API | `TRANSPORT_PRO_URL`, `TRANSPORT_PRO_USERNAME`, `TRANSPORT_PRO_PASSWORD` | loads, carrier vetting, contacts, offers |
 
-`make demo` and `make test` need neither.
+`make demo` and `make test` need none of them.
 
 ## Deploy
 ```bash
@@ -101,8 +143,17 @@ make docker           # build image
 docker run --env-file .env lanevoice:latest
 ```
 
+## Transport Pro integration
+
+Loads, carrier vetting and contact addresses come from the Transport Pro Public
+API; the **call audit trail stays local** (the API has no endpoint for it, and
+losing it would make a disputed booking unauditable).
+
+See **[docs/TRANSPORT_PRO.md](docs/TRANSPORT_PRO.md)** for the endpoint map, the
+field mapping, the three call gates, and the two things to verify against live
+data before go-live.
+
 ## Out of scope (v1)
-Outbound calling, multi-load calls, live Transport Pro integration (seed DB
-stands in for the load mirror), production fraud scoring. Carrier verification is
-a **mock** you replace with FMCSA + a commercial fallback — the decision logic
-stays.
+Outbound calling, multi-load calls, production fraud scoring beyond the
+board-rate tripwire. FMCSA is not consulted directly — carrier vetting is
+whatever Transport Pro reports for the MC/USDOT.

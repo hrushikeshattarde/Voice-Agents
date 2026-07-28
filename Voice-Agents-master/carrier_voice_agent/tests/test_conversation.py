@@ -9,13 +9,21 @@ each turn differently and a test that pins the wording would be testing the
 mock.
 """
 
+import re
+
 from lanevoice.conversation import CarrierSalesAgent
+from lanevoice.conversation.agent import _MAX_MC_ASKS
 from lanevoice.settings import get_settings
 from lanevoice.voice import StubComposer
 
 # The empty call now sits between verification and the load details, so every
 # path to a rate goes through it.
 EMPTY = "empty in Dallas, Texas today"
+
+# An address that IS on Blue Sky Logistics' file in the seed data. The booking
+# gate only confirms a booking for an address already on the carrier's account,
+# so every test that expects to reach "booked" has to give one of theirs.
+ON_FILE = "dispatch@blueskylogistics.com"
 
 
 def _agent(repo, max_rounds=6, composer=None):
@@ -158,6 +166,99 @@ def test_risk_flagged_carrier_goes_to_a_human(repo):
 
 
 # --------------------------------------------------------------------------- #
+# Hearing an MC/USDOT number the way a person does
+# --------------------------------------------------------------------------- #
+def _to_mc(repo, load="L1002"):
+    a = _agent(repo)
+    a.greeting()
+    a.handle(load)
+    return a
+
+
+def test_digits_are_remembered_across_turns(repo):
+    """A caller cut off mid-number carries on from where they stopped. Their first
+    attempt must not be thrown away — that's what forces the third re-ask."""
+    a = _to_mc(repo)
+    a.handle("six five four")
+    assert a._mc_digits == "654"                 # held, not discarded
+    assert a.state.value == "verify_carrier"
+    a.handle("three two one")
+    assert a._mc_digits == "654321"              # joined across the two turns
+    assert a.carrier.legal_name == "Roadrunner Freight Inc"
+    assert a.state.value == "ask_empty"
+
+
+def test_a_caller_who_backs_up_and_repeats_is_not_double_counted(repo):
+    """"six five four" ... "five four three two one" is 654321, not 654654321.
+    The carrier file decides which reading was real."""
+    a = _to_mc(repo)
+    a.handle("6, 5, 4")
+    a.handle("5, 4, 3, 2, 1")
+    assert a._mc_digits == "654321"
+    assert a.carrier is not None
+
+
+def test_a_caller_who_starts_the_number_over_is_understood(repo):
+    a = _to_mc(repo)
+    a.handle("it's 654")
+    a.handle("654321")
+    assert a._mc_digits == "654321"
+    assert a.carrier is not None
+
+
+def test_partial_number_is_confirmed_by_company_name(repo):
+    """One digit lost off the end still narrows to a single carrier. Reading the
+    NAME back is easier to confirm on a bad line than collecting digits."""
+    a = _to_mc(repo)
+    a.handle("MC 65432")                         # 654321 with the tail dropped
+    assert a.carrier is None                     # not verified on a guess
+    turn = a._composer.turns[-1]
+    assert "Roadrunner Freight Inc" in turn["facts"]
+    assert "do NOT read the MC or USDOT digits back" in turn["directive"].lower() \
+        or "do not read the mc or usdot digits back" in turn["directive"].lower()
+    a.handle("yes, that's us")                   # the confirmation resolves it
+    assert a.carrier.legal_name == "Roadrunner Freight Inc"
+    assert a._mc_digits == "654321"              # the real number, off their file
+
+
+def test_denying_the_name_discards_the_misheard_digits(repo):
+    """If the name is wrong the digits behind it were wrong too — keeping them
+    would just narrow to the same wrong carrier again."""
+    a = _to_mc(repo)
+    a.handle("MC 65432")
+    a.handle("no, different company")
+    assert a._mc_digits == ""
+    assert a._mc_narrowed is None
+    a.handle("MC 123456")
+    assert a.carrier.legal_name == "Blue Sky Logistics LLC"
+
+
+def test_the_agent_never_asks_a_caller_to_slow_down(repo):
+    """Nobody working a freight desk says "one digit at a time". Asking for it is
+    what made the caller on the real call hang up."""
+    a = _to_mc(repo)
+    for turn in ("uh hang on", "six five four", "mumble"):
+        a.handle(turn)
+        if a.state.value != "verify_carrier":
+            break
+    # Strip the sentences that explicitly FORBID this wording; nothing should be
+    # left that still tells the agent to ask for it.
+    instructions = re.sub(r"do not[^.]*", "", _directives(a))
+    for banned in ("slow down", "slowly", "one digit at a time"):
+        assert banned not in instructions, f"agent was told to ask for: {banned}"
+
+
+def test_an_unreadable_number_reaches_a_person_not_a_loop(repo):
+    a = _to_mc(repo)
+    for _ in range(_MAX_MC_ASKS + 1):
+        a.handle("static on the line")
+        if a.state.value == "done":
+            break
+    assert a.summary()["outcome"] == "transferred"
+    assert "Could not capture an MC/USDOT number" in _notes(repo)
+
+
+# --------------------------------------------------------------------------- #
 # The empty call gates the load details
 # --------------------------------------------------------------------------- #
 def test_load_details_are_withheld_until_the_empty_call(repo):
@@ -174,6 +275,29 @@ def test_load_details_are_withheld_until_the_empty_call(repo):
         assert "Chicago" not in blob and "Dallas" not in blob
         assert "Dry Van" not in blob
         assert turn["speakable"] == ""          # and no rate either
+
+
+def test_an_mc_read_one_digit_at_a_time_is_accepted(repo):
+    """The form we actually ask for has to work first time."""
+    a = _agent(repo)
+    a.greeting()
+    a.handle("Looking for load L1002")
+    a.handle("6, 5, 4, 3, 2, 1.")
+    assert a.carrier is not None
+    assert a.carrier.legal_name == "Roadrunner Freight Inc"
+    assert a.state.value == "ask_empty"          # straight on to the empty call
+
+
+def test_an_uncaptured_mc_goes_to_a_person_instead_of_asking_forever(repo):
+    """A caller who can't be heard gets a human, not a fourth attempt. Three
+    unanswered asks in a row is what made a real caller hang up."""
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1002")
+    for _ in range(_MAX_MC_ASKS):
+        a.handle("uh, hang on, my phone's cutting out")
+    assert a.summary()["outcome"] == "transferred"
+    assert "Could not capture an MC/USDOT number" in _notes(repo)
 
 
 def test_the_empty_call_asks_for_both_halves(repo):
@@ -364,7 +488,7 @@ def test_happy_path_books_at_opening(repo):
     assert a.state.value == "confirm_booking"
     a.handle("yep, I can cover it")
     assert a.state.value == "confirm_email"
-    a.handle("send it to dispatch@blue.com")
+    a.handle(f"send it to {ON_FILE}")
     assert a.summary()["outcome"] == "booked"
     assert repo.get_load("L1001").status.value == "covered"
 
@@ -375,7 +499,7 @@ def test_close_enough_gap_is_just_booked(repo):
     a.handle("2050")
     assert a.state.value == "confirm_booking"
     a.handle("yep can cover it")
-    a.handle("bill@carrier.com")
+    a.handle(ON_FILE)
     assert a.summary()["outcome"] == "booked"
     assert a._agreed_rate == 2050
 
@@ -389,7 +513,7 @@ def test_carrier_who_grinds_still_gets_covered(repo):
     assert a.state.value == "confirm_booking"
     assert a._agreed_rate == 2200
     a.handle("yes I can cover it")
-    a.handle("ops@blue.com")
+    a.handle(ON_FILE)
     assert a.summary()["outcome"] == "booked"
 
 
@@ -522,26 +646,58 @@ def test_agent_asks_for_the_email_and_suggests_nothing(repo):
     assert "@" not in a._composer.turns[-1]["facts"]    # no address put in its mouth
 
 
-def test_email_the_carrier_gives_is_matched_against_their_file(repo):
+def test_an_address_on_the_account_books_and_gets_the_link(repo):
     before = repo.carrier_emails("DOT1000001")
     assert len(before) > 1
     a = _to_email_step(repo)
     a.handle("send it to billing at blue sky logistics dot com")
     assert a._booking_email == "billing@blueskylogistics.com"
-    assert not a._email_is_new
-    assert repo.carrier_emails("DOT1000001") == before
-    assert "billing@blueskylogistics.com" in a._composer.turns[-1]["facts"]
+    assert a.summary()["outcome"] == "booked"
+    assert repo.carrier_emails("DOT1000001") == before   # nothing was added
+    last = a._composer.turns[-1]
+    assert "billing@blueskylogistics.com" in last["facts"]
+    assert "booking" in last["directive"].lower()
 
 
-def test_new_email_is_appended_to_the_carrier_file(repo):
+# --------------------------------------------------------------------------- #
+# The booking gate: an address that isn't on the account does NOT get a booking.
+#
+# This is the guard against the obvious attack on a voice desk — somebody who has
+# picked up a real MC number talking us into mailing the booking link to an
+# address they control. It is also the ordinary case of a misheard domain, which
+# is why the first miss is a re-ask rather than a handoff.
+# --------------------------------------------------------------------------- #
+def test_unknown_address_is_queried_once_and_books_nothing(repo):
     before = repo.carrier_emails("DOT1000001")
     a = _to_email_step(repo)
     a.handle("booking at blue sky freight dot com")
-    assert a._booking_email == "booking@blueskyfreight.com"
-    assert a._email_is_new
-    after = repo.carrier_emails("DOT1000001")
-    assert set(before) < set(after)
-    assert repo.get_carrier("123456").contact_emails == after
+
+    assert a.summary()["outcome"] is None          # still on the call
+    assert a.state.value == "confirm_email"
+    assert a._booking_email is None
+    assert repo.carrier_emails("DOT1000001") == before   # NOT appended any more
+
+    directive = a._composer.turns[-1]["directive"].lower()
+    assert "not the one on their account" in directive
+    assert "do not say they're booked yet" in directive
+    # It must not read the real addresses out — that would hand an impostor the
+    # answer, and it isn't how a rep confirms an address either.
+    assert "do not read out any address" in directive
+    for known in before:
+        assert known not in a._composer.turns[-1]["facts"]
+
+
+def test_unknown_address_twice_goes_to_a_rep_not_a_booking(repo):
+    a = _to_email_step(repo)
+    a.handle("booking at blue sky freight dot com")
+    a.handle("no it's definitely booking at blue sky freight dot com")
+
+    assert a.summary()["outcome"] == "transferred"
+    assert a._booking_email is None
+    notes = _notes(repo)
+    assert "NOT BOOKED" in notes
+    assert "not on their account" in notes
+    assert "2000" in notes            # the agreed rate is still recorded for a rep
 
 
 def test_carrier_can_point_at_the_address_on_file(repo):
@@ -551,17 +707,31 @@ def test_carrier_can_point_at_the_address_on_file(repo):
     assert a.summary()["outcome"] == "booked"
 
 
-def test_no_usable_email_is_asked_once_then_flagged(repo):
+def test_no_usable_email_is_asked_once_then_handed_over(repo):
+    """Previously this booked the load and left the confirmation to follow. It
+    can't any more: with no verified address there is nothing to send a booking
+    link to, so nobody gets told they're booked."""
     a = _to_email_step(repo)
     a.handle("uh, hang on a sec")
     assert "ask again for the best address" in a._composer.turns[-1]["directive"]
     a.handle("I'll have to dig it up")
-    assert a.summary()["outcome"] == "booked"
+    assert a.summary()["outcome"] == "transferred"
     assert a._booking_email is None
-    assert "NOT CAPTURED" in _notes(repo)
-    # And the closing turn must not pretend a confirmation is on its way.
-    assert "do NOT say the confirmation is already on its way" in \
-        a._composer.turns[-1]["directive"]
+    assert "NOT BOOKED" in _notes(repo)
+    assert "no usable address given" in _notes(repo)
+
+
+def test_booking_is_recorded_before_the_carrier_is_told(repo, monkeypatch):
+    """If the system of record won't take the booking, the carrier must not hear
+    that they're booked — a truck sent to a dock for a load nobody has a record
+    of is the worst outcome on this call."""
+    monkeypatch.setattr(repo, "record_booking", lambda *a, **k: False)
+    a = _to_email_step(repo)
+    a.handle(f"send it to {ON_FILE}")
+    assert a.summary()["outcome"] == "transferred"
+    assert "Could NOT record" in _notes(repo)
+    # Nothing in the closing turn may claim a booking.
+    assert "booked" not in a._composer.turns[-1]["directive"].lower()
 
 
 def test_cannot_cover_pickup_is_transferred(repo):

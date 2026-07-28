@@ -74,6 +74,10 @@ class Repository:
             last_verified_at=row["last_verified_at"],
             approved=bool(row["approved"]),
             contact_emails=emails,
+            # The column is NOT NULL, so a status was always reported here. This
+            # is what keeps `authority_reported` true for seeded carriers — an
+            # unreadable status is a live-feed condition, not a local one.
+            raw_authority_status=row["authority_status"],
         )
 
     @staticmethod
@@ -121,6 +125,32 @@ class Repository:
                 return None
             emails = self._emails(conn, row["usdot_number"])
             return self._carrier(row, emails)
+        finally:
+            conn.close()
+
+    def carriers_matching_digits(self, digits: str, limit: int = 5) -> list[Carrier]:
+        """Carriers whose MC or USDOT number STARTS WITH `digits`.
+
+        Phone audio loses digits, so requiring a perfect six of them before we
+        can look anybody up is what forces the agent to keep asking. A rep works
+        the other way round: they narrow on what they did hear and confirm by
+        company name. Below four digits this would match half the file, so it
+        returns nothing rather than a guess.
+        """
+        q = _digits(digits)
+        if len(q) < 4:
+            return []
+        conn = self._db.connect()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM carriers
+                   WHERE REPLACE(REPLACE(mc_number,'MC',''),' ','') LIKE ?
+                      OR REPLACE(REPLACE(usdot_number,'DOT',''),' ','') LIKE ?
+                   LIMIT ?""",
+                (f"{q}%", f"{q}%", limit),
+            ).fetchall()
+            return [self._carrier(r, self._emails(conn, r["usdot_number"]))
+                    for r in rows]
         finally:
             conn.close()
 
@@ -225,3 +255,27 @@ class Repository:
             " WHERE call_id=?",
             (load_id, carrier_dot, _now(), outcome, payload, call_id),
         )
+
+    # -- write-backs to a system of record --------------------------------- #
+    # These exist because the conversation layer calls them at the right moments
+    # regardless of where its data came from; the alternative is the agent asking
+    # what kind of repository it is holding, which is the coupling this class
+    # exists to prevent.
+    #
+    # They return True, and the return value means "the record is where it needs
+    # to be" — NOT "an API call was made". This repository IS the system of
+    # record, so there is nothing further to push and nothing that can fail. The
+    # agent only refuses to confirm a booking when one of these returns False,
+    # so getting this wrong would break the offline demo and every test.
+    def record_booking(self, load: Load, carrier: Carrier, rate: float,
+                       **_kwargs: object) -> bool:
+        """Nothing to push: `book_load` already recorded it locally."""
+        return True
+
+    def record_capacity(self, carrier: Carrier, **_kwargs: object) -> bool:
+        """Nothing to push: the empty call is in the call notes."""
+        return True
+
+    def post_load_note(self, load_id: str, content: str) -> bool:
+        """Nothing to push: notes are in `call_notes` against the call."""
+        return True

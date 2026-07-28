@@ -172,6 +172,32 @@ def test_never_walks_away_from_a_rate_it_can_pay(engine):
     assert result.rate <= engine.max_offer
 
 
+def test_a_firm_carrier_is_not_ground_on_after_our_closing_offer(engine):
+    """From a real call: carrier walked 2400 -> 2300 -> 2150, we closed at 2075,
+    and they repeated 2150 three times while we pushed back twice. Once our offer
+    is out and they've answered it, one push is fair — then take the load. The
+    gap here is $75 on a 925-mile lane; grinding it is how you lose freight you
+    were always cleared to sign."""
+    assert engine.evaluate(2400).decision == Decision.HOLD
+    assert engine.evaluate(2300).decision == Decision.PULL
+    close = engine.evaluate(2150)
+    assert close.is_split and close.rate == 2075
+    assert engine.evaluate(2150).decision == Decision.HOLD      # one push back
+    done = engine.evaluate(2150)                                 # not a second
+    assert done.decision == Decision.ACCEPT
+    assert done.rate == 2150
+    assert done.rate <= engine.max_offer
+
+
+def test_the_full_hold_budget_still_applies_before_we_have_offered(engine):
+    """The shortened budget is specifically about grinding AFTER we've spent. A
+    carrier stonewalling before any offer still gets pushed the full count."""
+    assert engine.evaluate(2400).hold_number == 1
+    assert engine.evaluate(2400).hold_number == 2                # max_holds = 2
+    assert not engine.split_made
+    assert engine.evaluate(2400).is_final                        # then best-and-final
+
+
 def test_movement_resets_our_patience(engine):
     """Two holds don't burn the call down: a carrier who then starts moving gets
     asked to keep coming, not hit with a best-and-final ultimatum."""

@@ -85,6 +85,21 @@ _REPS = [
 ]
 
 
+def seed_reps(db: Database) -> None:
+    """Just the transfer list.
+
+    Reps are warm-transfer targets — a name and a phone — not Transport Pro
+    records, so they are seeded locally even when every load and carrier comes
+    from the live API. Without them a call that needs a human has nowhere to go.
+    """
+    conn = db.connect()
+    try:
+        conn.executemany("INSERT OR IGNORE INTO reps VALUES (?,?,?,?)", _REPS)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def seed_if_empty(db: Database) -> None:
     """Fill in anything missing. Every insert is OR IGNORE, so a database that's
     already half-populated (an older one being migrated, say) tops up instead of

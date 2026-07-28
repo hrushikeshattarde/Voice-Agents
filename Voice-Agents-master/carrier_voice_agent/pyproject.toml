@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "groq>=0.11.0",
+    "httpx>=0.27",              # Transport Pro Public API client
     "livekit-agents>=1.0",
     "livekit-plugins-groq",
     "livekit-plugins-noise-cancellation>=0.3.0",
@@ -15,6 +16,9 @@ dependencies = [
     "pydantic-settings>=2.0",
     "python-dotenv",
     "soundfile>=0.12.1",
+    # Transport Pro stops carry an `ianaTimezone`; Windows ships no zone database,
+    # so without this a pickup time falls back to the numeric UTC offset.
+    "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +31,7 @@ dev = [
 lanevoice-worker = "lanevoice.telephony.worker:main"
 lanevoice-demo = "lanevoice.demo:main"
 lanevoice-initdb = "lanevoice.db.database:main"
+lanevoice-tpcheck = "lanevoice.integrations.transportpro.check:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,5 +1,6 @@
 """Domain models and value types."""
 
+from lanevoice.domain.errors import SourceUnavailable
 from lanevoice.domain.models import (
     AuthorityStatus,
     CallOutcome,
@@ -18,6 +19,7 @@ from lanevoice.domain.models import (
 __all__ = [
     "AuthorityStatus",
     "Carrier",
+    "SourceUnavailable",
     "CallOutcome",
     "Decision",
     "Load",

@@ -10,36 +10,64 @@ class LoadStatus(str, Enum):
     OPEN = "open"
     COVERED = "covered"
     CANCELLED = "cancelled"
+    # On the board but not in a state the desk sells: awaiting an appointment, on
+    # hold, still being quoted, planned but not released. Kept apart from COVERED
+    # because the agent says something different for each, and telling a caller a
+    # load is "already covered" when it simply isn't ready yet is a false
+    # statement they may well repeat to the shipper.
+    NOT_READY = "not_ready"
 
 
 class AuthorityStatus(str, Enum):
-    """Carrier operating authority as the vetting feed reports it.
+    """Carrier vetting status as the source system reports it.
 
-    Only ACTIVE clears the desk — that is the company requirement, so INACTIVE
-    and SUSPENDED are both hard stops. Anything the feed sends that we don't
-    recognise is coerced to SUSPENDED rather than raising: a lookup that blows up
-    mid-call is bad, but a typo or a new feed value silently reading as good
-    authority is far worse. Fail closed, never guess ACTIVE.
+    Only ACTIVE clears the desk — that is the company requirement, so every other
+    value is a hard stop. Anything unrecognised is coerced to SUSPENDED rather
+    than raising: a lookup that blows up mid-call is bad, but a typo or a new feed
+    value silently reading as good authority is far worse. Fail closed, never
+    guess ACTIVE.
+
+    Transport Pro's `/voiceai/carrier_status` reports three values in practice —
+    `ACTIVE`, `FAIL` and `REVIEW`. The last one is why PENDING exists: a carrier
+    part-way through onboarding has not failed anything, and telling them they
+    don't meet our requirements is both untrue and the kind of thing they repeat
+    to other brokers. They go to a human instead (see `CarrierVerificationService`).
     """
 
     ACTIVE = "active"
     INACTIVE = "inactive"
     SUSPENDED = "suspended"   # suspended, revoked, out-of-service, failed vetting
+    PENDING = "pending"       # onboarding not finished — a person decides
 
     @classmethod
     def _missing_(cls, value: object) -> AuthorityStatus:
         raw = str(value).strip().lower().replace("-", " ").replace("_", " ")
         raw = " ".join(raw.split())
-        if raw in {"active", "authorized", "authorized for property", "a", "pass"}:
+        if raw in {"active", "authorized", "authorized for property", "a", "pass",
+                   "passed", "approved", "ok"}:
             return cls.ACTIVE
         if raw in {"inactive", "not in operation", "dormant", "none", "i"}:
             return cls.INACTIVE
+        if raw in {"review", "in review", "pending", "pending review", "onboarding",
+                   "incomplete", "new"}:
+            return cls.PENDING
+        # fail, failed, suspended, revoked, out of service, do not use, anything
+        # we have never seen.
         return cls.SUSPENDED
 
     @property
     def can_haul(self) -> bool:
         """The single gate: ACTIVE authority, nothing else."""
         return self is AuthorityStatus.ACTIVE
+
+    @property
+    def is_definite(self) -> bool:
+        """True when the source gave a settled answer, good or bad.
+
+        PENDING is the one that isn't: the carrier is mid-onboarding, so the
+        honest response is a handoff rather than a refusal.
+        """
+        return self is not AuthorityStatus.PENDING
 
 
 class CallOutcome(str, Enum):
@@ -101,6 +129,10 @@ class Load:
     delivery_date: str | None = None
     delivery_window: str | None = None
     load_type: str = "full truckload"
+    # Reefer setpoint, e.g. "-20 F". A condition of taking the load rather than a
+    # detail — a driver who agrees to haul ice cream without hearing "minus
+    # twenty" has agreed to something else.
+    temperature: str | None = None
 
     @property
     def is_open(self) -> bool:
@@ -109,6 +141,17 @@ class Load:
     @property
     def is_bookable(self) -> bool:
         return self.is_open and self.is_posted
+
+    @property
+    def is_quotable(self) -> bool:
+        """True if there is a real rate range to negotiate inside.
+
+        A load can be posted and open and still arrive with no published Load
+        Board Rate. There is no honest anchor to open at in that case, so the
+        agent hands it to a rep instead of inventing one — a made-up opening
+        number is a number the desk may have to honour.
+        """
+        return self.open_rate > 0 and self.ceiling_rate >= self.open_rate
 
     def facts(self, today: object | None = None) -> str:
         """Everything speakable about this load, as labelled facts.
@@ -131,6 +174,7 @@ class Load:
                 if self.delivery_date else None),
             ("Delivery window", self.delivery_window),
             ("Commodity", self.commodity),
+            ("Temperature", self.temperature),
             ("Pieces", self.pieces),
             ("Dimensions", self.dimensions),
             ("Weight", f"{self.weight_lbs:,} lbs" if self.weight_lbs else None),
@@ -155,9 +199,26 @@ class Carrier:
     # against these and appended if new — carriers legitimately have several.
     contact_emails: tuple[str, ...] = field(default_factory=tuple)
 
+    # Transport Pro's own id for the carrier record, when we came from there.
+    # `/contact/search` is keyed on it, so without it we cannot read their
+    # address file.
+    carrier_id: str | None = None
+
+    # The status string the source system actually sent, before it was folded
+    # into `authority_status`. `None` means the record carried no status field we
+    # could find — which is a very different thing from a record that says
+    # "inactive", and is routed to a human instead of declined. Kept verbatim so
+    # the reason in the call log is the source's word, not our interpretation.
+    raw_authority_status: str | None = None
+
     @property
     def latest_email(self) -> str | None:
         return self.contact_emails[-1] if self.contact_emails else None
+
+    @property
+    def authority_reported(self) -> bool:
+        """False when we could not find a vetting status on the record at all."""
+        return self.raw_authority_status is not None
 
 
 @dataclass(frozen=True)

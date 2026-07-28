@@ -15,8 +15,21 @@ rejected and re-prompted.
              -> CONFIRM_BOOKING -> CONFIRM_EMAIL
              -> DONE (booked | transferred | rejected | no_deal)
 
+Three gates, in this order, and each one is a hard stop:
+
+  IDENTIFY_LOAD   the load number has to be on the board — posted, open, and
+                  carrying a published rate to anchor at.
+  VERIFY_CARRIER  the MC/USDOT has to be in the system as ACTIVE. INACTIVE and
+                  SUSPENDED are told they don't meet the requirements to work
+                  with us; a status we cannot READ goes to a human instead.
+  CONFIRM_EMAIL   the address they give has to already be on their account, and
+                  the booking has to land in the system of record, before anyone
+                  hears the word "booked".
+
 Nothing about the load is shared — with the caller or with the composer — until
-VERIFY_CARRIER clears (ACTIVE authority only) and ASK_EMPTY is answered.
+VERIFY_CARRIER clears and ASK_EMPTY is answered. Where the loads and carriers
+come from (the Transport Pro API or the offline seed data) is the repository's
+business, not this file's.
 """
 
 from __future__ import annotations
@@ -27,9 +40,11 @@ import uuid
 
 from lanevoice import formatting, parsing
 from lanevoice.db.repository import Repository
+from lanevoice.domain.errors import SourceUnavailable
 from lanevoice.domain.models import (
     CallOutcome,
     Decision,
+    LoadStatus,
     OfferParty,
     VerificationAction,
 )
@@ -49,6 +64,11 @@ _LAST_RESORT = ("Sorry, let me get you over to one of our reps who can pick this
                 "up. One moment.")
 
 logger = get_logger(__name__)
+
+# How many times we'll ask for an MC/USDOT number before handing the call to a
+# person. Spoken digits over phone audio fail often enough that a bot which just
+# keeps asking gets hung up on.
+_MAX_MC_ASKS = 3
 
 # Failures that will happen again identically on the next attempt: a bad key, a
 # model that doesn't exist, a revoked token. Retrying these burns two more round
@@ -111,6 +131,17 @@ _DECLARES_FINAL_RE = re.compile(
 
 def _declares_final(text: str) -> bool:
     return bool(_DECLARES_FINAL_RE.search(text.lower()))
+
+
+# Confirming or denying an identity we read back ("is this Roadrunner Freight?").
+# Narrow and word-boundary matched: these decide which carrier we book.
+_AFFIRMS_RE = re.compile(
+    r"\b(?:yes|yeah|yep|yup|correct|right|sure|speaking|affirmative|uh[- ]huh|"
+    r"that'?s (?:us|right|me|correct)|we are|i am|it is|you got it)\b"
+)
+_DENIES_RE = re.compile(
+    r"\b(?:no|nope|nah|not us|not me|wrong|different|another|isn'?t|ain'?t)\b"
+)
 
 
 # Rejections with no new number — the carrier is holding, so we make our next move.
@@ -256,9 +287,11 @@ class CarrierSalesAgent:
         self.neg: NegotiationEngine | None = None
         self._last_ask: float | None = None
         self._agreed_rate: float | None = None
-        self._booking_email: str | None = None   # where the rate con link goes
-        self._email_is_new = False               # wasn't on file -> we saved it
+        self._booking_email: str | None = None   # where the booking link goes
         self._email_asks = 0                     # re-asks when we didn't catch one
+        self._mc_asks = 0                        # re-asks for an unheard MC/USDOT
+        self._mc_digits = ""                     # digits heard so far, across turns
+        self._mc_narrowed = None                 # partial that matched one carrier
         self._levers_used = 0                    # non-price pitches already spent
         self._empty_location: str | None = None  # where their truck frees up
         self._empty_when: str | None = None      # and when
@@ -377,16 +410,48 @@ class CarrierSalesAgent:
             f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
             f"Last failure: {why}",
         )
-        rep_id = None
-        if self.load is not None:
-            resolution = self._transfers.resolve(self.load)
-            rep_id = resolution.rep.rep_id if resolution.rep else None
+        # A call can break before it has a load — `resolve` takes that.
+        resolution = self._transfers.resolve(self.load)
+        rep_id = resolution.rep.rep_id if resolution.rep else None
         self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id)
         self.transcript.append(("agent", _LAST_RESORT))
         return _LAST_RESORT
 
     def _log_user(self, text: str) -> None:
         self.transcript.append(("carrier", text))
+
+    def _note(self, note: str) -> None:
+        """Record a note against the call, and against the load in the TMS.
+
+        Everything the agent decides that a human might have to answer for goes
+        through here. The local copy is the audit trail; the copy on the load is
+        what a rep actually sees when they open it, which is where they will be
+        looking when the carrier rings back. The TMS write is best-effort — the
+        repository swallows and logs its own failures — so a flaky API costs us a
+        note, never the call.
+        """
+        self._repo.log_note(self.call_id, note)
+        if self.load is not None and self._settings.post_load_notes:
+            self._repo.post_load_note(
+                self.load.load_id, f"[Voice AI call {self.call_id}] {note}")
+
+    def _backend_failure(self, exc: Exception) -> str:
+        """The system of record didn't answer. Hand over; don't guess.
+
+        Every question left at this point — is that load still open, is this
+        carrier active, is that address theirs — is one where a confident wrong
+        answer is worse for the carrier than a handoff. So we don't invent one.
+        """
+        logger.error("handing call %s to a rep: the system of record is "
+                     "unavailable in state %s — %s",
+                     self.call_id, self.state.value, exc)
+        self._repo.log_note(
+            self.call_id,
+            f"System of record unavailable in state {self.state.value} "
+            f"({type(exc).__name__}: {exc}) — handed to a rep without answering "
+            "the caller's question.",
+        )
+        return self._transfer_and_say(reason="source_unavailable")
 
     def _next_lever(self) -> str:
         """A fresh non-price selling point each time we lean on one, so the same
@@ -420,18 +485,25 @@ class CarrierSalesAgent:
             CallState.CONFIRM_EMAIL: self._confirm_email,
             CallState.DONE: lambda _t: "This call has ended. Goodbye.",
         }.get(self.state, self._identify_load)
-        return handler(user_text)
+        try:
+            return handler(user_text)
+        except SourceUnavailable as exc:
+            # The board, the carrier file or the contact list is unreachable. Not
+            # recoverable by asking the caller anything, so stop asking.
+            return self._backend_failure(exc)
 
     # -- Step 2: identify load --------------------------------------------- #
     def _identify_load(self, text: str) -> str:
-        load_id = parsing.extract_load_id(text)
+        numeric = self._settings.numeric_load_ids
+        load_id = parsing.extract_load_id(text, numeric=numeric)
         if not load_id:
             return self._say(
                 "You didn't catch a load or reference number in what they just said. Ask "
                 "for it — if they described a lane or a posting instead of a number, ask "
                 "whether the posting shows a reference number. Do not invent a load, and "
                 "do not read them the open list yet.",
-                facts="Example of the number format: L1001.",
+                facts=("Example of the number format: "
+                       + ("1303369." if numeric else "L1001.")),
                 amounts=set(),
             )
         # Only load ID NUMBERS are shared before verification — never lanes/details.
@@ -454,16 +526,43 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
         if not result.available:
+            # "Already covered" is a specific claim about the freight. It is only
+            # made when the board actually says somebody has it — a load that is
+            # merely not released yet gets the true, vaguer sentence instead. A
+            # caller repeats what we tell them to the shipper.
+            if result.load.status == LoadStatus.COVERED:
+                return self._say(
+                    f"Load {load_id} is already covered. Tell them, offer the other open "
+                    f"ones by number, and ask which they want. {no_details}",
+                    amounts=set(),
+                )
             return self._say(
-                f"Load {load_id} is already covered. Tell them, offer the other open ones "
-                f"by number, and ask which they want. {no_details}",
+                f"Load {load_id} is on your system but is not released for booking right "
+                f"now, so you can't sell it to them. Say only that — that one isn't "
+                f"available to book at the moment — then offer the open ones by number and "
+                f"ask which they want. Do NOT say it's covered, do NOT guess why, and do "
+                f"NOT promise it will open up later. {no_details}",
                 amounts=set(),
             )
 
-        # Valid, posted, open — but nothing about it comes out yet. Read the number
-        # back first: the caller is holding a posting and needs to know we're both
-        # looking at the same load before they hand over their MC.
         self.load = result.load
+
+        # Posted and open, but the board published no rate on it. There is no
+        # honest number to open at, and an invented anchor is one the desk may be
+        # held to — so a person picks this up. The carrier never hears that our
+        # data is thin, only that someone else is taking it.
+        if not result.load.is_quotable:
+            self._note(
+                f"Load {load_id} is posted and open but carries no usable Load Board "
+                f"Rate (open_rate={result.load.open_rate}, "
+                f"ceiling_rate={result.load.ceiling_rate}) — no anchor to quote, "
+                "handed to a rep before any rate was discussed."
+            )
+            return self._transfer_and_say(reason="no_published_rate")
+
+        # Valid, posted, open, quotable — but nothing about it comes out yet. Read
+        # the number back first: the caller is holding a posting and needs to know
+        # we're both looking at the same load before they hand over their MC.
         self.state = CallState.VERIFY_CARRIER
         return self._say(
             f"Read the load number {load_id} back to them digit by digit to confirm you "
@@ -475,44 +574,157 @@ class CarrierSalesAgent:
             amounts=set(),
         )
 
+    # -- Hearing an MC/USDOT number the way a person does ------------------- #
+    def _hear_identifier(self, text: str) -> str | None:
+        """Resolve the caller's identifier from everything heard SO FAR.
+
+        A rep doesn't need a clean six digits in one breath. They hold what they
+        caught, add whatever comes next, and the moment it matches a carrier on
+        their screen they're done. That's all this is: keep a running buffer, and
+        let the carrier file pick between the possible readings of it — a caller
+        who was cut off mid-number and one who started over produce different
+        digit strings, and only one of them is going to be a real carrier.
+
+        Returns the identifier to verify, or None if we still need more digits.
+        """
+        heard = parsing.heard_digits(text)
+
+        # We narrowed to one carrier and asked "is this you?". Their answer is the
+        # confirmation a rep actually works from — no point making someone recite
+        # digits down a bad line when the name already settled it.
+        if self._mc_narrowed is not None and not heard:
+            if _AFFIRMS_RE.search(text.lower()):
+                carrier = self._mc_narrowed
+                number = re.sub(r"\D", "", carrier.mc_number or carrier.usdot_number)
+                self._mc_digits = number
+                return number
+            if _DENIES_RE.search(text.lower()):
+                # Wrong carrier, so the digits behind the guess were wrong too.
+                # Keeping them would only narrow to the same wrong answer again.
+                self._mc_digits = ""
+                self._mc_narrowed = None
+                return None
+
+        readings = parsing.digit_readings(self._mc_digits, heard)
+
+        # Whole number on file -> that's them, whichever reading produced it.
+        for reading in readings:
+            if len(reading) >= 4 and self._repo.get_carrier(reading) is not None:
+                self._mc_digits = reading
+                return reading
+
+        # Nothing exact. Keep the longest reading that still narrows to a single
+        # carrier, so the next digit or two finishes the job instead of starting
+        # over. Failing that, keep the longest reading at all.
+        best, matches = "", []
+        for reading in readings:
+            found = self._repo.carriers_matching_digits(reading)
+            if len(found) == 1 and len(reading) > len(best):
+                best, matches = reading, found
+        self._mc_digits = best or (readings[0] if readings else self._mc_digits)
+        self._mc_narrowed = matches[0] if matches else None
+        return None
+
+    def _chase_identifier(self, text: str) -> str:
+        """Ask for what's still missing — never for the whole thing again."""
+        self._mc_asks += 1
+        held = self._mc_digits
+
+        # Down to one carrier on a partial number: confirm by company name, which
+        # is faster and far more reliable than collecting the last two digits.
+        # Only worth doing once — if the name doesn't settle it, digits won't.
+        if self._mc_narrowed is not None and self._mc_asks < _MAX_MC_ASKS:
+            return self._say(
+                "You've matched what you heard to one carrier on file. Read their company "
+                "name back and ask if that's them — a name is easier to confirm over a bad "
+                "line than digits are. Do NOT read the MC or USDOT digits back and do NOT "
+                "ask them to repeat the number.",
+                facts=f"Carrier you think this is: {self._mc_narrowed.legal_name}",
+                amounts=set(),
+            )
+
+        if self._mc_asks >= _MAX_MC_ASKS:
+            self._note(
+                f"Could not capture an MC/USDOT number after {_MAX_MC_ASKS} attempts on "
+                f"{self.load.load_id if self.load else 'no load'} — handed to a rep. "
+                f"Digits held: {held or 'none'}. Last thing heard: \"{text.strip()}\"",
+            )
+            return self._transfer_and_say(reason="mc_not_captured")
+
+        if held:
+            # We have part of it. Read that part back and ask only for the rest —
+            # this is the bit a caller actually finds normal, and it means their
+            # first attempt wasn't wasted.
+            spoken = formatting.spell_digits(held)
+            return self._say(
+                f"You caught part of their number and need the rest. Read back exactly "
+                f"what you have — {spoken} — and ask what comes after it. Do NOT ask them "
+                f"to start again, do NOT ask them to slow down or say it one digit at a "
+                f"time, and do NOT say you didn't catch it: you caught most of it.",
+                facts=f"Digits you already have: {spoken}",
+                amounts=set(),
+            )
+
+        if self._mc_asks == 1:
+            # Usually not a mishearing at all: they answered the load read-back
+            # and haven't reached the number yet. Claiming to have missed
+            # something they never said is what makes a caller lose confidence.
+            return self._say(
+                "There is no MC or USDOT number in what they just said — most likely they "
+                "were answering your question about the load and haven't got to it yet. "
+                "Just ask for their MC or USDOT number. Do NOT say you didn't catch it and "
+                "do NOT ask them to repeat it: they haven't given it yet.",
+                amounts=set(),
+            )
+
+        return self._say(
+            "You got no digits out of that at all. Say the line is breaking up and ask for "
+            "their MC or USDOT number once more. Ask normally — do NOT tell them to slow "
+            "down or to say it one digit at a time; a rep just asks again.",
+            amounts=set(),
+        )
+
     # -- Step 3: verify carrier -------------------------------------------- #
     def _verify_carrier(self, text: str) -> str:
-        _, number = parsing.extract_mc_dot(text)
-        if not number:
-            return self._say(
-                "You didn't catch a number. Say so and ask them to give you their MC or "
-                "USDOT number again, slowly.",
-                amounts=set(),
-            )
+        number = self._hear_identifier(text)
+        if number is None:
+            return self._chase_identifier(text)
         result = self._verifier.verify(number)
-
-        if not result.verified:
-            # Authority is not ACTIVE, or insurance isn't on file. Either way this
-            # carrier cannot haul for us and there is no rate conversation to have.
-            self._repo.log_note(
-                self.call_id,
-                f"Verification failed on {number} "
-                f"({result.carrier.legal_name if result.carrier else 'not found'}): "
-                f"{result.reason}, flags {list(result.risk_flags)} — no rate discussed.",
-            )
-            self._finish(CallOutcome.REJECTED)
-            return self._say(
-                "You cannot confirm active operating authority and insurance for them, so "
-                "you cannot talk about this load or its rate at all. Tell them that "
-                "plainly, say it's going to your team to review and someone will follow "
-                "up, and close the call politely. Do NOT say which check failed, do not "
-                "speculate about why, and do not suggest how they might get around it.",
-                amounts=set(),
-            )
-
         self.carrier = result.carrier
+        who = result.carrier.legal_name if result.carrier else "not found"
 
-        # Not approved to work with Circle Logistics -> decline, don't book.
+        # DECLINE — the system of record gave us a definite answer and it wasn't
+        # yes. Two different reasons, and the carrier is told a different thing
+        # for each, but neither one hears which check it was.
         if result.action == VerificationAction.DECLINE:
-            self._repo.log_note(
-                self.call_id,
-                f"Carrier {self.carrier.legal_name} (USDOT {self.carrier.usdot_number}) "
-                "is not approved to work with Circle Logistics — declined.",
+            if result.reason == "authority_not_active":
+                # The requirement is ACTIVE. Their record says INACTIVE or
+                # SUSPENDED (or something we read as suspended, since an
+                # unrecognised status fails closed), so there is no load
+                # conversation and no rate conversation to have.
+                self._note(
+                    f"Carrier {who} (MC {result.carrier.mc_number or 'n/a'}, USDOT "
+                    f"{result.carrier.usdot_number}) is in the system as "
+                    f"{result.carrier.raw_authority_status!r} -> "
+                    f"{result.carrier.authority_status.value}, not ACTIVE. Told they "
+                    "do not meet the requirements. No load detail or rate discussed."
+                )
+                self._finish(CallOutcome.REJECTED)
+                return self._say(
+                    "Their company does not currently meet the requirements to work with "
+                    "your brokerage, so you cannot go any further on this load with them — "
+                    "no lane, no details, no rate. Tell them exactly that, in one plain "
+                    "sentence: their company doesn't meet certain requirements to work with "
+                    "you right now. Then close the call politely. Do NOT say which check "
+                    "failed, do NOT mention authority, insurance, safety ratings or any "
+                    "specific status, do not speculate about why, and do not suggest how "
+                    "they might get around it or when to try again.",
+                    amounts=set(),
+                )
+            # Vetting is fine; the desk simply isn't set up with this company.
+            self._note(
+                f"Carrier {who} (USDOT {result.carrier.usdot_number}) is not approved "
+                "to work with Circle Logistics — declined."
             )
             self._finish(CallOutcome.REJECTED)
             return self._say(
@@ -522,11 +734,14 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
 
+        # HUMAN_REVIEW — we do NOT have a definite answer. Either the record
+        # carries a status we couldn't read, or insurance is missing, or a soft
+        # flag came up. None of these is something to accuse a carrier of, so a
+        # person picks it up.
         if result.action == VerificationAction.HUMAN_REVIEW:
-            self._repo.log_note(
-                self.call_id,
-                f"Carrier {self.carrier.legal_name} verified but flagged "
-                f"{list(result.risk_flags)} — routed to a rep.",
+            self._note(
+                f"Carrier {who} not cleared automatically: {result.reason}, flags "
+                f"{list(result.risk_flags)} — routed to a rep, no rate discussed."
             )
             self._transfer(reason="verification_review")
             return self._say(
@@ -581,8 +796,7 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
 
-        self._repo.log_note(
-            self.call_id,
+        self._note(
             f"Empty call for {self.load.load_id}: "
             f"where={self._empty_location or 'NOT CAPTURED'}, "
             f"when={self._empty_when or 'NOT CAPTURED'} "
@@ -660,8 +874,7 @@ class CarrierSalesAgent:
     # -- Load requirements gate (PRD step: narrate notes, confirm) --------- #
     def _check_requirements(self, text: str) -> str:
         if _declines_requirements(text):
-            self._repo.log_note(
-                self.call_id,
+            self._note(
                 f"Carrier {self.carrier.legal_name} can't meet the requirements on "
                 f"{self.load.load_id} ({self.load.notes!r}) — not booked.",
             )
@@ -712,8 +925,7 @@ class CarrierSalesAgent:
             return self._propose_booking(result.rate)
 
         if result.decision == Decision.REVIEW:
-            self._repo.log_note(
-                self.call_id,
+            self._note(
                 f"Suspiciously low ask ${int(ask)} on {self.load.load_id} "
                 "(fraud tripwire) — routed to review.",
             )
@@ -737,7 +949,9 @@ class CarrierSalesAgent:
         no_new_number = (
             f"You may name ONLY two numbers: their ${ask_i} and your ${rate}. Do NOT "
             "invent, offer, or hint at any other figure, and do NOT split the "
-            "difference — you are not moving on this turn. Never reveal your max."
+            "difference — you are not moving on this turn. Never reveal your max. "
+            f"Do NOT ask them to 'do' or accept ${ask_i} — that is their own number, "
+            "they already said it; you are asking them to come to yours."
         )
 
         # PULL — they came down, and we do NOT pay them for it. Credit the move,
@@ -776,10 +990,12 @@ class CarrierSalesAgent:
                 # the argument, and repeating the discovery question sounds canned.
                 opened = int(self.neg.floor)
                 return self._say(
-                    f"You already moved from ${opened} up to ${rate}; they are still "
-                    f"sitting on ${ask_i}. Point the imbalance out — you've moved, they "
-                    f"haven't — and ask them to come your way now. Not rude about it. "
-                    f"{no_new_number} You may also mention your opening ${opened}.",
+                    f"You opened at ${opened} and have since come UP to ${rate}; they are "
+                    f"still sitting on ${ask_i}. Point the imbalance out — you moved, they "
+                    f"didn't — and ask them to come your way now. Not rude about it. You "
+                    f"went UP from ${opened} to ${rate}: never describe your own move as "
+                    f"coming down, and don't call it a long way. {no_new_number} You may "
+                    f"also mention your opening ${opened}.",
                     facts=f"{lane} You opened at ${opened} and are now at ${rate}. They "
                     f"have not moved off ${ask_i}.",
                     amounts={rate, ask_i, opened},
@@ -815,8 +1031,9 @@ class CarrierSalesAgent:
             return self._say(
                 f"They repeated ${ask_i} without moving. Point out you're both where you "
                 f"started and that you're still at ${rate}. Instead of raising your number, "
-                f"sell the load on this one non-price point: {lever}. Then press them for "
-                f"the best number they can actually do. Firm, friendly, no begging. "
+                f"sell the load on this one non-price point: {lever}. Then ask for the "
+                f"LOWEST number they can actually take — not whether they can do ${ask_i}, "
+                f"which is the number they already gave you. Firm, friendly, no begging. "
                 f"{no_new_number}",
                 facts=f"{lane} You are holding at ${rate}. They have not moved. "
                 f"Non-price point to use: {lever}",
@@ -861,7 +1078,7 @@ class CarrierSalesAgent:
         return self._say(
             f"You've agreed on ${int(rate)}. Say the number back so it's on the record, "
             f"then ask whether they can cover that pickup — the day, the place and the "
-            f"equipment — and tell them you'll send the rate confirmation over to sign, "
+            f"equipment — and tell them you'll send the booking confirmation over to sign, "
             f"which is what locks it in. Direct and warm.",
             facts=f"Agreed rate: ${int(rate)}",
             amounts={int(rate)},
@@ -879,19 +1096,18 @@ class CarrierSalesAgent:
 
         # Can't cover the pickup -> hand to a rep to rework, don't just book.
         if any(p in lowered for p in _CANNOT_COVER):
-            self._repo.log_note(
-                self.call_id,
+            self._note(
                 f"Agreed ${int(self._agreed_rate)} on {self.load.load_id} but carrier "
                 f"couldn't confirm the {self.load.pickup_date} pickup — needs a rep to rework.",
             )
             return self._transfer_and_say(reason="pickup_issue")
 
-        # Pickup confirmed -> ask THEM where the rate con goes. We don't read our
-        # file at them and call that a confirmation; whatever they say is checked
-        # against the record afterwards.
+        # Pickup confirmed -> ask THEM where the booking link goes. We don't read
+        # our file at them and call that a confirmation; whatever they say is
+        # checked against the account afterwards, and has to match.
         self.state = CallState.CONFIRM_EMAIL
         return self._say(
-            "They can cover the pickup. Ask which email address to send the rate "
+            "They can cover the pickup. Ask which email address to send the booking "
             "confirmation to. YOU are sending it to THEM — never imply they send you "
             "anything. Do NOT invent, guess or suggest an address, and do not read one off "
             "their file: wait for them to say it. Don't ask for a driver name or a truck "
@@ -900,80 +1116,132 @@ class CarrierSalesAgent:
         )
 
     def _confirm_email(self, text: str) -> str:
-        """The carrier gives the address; we check it against their file.
+        """The carrier gives the address, and it has to already be on their account.
 
-        Known address -> confirm it back. New one -> confirm it back and append it
-        to the carrier record, so the file grows instead of going stale.
+        This is the last gate before the words "you're booked", and it is a gate
+        rather than a formality: the booking link goes to whatever address clears
+        here, so an address that is NOT on the carrier's account in the system of
+        record does not clear. That rules out the failure this exists to prevent —
+        somebody who has learned an MC number talking us into sending the booking
+        link to an address they control.
+
+        So there are exactly three ways out of this state:
+
+          * the address they said is on the account  -> booked, link goes there
+          * they point at the account ("use the one  -> booked, link goes to the
+            you've got") and we hold one               most recent one on file
+          * anything else, after one more ask       -> NOT booked, a rep takes it
+
+        The old behaviour — accept any address, append it to the file, confirm the
+        booking anyway — is deliberately gone.
         """
         spoken = parsing.extract_email(text)
-        on_file = self.carrier.contact_emails
+        # Read the file rather than trusting the copy taken at verification: on a
+        # long call a rep may have added the address while we were talking.
+        on_file = self._repo.carrier_emails(self.carrier.usdot_number)
 
         if spoken:
-            known = self._repo.email_on_file(self.carrier.usdot_number, spoken)
-            if not known:
-                self._repo.add_carrier_email(self.carrier.usdot_number, spoken)
-            return self._book_rate_con(
-                spoken.lower(),
-                "matched carrier file" if known else "new address — added to carrier file",
-                text,
-                is_new=not known,
-            )
+            if spoken.strip().lower() in on_file:
+                return self._book_rate_con(
+                    spoken.strip().lower(), "matched the carrier's account", text)
+            # A real address, but not one we hold. Most often a mis-heard domain,
+            # so it is worth one more ask before handing the call over.
+            if self._email_asks < 1:
+                self._email_asks += 1
+                return self._say(
+                    "That address is not the one on their account, so you cannot send the "
+                    "booking to it. Say you have a different address on file for them and "
+                    "ask them to confirm the one that's on the account — or to read theirs "
+                    "back once more in case you misheard it. Do NOT read out any address "
+                    "from their file, do NOT spell one for them, and do NOT accuse them of "
+                    "anything: assume you misheard. One short question. Do not say they're "
+                    "booked yet.",
+                    facts=f"What you heard, which is NOT on their account: {spoken}",
+                    amounts=set(),
+                )
+            return self._email_unverified(
+                f"carrier gave {spoken!r}, which is not on their account", text)
 
-        # "Just use the one you've got" — they're pointing at the file rather than
-        # reciting it, so read the most recent one back as we send it.
+        # "Just use the one you've got" — they're pointing at the account rather
+        # than reciting it, which is the account address by definition.
         if on_file and _defers_to_file(text):
             return self._book_rate_con(
-                on_file[-1], "carrier deferred to the address on file", text)
+                on_file[-1], "carrier deferred to the address on their account", text)
 
         if self._email_asks < 1:
             self._email_asks += 1
             return self._say(
                 "You didn't get a usable email address out of that. Say you didn't catch it "
-                "and ask again for the best address for the rate confirmation. One short "
+                "and ask again for the best address for the booking confirmation. One short "
                 "sentence. Do NOT invent, guess or suggest an address.",
                 amounts=set(),
             )
 
-        # Asked twice, still nothing usable. Book the load; the con waits.
-        return self._book_rate_con(None, "no address given on the call", text)
+        return self._email_unverified("no usable address given on the call", text)
 
-    def _book_rate_con(self, email: str | None, source: str, text: str,
-                       is_new: bool = False) -> str:
-        self._booking_email = email
-        self._email_is_new = is_new
-        self._repo.log_note(
-            self.call_id,
-            f"Booking for {self.load.load_id} @ ${int(self._agreed_rate)} — rate con to: "
-            f"{email or 'NOT CAPTURED — needs follow-up before sending'} ({source}); "
-            f"addresses now on file for {self.carrier.legal_name}: "
-            f"{', '.join(self._repo.carrier_emails(self.carrier.usdot_number)) or 'none'}; "
-            f"raw: \"{text.strip()}\"",
+    def _email_unverified(self, why: str, text: str) -> str:
+        """Rate agreed, address not verified -> a person finishes it.
+
+        Everything the desk needs is already recorded: the agreed rate is in the
+        offer history and this note carries the reason. What the agent must not do
+        is tell them they're booked, because nothing was booked.
+        """
+        self._note(
+            f"NOT BOOKED on {self.load.load_id} at the agreed "
+            f"${int(self._agreed_rate)}: {why}. Addresses on the account for "
+            f"{self.carrier.legal_name}: "
+            f"{', '.join(self._repo.carrier_emails(self.carrier.usdot_number)) or 'none'}. "
+            f"Last thing heard: \"{text.strip()}\". Rate was agreed on the call — a rep "
+            "can confirm the address and book it."
         )
-        return self._finalize_booking(details_ok=bool(email))
+        return self._transfer_and_say(reason="email_not_verified")
 
-    def _finalize_booking(self, details_ok: bool = True) -> str:
+    def _book_rate_con(self, email: str, source: str, text: str) -> str:
+        self._booking_email = email
+        self._note(
+            f"Booking {self.load.load_id} @ ${int(self._agreed_rate)} for "
+            f"{self.carrier.legal_name} (MC {self.carrier.mc_number or 'n/a'}) — "
+            f"booking link to {email} ({source}); raw: \"{text.strip()}\""
+        )
+        return self._finalize_booking()
+
+    def _finalize_booking(self) -> str:
+        """Put the booking in the system of record, THEN say it out loud.
+
+        In that order, and only in that order. "You're booked" is the one sentence
+        on this call that puts a truck on the road, and a carrier who hears it and
+        then finds no load against their name shows up at a shipper for freight
+        that isn't theirs. So if the write-back fails, nobody is told they're
+        booked — the call goes to a rep with the rate and the address already in
+        the note, which is a bad minute for us and a safe one for them.
+        """
         rate = int(self._agreed_rate)
+        recorded = self._repo.record_booking(
+            self.load,
+            self.carrier,
+            rate,
+            email=self._booking_email,
+            contact_name=self.carrier.legal_name,
+            notes=(f"Booked by voice AI on call {self.call_id} at ${rate}. "
+                   f"Truck empty: {self._empty_summary() or 'not captured'}"),
+        )
+        if not recorded:
+            self._note(
+                f"Could NOT record the ${rate} booking for {self.load.load_id} in the "
+                "system of record — nothing was said to the carrier about being booked. "
+                "A rep must place this manually."
+            )
+            return self._transfer_and_say(reason="booking_write_failed")
+
         self._repo.book_load(self.load.load_id)
         self._finish(CallOutcome.BOOKED)
-        if self._booking_email:
-            # Naming the address out loud is the carrier's last chance to catch a
-            # wrong one before the con lands in an inbox nobody reads.
-            email_note = (f"Tell them the rate confirmation is going to "
-                          f"{self._booking_email} — say that address exactly as written, "
-                          "do not alter or improve it — and to sign it. ")
-            if self._email_is_new:
-                email_note += "Mention you've saved that address to their file. "
-            facts = f"Rate confirmation goes to: {self._booking_email}"
-        else:
-            # Nothing to sign yet — don't pretend a con is on its way.
-            email_note = ("You still don't have an email for them, so ask them to send one "
-                          "over so you can get the rate confirmation out. Do NOT invent an "
-                          "address and do NOT say the confirmation is already on its way. ")
-            facts = "You have no email address for them."
         return self._say(
-            f"Confirm they're booked on this load at ${rate}. {email_note}Close warmly and "
-            f"briefly — they're a driver who wants to get moving.",
-            facts=facts,
+            f"Confirm they're booked on this load at ${rate}. Tell them the booking "
+            f"confirmation is going to {self._booking_email} — say that address exactly as "
+            f"written, do not alter or improve it — and that they just need to open it and "
+            f"sign to lock it in. Close warmly and briefly; they're a driver who wants to "
+            f"get moving.",
+            facts=f"Booking link goes to: {self._booking_email}",
             amounts={rate},
             must_say=rate,
         )
@@ -1026,8 +1294,7 @@ class CarrierSalesAgent:
         """Their number is inside Max Buy but above what the agent spends on its
         own. A rep in this spot doesn't walk and doesn't cave — they go ask."""
         offers = ", ".join(f"${int(o)}" for o in self.neg.offers_made) or "n/a"
-        self._repo.log_note(
-            self.call_id,
+        self._note(
             f"ESCALATION on {self.load.load_id} ({self.load.origin} -> "
             f"{self.load.destination}). Carrier {self.carrier.legal_name} "
             f"(USDOT {self.carrier.usdot_number}) is firm at ${int(ask)}. We opened at "
@@ -1041,8 +1308,7 @@ class CarrierSalesAgent:
     # -- No deal: walked up, still apart -> note + decline + end ------------ #
     def _no_deal(self, ask: float, result) -> str:
         offers = ", ".join(f"${int(o)}" for o in self.neg.offers_made) or "n/a"
-        self._repo.log_note(
-            self.call_id,
+        self._note(
             f"NO DEAL on {self.load.load_id} ({self.load.origin} -> "
             f"{self.load.destination}). Carrier {self.carrier.legal_name} "
             f"(USDOT {self.carrier.usdot_number}) held at ${int(ask)}, which is ABOVE "

@@ -8,10 +8,56 @@ from __future__ import annotations
 
 import re
 
+# Digits a caller spoke as words. "Oh" for zero is near-universal on the phone.
+_SPOKEN_DIGITS = {
+    "zero": "0", "oh": "0", "nought": "0", "one": "1", "two": "2", "three": "3",
+    "four": "4", "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+}
+_SPOKEN_DIGIT_RE = re.compile(
+    r"\b(" + "|".join(_SPOKEN_DIGITS) + r")\b", re.IGNORECASE)
 
-def extract_load_id(text: str) -> str | None:
-    """Match 'L1001', 'load 1001', 'L 10 01' -> 'L1001'."""
-    compact = text.upper().replace(" ", "")
+# A run of SINGLE digits separated by punctuation or spaces. Each element must be
+# a lone digit, which is what keeps "42,000" and "$2,150" out of this.
+_DIGIT_RUN_RE = re.compile(r"\b\d(?:[\s,.–—-]+\d\b)+")
+
+
+def glue_spoken_digits(text: str) -> str:
+    """Join up digits a caller read out one at a time.
+
+    We ask them to say an MC number "slowly, one digit at a time" — and then STT
+    hands back "6, 5, 4, 3, 2, 1", which no `\\d{4,8}` pattern will ever match. So
+    the agent asks again, gets the same thing, and the caller hangs up on us.
+    Spoken words are converted first ("six five four" -> "6 5 4").
+
+    Only runs of single separated digits are joined, so quantities keep their
+    shape: "42,000 lbs" and "$2,150" come through untouched.
+    """
+    converted = _SPOKEN_DIGIT_RE.sub(
+        lambda m: _SPOKEN_DIGITS[m.group(1).lower()], text)
+    return _DIGIT_RUN_RE.sub(lambda m: re.sub(r"\D", "", m.group()), converted)
+
+
+def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
+    """The load number in what the caller just said, or None.
+
+    Two formats, because it depends where the loads come from (see
+    `Settings.numeric_load_ids`):
+
+    * `numeric=False` — the seed data's `L1001`. Matches 'L1001', 'load 1001',
+      'L 10 01' and 'L one zero zero one', and always returns it L-prefixed.
+    * `numeric=True` — Transport Pro's bare ids, which run six and seven digits
+      ('1303369', '2333606'). Returned exactly as heard, since that is what the
+      API is keyed on.
+
+    The numeric form needs five digits minimum. Rates are three and four digits
+    and get said constantly on these calls, so a shorter run is far likelier to
+    be money than a load number — and 'L1001' still needs only four, because the
+    letter is doing the disambiguating there.
+    """
+    compact = glue_spoken_digits(text).upper().replace(" ", "")
+    if numeric:
+        match = re.search(r"\d{5,9}", compact)
+        return match.group() if match else None
     match = re.search(r"L?\d{4,6}", compact)
     if not match:
         return None
@@ -20,15 +66,56 @@ def extract_load_id(text: str) -> str | None:
     return token if token.startswith("L") else f"L{digits}"
 
 
+def heard_digits(text: str) -> str:
+    """Every digit in an utterance, in order, with everything else dropped.
+
+    Deliberately blunt: at the point we're trying to hear an identifier, "it's
+    six five four" and "654" and "6-5-4" are the same thing, and we would rather
+    hold three digits we can build on than nothing at all.
+    """
+    return re.sub(r"\D", "", glue_spoken_digits(text))
+
+
+def digit_readings(held: str, heard: str) -> list[str]:
+    """How the digits we just heard could relate to the ones we already had.
+
+    A caller who gets cut off mid-number carries on from where they stopped; one
+    who thinks we missed it starts over; one who is being careful backs up a
+    couple of digits and then continues. All three are ordinary, and from the
+    text alone they are indistinguishable — so we return every reading, longest
+    first, and let the caller's own carrier file decide which one is real.
+
+    Returned in the order worth trying, without duplicates.
+    """
+    readings: list[str] = []
+
+    def add(value: str) -> None:
+        if value and value not in readings:
+            readings.append(value)
+
+    if held and heard:
+        # They repeated the tail before carrying on: "six five four" ... "five
+        # four three two one" -> 654321, not 654654321. Longest overlap first.
+        for k in range(min(len(held), len(heard)), 0, -1):
+            if held.endswith(heard[:k]):
+                add(held + heard[k:])
+        add(held + heard)          # straight continuation
+    add(heard)                     # they started the number over
+    add(held)                      # nothing new was audible
+    return readings
+
+
 def extract_mc_dot(text: str) -> tuple[str | None, str | None]:
     """
     Return ('MC'|'DOT', number) or (None, None).
 
     Classifies by the label nearest the number, tolerating filler words
     ("my MC is 123456", "MC number 123456") and glued forms ("MC123456").
-    Defaults to DOT (the primary identifier per PRD §8.3) when unlabeled.
+    Digits read out one at a time are joined first, since that is exactly how we
+    ask for them. Defaults to DOT (the primary identifier per PRD §8.3) when
+    unlabeled.
     """
-    upper = text.upper()
+    upper = glue_spoken_digits(text).upper()
     num = re.search(r"\d{4,8}", upper)
     if not num:
         return None, None

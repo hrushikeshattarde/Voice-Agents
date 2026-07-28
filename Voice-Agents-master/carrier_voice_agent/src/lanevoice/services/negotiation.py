@@ -137,7 +137,13 @@ class NegotiationEngine:
         # it. Conceding here would just be bidding against ourselves.
         if not moved_down:
             self.holds += 1
-            if (self.holds <= self.max_holds and not last_round
+            # Once our closing offer is already on the table, a carrier who
+            # repeats their number has effectively answered it. One push back is
+            # fair; grinding on past that is how you lose a load you were always
+            # going to be able to sign, and it is what makes a desk sound like a
+            # machine. Before we've offered, the full hold budget applies.
+            hold_budget = min(self.max_holds, 1) if self.split_made else self.max_holds
+            if (self.holds <= hold_budget and not last_round
                     and not self.carrier_final):
                 return NegotiationResult(
                     decision=Decision.HOLD,
