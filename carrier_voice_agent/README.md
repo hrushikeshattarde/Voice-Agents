@@ -21,7 +21,7 @@ src/lanevoice/
 ├── services/              # the deterministic "product": loads, verification,
 │                          #   negotiation engine, transfer
 ├── conversation/          # CarrierSalesAgent — the call state machine (the brain)
-├── voice/                 # GroqTTS + GroqPhraser
+├── voice/                 # GroqTTS + GroqComposer (writes every spoken turn)
 ├── telephony/             # LiveKit worker (STT plugin + TTS adapter + lifecycle)
 └── demo.py                # text-mode simulation (no keys)
 tests/                     # pytest: parsing, negotiation, verification, conversation
