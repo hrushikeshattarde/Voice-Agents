@@ -143,6 +143,12 @@ def _scripted(name: str, turns: list[str], max_rounds: int | None = None) -> Non
             break
     print(f"--> {agent.summary()}")
 
+# The whisper briefing and the busy-callback line are deliberately NOT simulated
+# here. Both belong to a live call: one is audio played to a rep in another room,
+# the other only happens because a real phone went unanswered. Printing either in
+# text mode would show a conversation that never takes place. `tests/test_whisper.py`
+# is where their content is pinned.
+
 
 def _interactive(live: bool = False, show_facts: bool = False) -> None:
     agent = _new_agent(live=live, show_facts=show_facts)
@@ -221,6 +227,12 @@ def main() -> None:
     ], max_rounds=4)
     _scripted("Suspiciously cheap -> fraud review", [
         "L1001", "MC123456", "empty in Chicago, Illinois today", "I'll haul it for 900",
+    ])
+    # Asked for mid-rundown, which is where it actually happens. L1001 is assigned
+    # to R01 in the seed data, so that is who takes it — not whoever is free.
+    _scripted("Carrier asks for the sales rep -> the rep the load is assigned to", [
+        "L1001", "MC 123456", "empty in Chicago, Illinois today",
+        "hold on, can I just talk to the sales rep on this one",
     ])
     _scripted("Suspended authority -> blocked before any rate", [
         "L1002", "MC999888",

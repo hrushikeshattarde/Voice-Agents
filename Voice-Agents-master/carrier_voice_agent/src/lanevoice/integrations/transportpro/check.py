@@ -8,7 +8,7 @@
 Read-only: it authenticates, looks things up, and prints what came back. It never
 posts an offer, a note or a capacity row.
 
-It exists for two failure modes that are invisible until a live call, and silent
+It exists for three failure modes that are invisible until a live call, and silent
 when they happen:
 
 * **A load status vocabulary mismatch.** The agent sells only `Ready To Dispatch`,
@@ -20,6 +20,12 @@ when they happen:
   response in the collection, so `mappers.py` finds its fields by name across
   whatever shape arrives. If a status can't be found the carrier is sent to a
   human, which looks like a policy decision rather than a bug.
+* **A carrier-rep contact type we don't recognise.** A load names its people as
+  `internalContacts` types, and no saved payload in the collection shows the
+  carrier-rep one. Get it wrong and a caller asking for "the rep on this load" is
+  quietly transferred to whoever is free instead of to the load's owner — a
+  handoff that works, to the wrong desk. The tool prints the types the load
+  actually carries next to the rep it resolved.
 
 `--raw` prints the real payloads next to what the mappers made of them, which is
 how you confirm both in about ten seconds. When something is wrong the output
@@ -44,6 +50,7 @@ from lanevoice.integrations.transportpro.mappers import (
     contact_emails,
     map_carrier,
     map_load,
+    map_rep,
 )
 from lanevoice.logging_config import setup_logging
 from lanevoice.settings import get_settings
@@ -113,6 +120,50 @@ def _check_carrier(client, number: str, raw: bool) -> None:
         _dump(f"raw contact/search for carrier {carrier.carrier_id}", contacts[:3])
 
 
+def _check_rep(client, record: dict, load, settings, raw: bool) -> None:
+    """Who a caller asking for "the rep on this load" would actually reach.
+
+    Two hops, and either can be the reason a handoff lands on the wrong desk: the
+    load has to name a carrier rep in a type this build recognises, and that user
+    has to have a number we can dial. Both are printed with the values seen, so a
+    vocabulary mismatch is a one-line env change rather than a mystery.
+    """
+    contacts = record.get("internalContacts")
+    kinds = [str(c.get("type")) for c in contacts or [] if isinstance(c, dict)]
+    print(f"       internal contacts : {', '.join(kinds) or '(none)'}")
+
+    if load.assigned_rep_id is None:
+        _show(BAD, "  no carrier sales rep on this load, so a caller who asks for "
+                   "the rep on it is handed to whoever is free instead. If "
+                   "Transport Pro DOES show a carrier rep, add its type from the "
+                   "line above to TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES "
+                   f"(currently: {settings.transport_pro_carrier_rep_contact_types}).")
+        return
+
+    user = client.user(load.assigned_rep_id)
+    if raw and user:
+        _dump(f"raw GET /user/{load.assigned_rep_id}", user)
+    rep = map_rep(user) if user else None
+    if rep is None:
+        _show(BAD, f"  the load is assigned to user {load.assigned_rep_id}, but "
+                   f"GET /user/{load.assigned_rep_id} returned nothing usable. The "
+                   "transfer will fall back to whoever is free.")
+        return
+
+    print(f"       assigned rep      : {rep.name or '(no name)'} "
+          f"({rep.title or 'no title'})")
+    print(f"       transfer would go : {rep.spoken_phone or '(nowhere)'}")
+    if rep.available:
+        _show(OK, "  a caller asking for the rep on this load reaches them")
+    else:
+        _show(BAD, "  no dialable number on their user record, so the transfer "
+                   "falls back to whoever is free. Check phoneNumbers in --raw.")
+    if rep.extension:
+        _show(WARN, f"  their number carries extension {rep.extension}, which "
+                    "cannot travel in a SIP transfer. The call reaches the "
+                    "switchboard and the extension goes in the call note.")
+
+
 def _check_load(client, load_id: str, raw: bool) -> None:
     """Look a load number up the way `_identify_load` does — `GET /load/{id}`."""
     match = client.load_detail(load_id)
@@ -130,7 +181,8 @@ def _check_load(client, load_id: str, raw: bool) -> None:
     # payload with no posting flag has to read as "not on the board".
     load = map_load(match, posted=False,
                     fraud_low_ratio=settings.transport_pro_fraud_low_ratio,
-                    open_statuses=settings.open_load_statuses)
+                    open_statuses=settings.open_load_statuses,
+                    rep_types=settings.carrier_rep_contact_types)
     if load is None:
         _show(BAD, "  the record has no load_id this code can find")
         return
@@ -176,6 +228,9 @@ def _check_load(client, load_id: str, raw: bool) -> None:
                    "open at. The agent will hand this load to a rep.")
     if not load.origin or not load.destination:
         _show(WARN, "  the lane is incomplete — check the waypoints in --raw")
+
+    # Who a caller asking for a person on this load gets put through to.
+    _check_rep(client, match, load, settings, raw)
 
 
 def main() -> int:

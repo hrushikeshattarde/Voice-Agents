@@ -26,11 +26,14 @@ src/lanevoice/
 ├── datasource.py          # picks the backend from DATA_SOURCE
 ├── voice/                 # GroqTTS + GroqComposer (writes every spoken turn)
 ├── telephony/             # LiveKit worker (STT plugin + TTS adapter + lifecycle)
+│                          #   + whisper.py: rings the rep, briefs them, press 9 to
+│                          #     take the call; transfer.py: blind REFER fallback
 └── demo.py                # text-mode simulation (no keys)
 tests/                     # pytest: parsing, negotiation, verification, conversation,
-                           #   Transport Pro client / mappers / repository / full calls
-docs/                      # LIVE_SETUP.md, TEST_CALL_SCRIPTS.md
-sip_setup/                 # LiveKit inbound-trunk + dispatch-rule JSON
+                           #   Transport Pro client / mappers / repository / full calls,
+                           #   transfer + whisper handoff
+docs/                      # LIVE_SETUP.md, TEST_CALL_SCRIPTS.md, TRANSPORT_PRO.md
+sip_setup/                 # LiveKit inbound + outbound trunk + dispatch-rule JSON
 Dockerfile · Makefile · pyproject.toml
 ```
 

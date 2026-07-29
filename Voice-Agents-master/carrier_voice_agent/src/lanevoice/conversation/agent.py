@@ -30,6 +30,12 @@ Nothing about the load is shared — with the caller or with the composer — un
 VERIFY_CARRIER clears and ASK_EMPTY is answered. Where the loads and carriers
 come from (the Transport Pro API or the offline seed data) is the repository's
 business, not this file's.
+
+One request cuts across all of it: **"can I talk to the sales rep?"** is answered
+from any state, by the rep the load is assigned to, before the state machine gets
+a look at the turn (`handle`). Moving the actual phone line is the telephony
+layer's job — this class publishes `pending_transfer` and stays independent of
+audio I/O.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from lanevoice.domain.models import (
     Decision,
     LoadStatus,
     OfferParty,
+    TransferResolution,
     VerificationAction,
 )
 from lanevoice.logging_config import get_logger
@@ -83,6 +90,9 @@ _UNRETRYABLE = re.compile(
 # The agent's persona — handed to the composer as a fact so the whole call sounds
 # like one consistent human rep.
 REP_NAME = "Alex"
+# Said to carriers on the greeting and to reps on the whisper, so it lives in one
+# place rather than being spelled slightly differently in each.
+BROKERAGE = "Circle Logistics"
 
 # Non-price levers a rep leans on when a carrier is stuck on their number. ONE
 # per turn, and never the same one twice on a call — a pitch delivered verbatim
@@ -101,10 +111,102 @@ _ACCEPT_WORDS = (
     "sounds good", "book it", "agreed", "accept", "perfect", "yes", "yeah",
     "yep", "yup", "ok", "okay", "sure", "fine", "let's do it", "you got it",
 )
-_HUMAN_WORDS = (
-    "talk to a human", "speak to someone", "representative", "a rep",
-    "real person", "agent please",
+# The caller asking for a person. Checked on EVERY turn, in every state, because
+# "can I just talk to the sales rep" is a sentence a carrier says at any point in
+# a call — while the agent is still asking for their MC, in the middle of a
+# rundown, or after a rate has been agreed — and it is always answered the same
+# way: hand them to the rep whose load it is (`_transfer_and_say`).
+#
+# Two shapes are matched. An explicit handoff ("transfer me", "put me through"),
+# and a request for one of OUR people. The second needs a determiner on our side
+# — "your rep", "a person", "the sales rep" — which is what keeps the sentences a
+# carrier says constantly out of it: "let me check with MY dispatcher", "I'll talk
+# to MY driver". `someone` and `person` are only honoured after "talk/speak to",
+# since "I need someone at the dock to unload" is not a request for our desk.
+_DETERMINER = r"(?:a|an|the|your|one of your|another|some)"
+_ADJECTIVES = (r"(?:(?:real|actual|live|human|carrier|sales|account|senior|other"
+               r"|different|regular|normal)\s+){0,3}")
+_REP_NOUN = (rf"(?:sales\b|{_DETERMINER}\s+{_ADJECTIVES}"
+             r"(?:rep|reps|representative|human|manager|broker|salesperson)\b)")
+_PERSON_NOUN = (rf"(?:someone|somebody|{_REP_NOUN}"
+                rf"|{_DETERMINER}\s+{_ADJECTIVES}(?:person|people)\b)")
+
+_ASKS_FOR_PERSON_RE = re.compile(
+    # An explicit handoff, whoever it lands on.
+    r"\b(?:transfer|forward)\s+(?:me|this|the call)\b"
+    r"|\bput\s+me\s+(?:through|on)\b"
+    r"|\bconnect\s+me\b"
+    r"|\bhand\s+(?:me|this)\s+(?:over|off)\b"
+    # "can I talk to the sales rep", "I need to speak with a person".
+    rf"|\b(?:talk|speak|speaking|chat|deal|dealing)\b[^.?!]{{0,24}}?"
+    rf"\b(?:to|with)\s+{_PERSON_NOUN}"
+    # "get me a rep", "I want the rep on this load".
+    rf"|\b(?:get|give)\s+me\s+{_REP_NOUN}"
+    rf"|\b(?:want|need|prefer|rather have)\s+(?:to\s+\w+\s+(?:to|with)\s+)?{_REP_NOUN}"
+    # A bare demand for a human, however it arrives.
+    r"|\b(?:is|are)\s+there\s+(?:a|an)\s+(?:real|actual|live)\s+(?:person|human)\b"
+    r"|\b(?:real|actual|live)\s+(?:person|human|people)\b"
+    r"|\bhuman\s+(?:being|please)\b",
+    re.IGNORECASE,
 )
+
+
+def _asks_for_a_person(text: str) -> bool:
+    return bool(_ASKS_FOR_PERSON_RE.search(text))
+
+
+# The ONLY reason a live call is moved onto a rep's phone: the caller asked for a
+# person. Everything else the agent can't finish — a rate above its authority, a
+# fraud tripwire, an address that isn't on the account, a dead board — is handed
+# over as a CALLBACK instead: noted, assigned, and the carrier is told a rep will
+# ring them.
+#
+# The desk's reasoning is that an unrequested transfer is a worse experience than a
+# callback. A carrier who asked a question and is suddenly listening to a phone ring
+# has lost control of their own call, and the rep they land on is interrupted by
+# somebody who did not ask for them. When the carrier DOES ask, all of that flips:
+# being put through is exactly what they want.
+_TRANSFER_ON_REQUEST_ONLY = frozenset({"carrier_request"})
+
+# What the rep needs to know about WHY the call is coming to them, keyed on the
+# handoff reason. One sentence each, in the first person, because it is read to a
+# colleague who is about to pick up. `{rate}` is the figure the situation turns on.
+_WHISPER_SITUATION = {
+    "carrier_request": "They asked to speak to a person.",
+    "above_agent_authority":
+        "They're firm at {ask}, which is above what I can approve on my own.",
+    "fraud_review":
+        "They offered to haul it for {ask}, well under the board rate, so I "
+        "flagged it instead of booking it.",
+    "email_not_verified":
+        "We agreed {rate}, but the email address they gave is not on their "
+        "account, so nothing is booked.",
+    "pickup_issue":
+        "We agreed {rate}, but they couldn't confirm the pickup.",
+    "booking_write_failed":
+        "We agreed {rate}, but the booking would not save, so it is not placed.",
+    "verification_review": "I couldn't finish verifying them.",
+    "mc_not_captured": "I couldn't catch their MC or USDOT number.",
+    "no_published_rate":
+        "There's no board rate published on this load, so I had nothing to quote.",
+    "ceiling_guard": "The rate went outside what I'm allowed to agree.",
+    "source_unavailable": "I couldn't reach the system to answer their question.",
+    "cannot_compose": "I ran into a problem on the call.",
+}
+
+# Why a handoff went to somebody other than the load's own rep, in words, because
+# the call note is read by a person deciding what to do about it. Keyed on
+# `TransferResolution.note` — see `TransferService.resolve`.
+_FALLBACK_REASONS = {
+    "assigned_rep_has_no_number":
+        "the rep this load is assigned to has no phone number on their record",
+    "assigned_rep_unavailable":
+        "the rep this load is assigned to was not available",
+    "assigned_rep_not_found":
+        "the rep this load is assigned to could not be looked up",
+    "load_has_no_assigned_rep": "this load has no carrier rep assigned to it",
+    "no_load_identified": "the call had not got as far as a load number",
+}
 # The carrier calls their number their best. A rep stops asking at that point and
 # either closes it or lets it go — pressing a fourth time just burns the call.
 # Deliberately narrow: "final" and "firm" only count when they're attached to the
@@ -300,6 +402,14 @@ class CarrierSalesAgent:
         self._load_revealed = False               # gate: load facts reach the LLM only after this
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
+        # Set when this call has been handed over and the caller's line still has
+        # to be MOVED onto the rep's phone. This class knows nothing about SIP —
+        # the telephony layer reads this and does the moving. Anything driving the
+        # agent without a phone line (the demo, the tests) ignores it.
+        self.pending_transfer: TransferResolution | None = None
+        # Why the call is being handed over. Decides whether the line is actually
+        # moved (`_TRANSFER_ON_REQUEST_ONLY`) and what the rep is told in the whisper.
+        self._transfer_reason: str | None = None
         repo.start_call(self.call_id)
 
     # -- speaking ----------------------------------------------------------- #
@@ -410,10 +520,11 @@ class CarrierSalesAgent:
             f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
             f"Last failure: {why}",
         )
-        # A call can break before it has a load — `resolve` takes that.
-        resolution = self._transfers.resolve(self.load)
-        rep_id = resolution.rep.rep_id if resolution.rep else None
-        self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id)
+        # Through `_transfer` like every other handoff, so the line is actually
+        # moved: this is the one path that speaks a written line instead of a
+        # composed one, and it would be the worst place to say "let me get you
+        # over to a rep" and then not do it. `resolve` copes with no load.
+        self._transfer(reason="cannot_compose")
         self.transcript.append(("agent", _LAST_RESORT))
         return _LAST_RESORT
 
@@ -468,12 +579,19 @@ class CarrierSalesAgent:
             "what you can help with — that's it. Real desks answer short; do not "
             "deliver a speech, do not list what you do, and do not ask for a load "
             "number yet. One sentence.",
-            facts=f"Your name: {REP_NAME}. Brokerage: Circle Logistics.",
+            facts=f"Your name: {REP_NAME}. Brokerage: {BROKERAGE}.",
             amounts=set(),
         )
 
     def handle(self, user_text: str) -> str:
         self._log_user(user_text)
+        # "Can I just talk to the rep on this?" outranks whatever this state was
+        # about to ask. It is checked here rather than inside the states because a
+        # caller says it wherever they like, and a bot that carries on asking for
+        # an MC number after being asked for a person is the single most
+        # infuriating thing this system could do. The load is already identified by
+        # IDENTIFY_LOAD, so by this point the handoff usually knows whose load it
+        # is; before that it falls back to whoever is free.
         handler = {
             CallState.IDENTIFY_LOAD: self._identify_load,
             CallState.VERIFY_CARRIER: self._verify_carrier,
@@ -486,6 +604,8 @@ class CarrierSalesAgent:
             CallState.DONE: lambda _t: "This call has ended. Goodbye.",
         }.get(self.state, self._identify_load)
         try:
+            if self.state != CallState.DONE and _asks_for_a_person(user_text):
+                return self._asked_for_a_person(user_text)
             return handler(user_text)
         except SourceUnavailable as exc:
             # The board, the carrier file or the contact list is unreachable. Not
@@ -893,10 +1013,11 @@ class CarrierSalesAgent:
         money = parsing.extract_money(text)
 
         # Explicit "yes" with no number -> accept the offer on the table.
+        # A request for a person never reaches here: `handle` takes those first,
+        # in every state, so "yeah, put me through to the rep" is a handoff and not
+        # an acceptance of the number on the table.
         if money is None and any(w in lowered for w in _ACCEPT_WORDS):
             return self._propose_booking(self.neg.current_offer)
-        if any(w in lowered for w in _HUMAN_WORDS):
-            return self._transfer_and_say(reason="carrier_request")
 
         if money is not None:
             self._last_ask = money
@@ -1246,48 +1367,348 @@ class CarrierSalesAgent:
             must_say=rate,
         )
 
+    # -- The caller asks for a person --------------------------------------- #
+    def _asked_for_a_person(self, text: str) -> str:
+        """They asked for a human, so they get one — the rep whose load this is.
+
+        Answered from any state and at any point in the call. What is recorded
+        first is the state it happened in and what had already been agreed,
+        because the rep picking the call up has to carry on from wherever the
+        carrier had got to rather than start them again.
+        """
+        agreed = (f" A rate of ${int(self._agreed_rate)} was already agreed on this "
+                  "call." if self._agreed_rate else "")
+        self._note(
+            f"Carrier asked to speak to a person during {self.state.value} "
+            f'("{text.strip()}").{agreed}'
+        )
+        return self._transfer_and_say(reason="carrier_request")
+
     # -- Step 6b: transfer -------------------------------------------------- #
-    def _transfer(self, reason: str) -> object:
+    def _transfer(self, reason: str) -> TransferResolution:
+        """Decide who this call belongs to, and whether to move the line to them.
+
+        Two things happen the caller never hears. The handoff goes in the audit
+        trail AND onto the load, naming who has it and whose load it actually is —
+        that is what makes a handoff reviewable afterwards. And `pending_transfer`
+        is set IF this is a reason we transfer for, which is the telephony layer's
+        cue to ring that rep; see `_TRANSFER_ON_REQUEST_ONLY`.
+
+        The transfer event records which of the two happened, so the metric "was
+        this call transferred to the right rep" is never satisfied by a call that
+        was only ever assigned:
+
+            initiated  -> the line is being moved; settled later as connected,
+                          declined or failed by whoever does the moving
+            callback   -> nobody's phone rang; this rep owes the carrier a call
+        """
+        self._transfer_reason = reason
         resolution = self._transfers.resolve(self.load)
-        self._finish(CallOutcome.TRANSFERRED, rep_id=resolution.rep.rep_id
-                     if resolution.rep else None)
+        transferring = (reason in _TRANSFER_ON_REQUEST_ONLY
+                        and resolution.rep is not None)
+        self._note(self._transfer_note(reason, resolution, transferring))
+        if resolution.rep is not None:
+            self._repo.log_transfer(self.call_id, resolution.rep.rep_id,
+                                    "initiated" if transferring else "callback")
+        self._finish(CallOutcome.TRANSFERRED)
+        self.pending_transfer = resolution if transferring else None
         return resolution
+
+    def _transfer_note(self, reason: str, resolution: TransferResolution,
+                       transferring: bool) -> str:
+        """The handoff, written down for the rep who has to pick it up."""
+        rep, owner = resolution.rep, resolution.assigned_rep
+        owns = f"{owner.name or owner.rep_id}" if owner else None
+        if rep is None:
+            whose = f" This load belongs to {owns}." if owns else ""
+            return (f"Handoff ({reason}): no rep was free, so a callback was logged "
+                    f"rather than a transfer.{whose}")
+
+        who = f"{rep.name or f'rep {rep.rep_id}'} on {rep.spoken_phone or 'no number'}"
+        # A callback is not a transfer and must not read like one in the note: the
+        # rep opening this load has to know whether the carrier is already talking
+        # to somebody or is waiting for a phone call.
+        action = ("Transferring the caller to" if transferring
+                  else "CALLBACK OWED by")
+        if not resolution.is_fallback:
+            return f"Handoff ({reason}). {action} {who} — the rep this load is " \
+                   "assigned to."
+        because = _FALLBACK_REASONS.get(
+            resolution.note, resolution.note or "reason not recorded")
+        if owns:
+            because = f"{because} ({owns})"
+        return f"Handoff ({reason}). {action} {who}, as a fallback: {because}."
+
+    def _rep_label(self, resolution: TransferResolution) -> str | None:
+        """What to call the rep out loud, or None when there is nobody to name."""
+        if resolution.rep is None:
+            return None
+        return resolution.rep.name or "one of our reps"
 
     def _transfer_and_say(self, reason: str) -> str:
         resolution = self._transfer(reason)
-        if reason == "above_agent_authority":
-            # Don't hand the carrier a "no" — hand them to someone who can say yes.
-            who = resolution.rep.name if resolution.rep else None
-            if who is None:
-                return self._say(
-                    "Their number is above what you can approve on your own, and nobody "
-                    "senior is free this second. Tell them that, and that a rep will call "
-                    "them straight back on this load — ask them to sit tight rather than "
-                    "taking something else. Keep it hopeful: this is not a no. Name NO "
-                    "dollar figure.",
-                    amounts=set(),
-                )
+        who = self._rep_label(resolution)
+        # `_transfer` decides this: only a caller who ASKED for a person gets put
+        # through. Everything else is a callback, and the difference has to be
+        # audible — "hold a moment" and "someone will ring you" are promises about
+        # different things, and the wrong one is a carrier holding a dead line.
+        if self.pending_transfer is None:
+            return self._say_callback(reason, who)
+
+        # Whether this rep OWNS the load decides what may be claimed about them.
+        # "who handles this load" is a statement of fact, and making it about a
+        # fallback rep is a lie the carrier uncovers the moment they say hello.
+        if resolution.is_fallback:
             return self._say(
-                f"Their number is above what YOU can approve on your own, but it is NOT a "
-                f"no. Tell them that and that you're putting them through to {who}, who can "
-                f"sign off on it. Warm and hopeful. Name NO dollar figure and do not "
-                f"mention limits, caps or maximums.",
+                f"Tell them you're putting them through to {who} and to hold a moment. Do "
+                f"NOT say this person handles their load, is expecting them, or knows "
+                f"anything about it — they don't, and the carrier finds that out ten "
+                f"seconds later. Name NO dollar figure.",
                 facts=f"Rep taking the call: {who}",
                 amounts=set(),
             )
-        if resolution.rep is None:
+        return self._say(
+            f"Tell them you're putting them through to {who}, the rep this load is "
+            f"assigned to, and to hold a moment. Name NO dollar figure.",
+            facts=f"Rep taking the call: {who}, who this load is assigned to",
+            amounts=set(),
+        )
+
+    def _say_callback(self, reason: str, who: str | None) -> str:
+        """Nobody is being put through: a rep will ring them back instead.
+
+        The carrier must not be told to hold. They are about to hang up and wait for
+        a phone call, and every word here is about making that a thing they're
+        willing to do rather than a brush-off.
+        """
+        if reason == "above_agent_authority":
+            # The one callback that is really good news. Their number is inside what
+            # the desk can pay — it is just above what the agent spends alone — so
+            # the last thing to do is let it sound like a rejection.
+            named = f"{who} " if who else "a rep "
             return self._say(
-                "No rep is free right now. Tell them you've logged a callback and someone "
-                "will get straight back to them. Brief and apologetic without grovelling. "
-                "Name NO dollar figure.",
+                f"Their number is above what YOU can approve on your own, but it is NOT a "
+                f"no — somebody here can sign it off. Tell them that, and that {named}will "
+                f"call them straight back on this load. Ask them to sit tight rather than "
+                f"taking something else. Do NOT tell them to hold: you are ending the call "
+                f"and someone is ringing them. Keep it hopeful. Name NO dollar figure and "
+                f"do not mention limits, caps or maximums.",
+                facts=f"Rep who will call them back: {who}" if who else "",
+                amounts=set(),
+            )
+        if who is None:
+            return self._say(
+                "Nobody is free to pick this up right now. Tell them you've logged it and "
+                "someone will get straight back to them. Do NOT tell them to hold. Brief "
+                "and apologetic without grovelling. Name NO dollar figure.",
                 amounts=set(),
             )
         return self._say(
-            f"Tell them you're putting them through to {resolution.rep.name}, who handles "
-            f"this load, and to hold a moment. Name NO dollar figure.",
-            facts=f"Rep taking the call: {resolution.rep.name}",
+            f"You can't finish this one yourself, so {who} is going to pick it up. Tell "
+            f"them {who} will call them straight back on this load, and close the call "
+            f"politely. Do NOT tell them to hold and do NOT say you're putting them "
+            f"through — nobody is being connected, they're getting a call back. Do not "
+            f"explain what went wrong on your side. Name NO dollar figure.",
+            facts=f"Rep who will call them back: {who}",
             amounts=set(),
         )
+
+    # -- The whisper: what the REP hears before they take the call ---------- #
+    def whisper_script(self) -> str:
+        """The briefing played to the rep while the carrier is on hold (PRD §3.6b).
+
+        **Deliberately not composed by the LLM**, which is the opposite of every
+        other line this class produces. The no-scripted-lines rule exists because
+        the CARRIER needs a reply shaped by what they just said. This is not that:
+        it is a data readout to a colleague, containing a load number, an MC number
+        and dollar figures, where a model paraphrasing "1437475" or rounding a rate
+        is a wrong number spoken to somebody who will act on it. Exactness wins.
+
+        Identifiers are spelled digit by digit and the load number is said twice —
+        a rep is writing it down off a phone speaker, and the second reading is
+        what makes that possible. Rates are written `$2400`; `voice.tts.speechify`
+        turns those into words on the way out.
+
+        The carrier cannot hear any of this: it is played in a separate room they
+        are not in. That is a structural guarantee, not a mute button — see
+        `lanevoice.telephony.whisper`.
+        """
+        carrier = self.carrier
+        load = self.load
+        parts = [f"This is the {BROKERAGE} voice assistant."]
+
+        if load is not None:
+            spelled = formatting.spell_digits(load.load_id)
+            parts.append(f"I have a carrier on the line about load {spelled}, "
+                         f"I repeat, load {spelled}.")
+            if load.origin and load.destination:
+                parts.append(f"{load.origin} to {load.destination}.")
+        else:
+            parts.append("I have a carrier on the line, and we never got as far as "
+                         "a load number.")
+
+        if carrier is not None:
+            who = carrier.legal_name
+            # DIGITS only — the record spells it "MC123456" in places, and spelling
+            # the letters too puts "M C M C 1 2 3 4 5 6" in the rep's ear.
+            mc = re.sub(r"\D", "", carrier.mc_number or "")
+            dot = re.sub(r"\D", "", carrier.usdot_number or "")
+            if mc:
+                label = f", M C {formatting.spell_digits(mc)}"
+            elif dot:
+                # A carrier who only ever gave a USDOT. Say which number it is, or
+                # the rep types it into the wrong box.
+                label = f", USDOT {formatting.spell_digits(dot)}"
+            else:
+                label = ""
+            parts.append(f"You'll be speaking with {who}{label}.")
+        else:
+            parts.append("I could not identify their company.")
+
+        if (situation := self._whisper_situation()):
+            parts.append(situation)
+        if (empty := self._empty_summary()):
+            parts.append(empty)
+
+        parts.append(f"Press {self._settings.whisper_accept_digit} to take the call, "
+                     f"or {self._settings.whisper_repeat_digit} to hear this again.")
+        return " ".join(parts)
+
+    def _whisper_situation(self) -> str:
+        """Where the call had got to, in one sentence — including the money.
+
+        "Offers made" is in the PRD's whisper for a reason: a rep who knows the
+        carrier is at $2400 against our $2200 can open with a number. One who
+        doesn't has to make the carrier start again, which is the thing a warm
+        transfer is supposed to prevent.
+        """
+        ask = self._last_ask
+        agreed = self._agreed_rate
+        ours = self.neg.current_offer if self.neg else None
+        template = _WHISPER_SITUATION.get(self._transfer_reason or "", "")
+        sentence = template.format(
+            ask=f"${int(ask)}" if ask else "their number",
+            rate=f"${int(agreed)}" if agreed else "a rate",
+        ) if template else ""
+
+        # Where the numbers stand, said ONCE. The reason sentence above already
+        # names a figure for several reasons ("firm at $2400"), and hearing the same
+        # number twice in one breath is how a rep writes it down wrong.
+        already_said = "$" in sentence
+        money: list[str] = []
+        if agreed:
+            if not already_said:
+                money.append(f"We had agreed ${int(agreed)}.")
+        else:
+            if ask and not already_said:
+                money.append(f"They're asking ${int(ask)}.")
+            if ours and ask:
+                money.append(f"My last offer was ${int(ours)}.")
+            elif ours:
+                money.append(f"I offered ${int(ours)} and they haven't given me a "
+                             "number.")
+        return " ".join(p for p in (sentence, *money) if p)
+
+    # -- The line could not be moved --------------------------------------- #
+    def transfer_failed(self, why: str) -> str:
+        """The handoff was announced but the line did not move.
+
+        Called by the telephony layer, which is the only part of the system that
+        knows whether the leg actually went across. By this point the carrier has
+        been told to hold, so the honest move is to come back on the line and
+        promise a callback — the alternative is leaving somebody listening to
+        nothing until they hang up.
+        """
+        rep = self.pending_transfer.rep if self.pending_transfer else None
+        self.pending_transfer = None
+        if rep is not None:
+            self._repo.log_transfer(self.call_id, rep.rep_id, "failed")
+        self._repo.log_note(
+            self.call_id,
+            f"Warm transfer to {rep.name if rep else 'a rep'} FAILED ({why}). The "
+            "carrier had already been asked to hold, so they were told a rep will "
+            "call them back. This call needs following up.",
+        )
+        return self._say(
+            "You told them to hold and the transfer didn't go through. Do not pretend "
+            "it did. Say you couldn't get them across, that you've logged it and "
+            "somebody will call them straight back on this load, and apologise once "
+            "without grovelling. Name NO dollar figure.",
+            amounts=set(),
+        )
+
+    def still_holding(self) -> str:
+        """One line to the carrier while we're getting the rep on the phone.
+
+        Composed like everything else they hear — but unlike everything else, a
+        failure here is swallowed and returns nothing. This runs while a handoff is
+        already in flight, and `_say`'s fallback for a composer it can't use is to
+        start ANOTHER handoff, which would ring a second rep for a call that is
+        already being answered by the first.
+
+        Empty string means "stay quiet", which is the correct degraded behaviour: a
+        few more seconds of hold beats a non-sequitur.
+        """
+        try:
+            spoken = self._composer.compose(
+                directive=(
+                    "You already told them you're putting them through, and they're "
+                    "still holding while you get hold of the rep. Say ONE short line "
+                    "so they know you haven't forgotten them and the line hasn't "
+                    "dropped. Do not promise a callback, do not name a rep, do not "
+                    "ask them anything, and name NO number of any kind."),
+                facts="", dialogue=self._dialogue(), speakable="", correction="",
+            ).strip()
+        except Exception as exc:  # noqa: BLE001 - a hold line is never worth a failure
+            logger.info("could not compose a hold line (%s) — staying quiet", exc)
+            return ""
+        # A hold line has no business saying a figure, and this one is not checked
+        # by the usual guard because there is no turn behind it.
+        if not spoken or _rate_leak(spoken, set(), ""):
+            return ""
+        self.transcript.append(("agent", spoken))
+        return spoken
+
+    def transfer_declined(self, why: str) -> str:
+        """The rep we rang could not take the call. Come back and say so (§9.5).
+
+        "Could not take it" covers a rep whose phone rang out, whose voicemail
+        picked up, and who answered, heard the briefing and didn't take it. All three
+        are the same thing to the carrier: the person they asked for is not
+        available this minute.
+
+        So the agent comes back on the line — the carrier is still there, holding —
+        and tells them the truth: the rep is busy, and will call them back. It does
+        NOT ring a queue of other people. The carrier asked for the rep on their
+        load, and being passed around three strangers is not what they asked for.
+        """
+        rep = self.pending_transfer.rep if self.pending_transfer else None
+        self.pending_transfer = None
+        name = (rep.name or f"rep {rep.rep_id}") if rep else "The rep"
+        if rep is not None:
+            self._repo.log_transfer(self.call_id, rep.rep_id, "declined")
+        self._note(
+            f"{name} did not pick up the transfer ({why}). The carrier was told they "
+            f"are busy and will call back. {name} OWES THIS CARRIER A CALL"
+            + (f" on {rep.spoken_phone}." if rep and rep.phone else ".")
+        )
+        return self._say(
+            f"You put them on hold to reach {name} and could not get hold of them. Come "
+            f"back on the line and tell them straight: {name} is tied up right now, and "
+            f"{name} will call them back on this load. Apologise once for the hold, "
+            f"briefly. Do NOT ask them to keep holding, do NOT offer somebody else, do "
+            f"NOT say what you were doing for the last minute, and do not promise a time. "
+            f"Then close the call warmly. Name NO dollar figure.",
+            facts=f"Rep who will call them back: {name}",
+            amounts=set(),
+        )
+
+    def transfer_connected(self) -> None:
+        """The caller is on the rep's line. Settle the audit trail."""
+        rep = self.pending_transfer.rep if self.pending_transfer else None
+        self.pending_transfer = None
+        if rep is not None:
+            self._repo.log_transfer(self.call_id, rep.rep_id, "connected")
 
     # -- Above the agent's own authority -> hand it to a human -------------- #
     def _escalate(self, ask: float, result) -> str:
@@ -1327,7 +1748,8 @@ class CarrierSalesAgent:
         )
 
     # -- persistence -------------------------------------------------------- #
-    def _finish(self, outcome: CallOutcome, rep_id: str | None = None) -> None:
+    def _finish(self, outcome: CallOutcome) -> None:
+        """Close the call out. Transfer events are `_transfer`'s business."""
         self.state = CallState.DONE
         self.outcome = outcome
         self._repo.end_call(
@@ -1337,8 +1759,6 @@ class CarrierSalesAgent:
             outcome.value,
             self.transcript,
         )
-        if rep_id and outcome == CallOutcome.TRANSFERRED:
-            self._repo.log_transfer(self.call_id, rep_id, "connected")
 
     def summary(self) -> dict:
         return {

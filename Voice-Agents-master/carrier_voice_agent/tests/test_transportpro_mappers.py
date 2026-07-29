@@ -11,9 +11,11 @@ import copy
 from lanevoice.domain.models import AuthorityStatus, LoadStatus
 from lanevoice.integrations.transportpro.client import _records
 from lanevoice.integrations.transportpro.mappers import (
+    carrier_rep_id,
     contact_emails,
     map_carrier,
     map_load,
+    map_rep,
     normalize_status,
 )
 from tests.transportpro_payloads import (
@@ -31,6 +33,8 @@ from tests.transportpro_payloads import (
     LOAD_DETAIL_WAYPOINTS,
     READY,
     SEARCH_AVAILABLE,
+    internal_contacts,
+    user_record,
 )
 
 RECORD = SEARCH_AVAILABLE["results"][0]
@@ -583,3 +587,121 @@ def test_contact_search_addresses_are_lowercased_and_deduplicated():
 def test_contacts_with_no_address_contribute_nothing():
     assert contact_emails([{"name": "No Email", "phone": "615-555-0100"}]) == ()
     assert contact_emails([]) == ()
+
+
+# --------------------------------------------------------------------------- #
+# The rep a load is assigned to
+#
+# This is who a caller asking "can I talk to the rep on this load" is handed to,
+# so the wrong answer here is a carrier transferred to somebody else's desk.
+# --------------------------------------------------------------------------- #
+def test_the_carrier_rep_is_picked_out_of_the_internal_contacts():
+    record = {"internalContacts": internal_contacts(ORDERTAKER=1000, CARRIERREP=2423)}
+    assert carrier_rep_id(record) == "2423"
+
+
+def test_the_order_taker_is_never_read_as_the_carrier_rep():
+    """A load with no carrier rep has no carrier rep.
+
+    ORDERTAKER is whoever keyed the order in and DISPATCHER runs the truck once
+    it's covered — different people on different desks. Transferring a carrier to
+    one of them because we couldn't find the rep is worse than the honest §9.5
+    fallback of whoever is free, so this returns None rather than a near-miss.
+    """
+    record = {"internalContacts": internal_contacts(
+        ORDERTAKER=1000, DISPATCHER=1001, CREATEDBY=1002, LASTUPDATEDBY=1)}
+    assert carrier_rep_id(record) is None
+
+
+def test_a_carrier_rep_type_we_were_not_told_about_is_still_recognised():
+    """The exact spelling comes from the live tenant, not from the collection, so
+    anything that plainly IS the carrier-side rep is used and logged."""
+    record = {"internalContacts": internal_contacts(
+        ORDERTAKER=1000, CARRIER_SALES_REPRESENTATIVE=2423)}
+    assert carrier_rep_id(record) == "2423"
+
+
+def test_configured_contact_types_are_tried_in_order():
+    record = {"internalContacts": internal_contacts(SALESREP=111, CARRIERREP=222)}
+    assert carrier_rep_id(record, ("salesrep", "carrierrep")) == "111"
+    assert carrier_rep_id(record, ("carrierrep", "salesrep")) == "222"
+
+
+def test_a_load_with_no_internal_contacts_names_no_rep():
+    assert carrier_rep_id({}) is None
+    assert carrier_rep_id({"internalContacts": []}) is None
+    assert carrier_rep_id({"internalContacts": "nonsense"}) is None
+
+
+def test_a_mapped_load_carries_the_rep_it_is_assigned_to():
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["internalContacts"] = internal_contacts(ORDERTAKER=1000, CARRIERREP=2423)
+    assert map_load(record, posted=True).assigned_rep_id == "2423"
+
+
+# --------------------------------------------------------------------------- #
+# GET /user/{id} -> a transfer target
+# --------------------------------------------------------------------------- #
+def test_a_user_record_becomes_a_dialable_rep():
+    rep = map_rep(user_record(2423))
+    assert rep.rep_id == "2423"
+    assert rep.name == "Lucas Piqueras"
+    assert rep.title == "Carrier Account Manager"
+    assert rep.phone == "+13123007447"
+    assert rep.extension == "8754"
+    assert rep.available is True
+
+
+def test_the_extension_is_kept_out_of_the_number_but_not_thrown_away():
+    """`312-300-7447 ext8754`. The extension cannot travel in a SIP transfer
+    destination, so the number has to be dialable without it — and the extension
+    still has to survive into the call note, or the transfer lands on a
+    switchboard with no way to reach the person."""
+    rep = map_rep(user_record(1, phoneNumbers=[
+        {"type": "OFFICE", "value": "312-300-7447 ext8754"}]))
+    assert (rep.phone, rep.extension) == ("+13123007447", "8754")
+    assert rep.spoken_phone == "+13123007447 ext 8754"
+
+
+def test_a_call_is_never_transferred_to_a_fax_machine():
+    """The collection's user record lists the FAX first. Taking the first number
+    on the list would put a carrier through to a fax tone."""
+    rep = map_rep(user_record(1, phoneNumbers=[
+        {"type": "FAX", "value": "260-220-8703"}]))
+    assert rep.phone == ""
+    assert rep.available is False
+
+
+def test_a_mobile_is_preferred_over_the_office_line():
+    rep = map_rep(user_record(1, phoneNumbers=[
+        {"type": "OFFICE", "value": "312-300-7447 ext8754"},
+        {"type": "MOBILE", "value": "(260) 555-0134"},
+    ]))
+    assert (rep.phone, rep.extension) == ("+12605550134", None)
+
+
+def test_a_rep_with_no_number_is_not_available_rather_than_missing():
+    """They are still the rep the load belongs to, which the call note says. What
+    they are not is somebody a live call can be handed to."""
+    rep = map_rep(user_record(7, phoneNumbers=[]))
+    assert rep.rep_id == "7" and rep.name == "Lucas Piqueras"
+    assert rep.available is False
+
+
+def test_a_number_we_cannot_dial_is_ignored_rather_than_guessed_at():
+    """A malformed destination handed to a SIP transfer is dead air on somebody's
+    call, so half a phone number is treated as no phone number."""
+    assert map_rep(user_record(1, phoneNumbers=[
+        {"type": "OFFICE", "value": "300-7447"}])).available is False
+    assert map_rep(user_record(1, phoneNumbers=[
+        {"type": "OFFICE", "value": "ext 8754"}])).available is False
+
+
+def test_an_already_e164_number_is_left_alone():
+    rep = map_rep(user_record(1, phoneNumbers=[
+        {"type": "OFFICE", "value": "+13123007447"}]))
+    assert rep.phone == "+13123007447"
+
+
+def test_a_user_record_with_no_id_is_not_a_person():
+    assert map_rep({"firstName": "Nobody", "phoneNumbers": []}) is None

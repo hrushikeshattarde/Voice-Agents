@@ -223,10 +223,31 @@ class Carrier:
 
 @dataclass(frozen=True)
 class Rep:
+    """A warm-transfer target: somebody on our side with a phone.
+
+    A rep comes from one of two places, and the difference matters at exactly one
+    point. The seeded table carries a real `available` flag. A Transport Pro user
+    — the person a load is actually assigned to — carries no presence field at
+    all, so there `available` means "we have a number we can dial", which is the
+    only availability the API lets us assert. See `TransportProRepository.get_rep`.
+    """
+
     rep_id: str
     name: str
     phone: str
     available: bool
+    # "Carrier Account Manager". Logged on every handoff because it is the
+    # cheapest way to spot that we picked the wrong internal contact off a load.
+    title: str | None = None
+    # Dialed after the call connects. Kept apart from `phone` because `phone` has
+    # to stay dialable on its own, and dropping the extension silently would send
+    # a warm transfer to a switchboard instead of to the rep.
+    extension: str | None = None
+
+    @property
+    def spoken_phone(self) -> str:
+        """The number as a human would write it down, extension included."""
+        return f"{self.phone} ext {self.extension}" if self.extension else self.phone
 
 
 # --------------------------------------------------------------------------- #
@@ -261,3 +282,7 @@ class TransferResolution:
     rep: Rep | None
     is_fallback: bool
     note: str | None = None
+    # Who the load actually belongs to, which is only different from `rep` when we
+    # could not reach them. Carried so the call note can name the load's real owner
+    # even on a fallback handoff — that is who has to ring the carrier back.
+    assigned_rep: Rep | None = None

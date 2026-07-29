@@ -32,6 +32,11 @@ proceeds, anything else does not. `carrier_status` has no saved example response
 in the collection, so `map_carrier` searches for its fields by name across the
 record instead of assuming one layout, and records the raw status string it read
 so a status we cannot parse is told apart from one that says "inactive".
+
+A load's people arrive as bare ids under `internalContacts`, so "who owns this
+load" takes two steps: `carrier_rep_id` picks the carrier sales rep's id off the
+load, and `map_rep` turns the `GET /user/{id}` record behind it into a name and a
+dialable number. That is the pair behind a warm transfer to the right rep.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from lanevoice.domain.models import AuthorityStatus, Carrier, Load, LoadStatus
+from lanevoice.domain.models import AuthorityStatus, Carrier, Load, LoadStatus, Rep
 from lanevoice.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +66,27 @@ _COVERED_HINTS = ("cover", "booked", "dispatch", "transit", "deliver", "assigned
 # Where a load carries its posting flag. `postingInfo.isPosted` is the shape the
 # fuller load formats use; the rest are defensive.
 _POSTED_KEYS = ("isposted", "is_posted", "posted", "postedtoloadboard")
+
+# The `internalContacts` entry that names the carrier sales rep — the person a
+# caller asking "can I talk to the rep on this load" wants. Ordered: the first
+# type a load actually carries wins.
+#
+# The collection's saved load payloads only ever show ORDERTAKER, DISPATCHER,
+# CREATEDBY and LASTUPDATEDBY, so the exact spelling of the carrier-rep type is
+# the one thing here that is read from live data rather than from an example.
+# That is why it is configurable (`TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES`) and
+# why `carrier_rep_id` falls back to a shape test rather than giving up: the
+# endpoint that sets this field is `POST /load/{id}/assign_carrier_sales_rep`,
+# whose body key is `carrierSalesRepId`.
+#
+# None of the other contact types stands in for it. An ORDERTAKER is whoever
+# keyed the order in, which is a different person on a different desk, and
+# transferring a carrier to them because we couldn't find the rep would be worse
+# than the honest fallback of "whoever is free" (§9.5).
+_DEFAULT_REP_CONTACT_TYPES = (
+    "carrierrep", "carriersalesrep", "carriersalesrepresentative",
+    "salesrep", "carrieraccountmanager",
+)
 
 
 def normalize_status(raw: Any) -> str:
@@ -581,8 +607,58 @@ def _notes(record: dict, shipment: dict, pickup: dict | None,
     return " ".join(found) or None
 
 
+def carrier_rep_id(record: dict,
+                   rep_types: tuple[str, ...] | frozenset[str] | None = None) -> str | None:
+    """The Transport Pro user id of the rep this load is assigned to.
+
+    `internalContacts` is a list of `{"type": ..., "id": ...}` — the load's people
+    as bare ids. This picks the carrier sales rep out of it and nothing else, so
+    that "put me through to the rep on this load" reaches the person whose load it
+    is. `GET /user/{id}` turns the id into a name and a phone (`map_rep`).
+
+    `rep_types` overrides the type vocabulary in preference order. Returns None
+    when the load names no carrier rep, which is a real answer: the transfer then
+    falls back to whoever is free rather than to the wrong person.
+    """
+    contacts = record.get("internalContacts")
+    if not isinstance(contacts, list):
+        return None
+
+    # Normalised type -> id, first occurrence winning, so a load that lists the
+    # same desk twice doesn't depend on which copy we read.
+    by_type: dict[str, str] = {}
+    for entry in contacts:
+        if not isinstance(entry, dict):
+            continue
+        kind = _norm(entry.get("type"))
+        ident = _text(entry.get("id")) or _text(entry.get("userId"))
+        if kind and ident:
+            by_type.setdefault(kind, ident)
+
+    for name in (rep_types or _DEFAULT_REP_CONTACT_TYPES):
+        if (ident := by_type.get(_norm(name))) is not None:
+            return ident
+
+    # A type we were not told about that is plainly the carrier-side rep anyway.
+    for kind, ident in by_type.items():
+        if "carrier" in kind and ("rep" in kind or "sales" in kind):
+            logger.info(
+                "Load names its carrier rep as internalContacts type %r, which is "
+                "not in TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES. Using it. Add it "
+                "to the setting to make this explicit.", kind)
+            return ident
+
+    if by_type:
+        logger.info(
+            "Load's internalContacts carry no carrier rep — types present: %s. "
+            "A caller asking for the rep on this load will get whoever is free.",
+            sorted(by_type))
+    return None
+
+
 def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
-             open_statuses: frozenset[str] | None = None) -> Load | None:
+             open_statuses: frozenset[str] | None = None,
+             rep_types: tuple[str, ...] | frozenset[str] | None = None) -> Load | None:
     """One `search_available` / load-detail record -> a `Load`.
 
     Two conditions decide whether the agent may sell it, and both are checked on
@@ -601,6 +677,10 @@ def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
     mapped and then gated by `Load.is_bookable` / `Load.is_quotable`, so a load
     that fails a condition becomes something the agent declines to sell rather
     than something it never heard of.
+
+    `assigned_rep_id` comes from `internalContacts` — see `carrier_rep_id`. It is
+    the load's own carrier sales rep, which is who a caller asking for a person
+    gets handed to.
     """
     load_id = _text(record.get("load_id")) or _text(record.get("id"))
     if not load_id:
@@ -690,7 +770,7 @@ def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
         open_rate=open_rate,
         ceiling_rate=ceiling_rate,
         fraud_low_rate=open_rate * fraud_low_ratio,
-        assigned_rep_id=None,
+        assigned_rep_id=carrier_rep_id(record, rep_types),
         status=status,
         is_posted=is_posted,
         notes=_notes(record, shipment, pickup, delivery),
@@ -838,6 +918,111 @@ def map_carrier(record: dict, *, emails: tuple[str, ...] = (),
         contact_emails=emails or _emails(record),
         carrier_id=carrier_id,
         raw_authority_status=raw_status,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Reps — the people a load is assigned to
+# --------------------------------------------------------------------------- #
+# Which of a user's numbers to try to reach them on, best first. FAX is not in
+# the list and never falls through: `phoneNumbers` in the collection's user record
+# is `[{"type": "FAX", ...}, {"type": "OFFICE", ...}]` — FAX first — so a plain
+# "take the first number" would warm-transfer a carrier into a fax machine.
+_REP_PHONE_TYPES = ("mobile", "cell", "cellular", "direct", "office", "work",
+                    "desk", "main", "business", "phone")
+
+# "312-300-7447 ext8754", "615-823-1937 ext 1". The extension is split off before
+# the number is read, or its digits merge into the number itself.
+_EXTENSION_RE = re.compile(r"(?:e?xt|extension|x)\.?\s*[:#]?\s*(\d{1,6})\s*$",
+                           re.IGNORECASE)
+
+
+def _phone(raw: Any) -> tuple[str | None, str | None]:
+    """A phone field -> `(dialable E.164 number, extension)`.
+
+    Returns `(None, ...)` for anything that isn't a number we can actually dial.
+    That is deliberate: this number is handed to the telephony layer to transfer a
+    live caller onto, and a malformed one there is dead air on somebody's call.
+    A US brokerage's user records are NANP; anything else is logged, not guessed.
+    """
+    text = _text(raw)
+    if not text:
+        return None, None
+
+    extension = None
+    if (match := _EXTENSION_RE.search(text)):
+        extension = match.group(1)
+        text = text[:match.start()]
+
+    digits = re.sub(r"\D", "", text)
+    if len(digits) == 10:
+        return f"+1{digits}", extension
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}", extension
+    if text.strip().startswith("+") and 8 <= len(digits) <= 15:
+        return f"+{digits}", extension
+    logger.warning("Transport Pro user phone %r is not a number this can dial; "
+                   "ignoring it.", _text(raw))
+    return None, extension
+
+
+def _rep_phone(record: dict) -> tuple[str | None, str | None]:
+    """The best number on a user record, and its extension."""
+    numbers = record.get("phoneNumbers")
+    by_type: dict[str, Any] = {}
+    if isinstance(numbers, list):
+        for entry in numbers:
+            if isinstance(entry, dict):
+                kind = _norm(entry.get("type")) or "phone"
+                by_type.setdefault(kind, entry.get("value"))
+
+    for kind in _REP_PHONE_TYPES:
+        if kind in by_type and (found := _phone(by_type[kind]))[0]:
+            return found
+
+    # Flat spellings, for a payload that doesn't use the `phoneNumbers` list.
+    for key in ("mobilePhone", "cellPhone", "directPhone", "officePhone",
+                "phoneNumber", "phone"):
+        if (found := _phone(record.get(key)))[0]:
+            return found
+    return None, None
+
+
+def map_rep(record: dict) -> Rep | None:
+    """A `GET /user/{id}` record -> a `Rep` to transfer a call to.
+
+    `available` is True when we have a number we can dial. Transport Pro user
+    records carry no presence field, so that is the only availability claim the
+    API supports — and it is the one that decides whether the transfer can happen
+    at all. A rep we cannot dial comes back `available=False` rather than as None,
+    so the handoff falls back to somebody free (§9.5) while the call note can
+    still say whose load it really is.
+
+    Returns None only for a record with no id, which is not a person.
+    """
+    rep_id = _text(record.get("id")) or _text(record.get("userId"))
+    if not rep_id:
+        logger.warning("Transport Pro user record has no id: keys=%s",
+                       sorted(record)[:12])
+        return None
+
+    first = _text(record.get("firstName")) or ""
+    last = _text(record.get("lastName")) or ""
+    name = " ".join(p for p in (first, last) if p) or _text(record.get("name")) or ""
+
+    phone, extension = _rep_phone(record)
+    if phone is None:
+        logger.warning(
+            "Transport Pro user %s (%s) has no dialable phone number, so a call "
+            "cannot be transferred to them.", rep_id, name or "no name")
+
+    return Rep(
+        rep_id=rep_id,
+        name=name,
+        phone=phone or "",
+        available=phone is not None,
+        title=_text(record.get("title")),
+        extension=extension,
     )
 
 

@@ -481,6 +481,65 @@ CARRIER_STATUS_NO_STATUS_FIELD = {
     "state": "TN",          # the address, which must never be read as a status
 }
 
+# --------------------------------------------------------------------------- #
+# The rep a load is assigned to
+# --------------------------------------------------------------------------- #
+# `internalContacts` as the load endpoints carry it: the load's people as bare
+# ids. The collection's saved load payloads only ever show ORDERTAKER, DISPATCHER,
+# CREATEDBY and LASTUPDATEDBY — the carrier-rep type is the one spelling read from
+# the live tenant rather than from an example, which is why it is configurable.
+def internal_contacts(**by_type):
+    """`internal_contacts(CARRIERREP=2423, ORDERTAKER=1000)` -> the load's list."""
+    return [{"type": kind, "id": ident} for kind, ident in by_type.items()]
+
+
+# --- GET /user/{id} — the collection's "Get User Record" example, verbatim --- #
+# Two details here are load-bearing. `phoneNumbers` leads with the FAX, so a
+# "take the first number" reading would warm-transfer a carrier into a fax
+# machine; and the office number carries an extension, which cannot travel in a
+# SIP transfer destination and so is kept separately.
+USER_RECORD = {
+    "id": 2423,
+    "firstName": "Lucas",
+    "lastName": "Piqueras",
+    "title": "Carrier Account Manager",
+    "team": "CS-Chicago Van",
+    "location": {"city": "Chicago", "state": "IL", "countryCode": "USA"},
+    "assignedTerminal": {
+        "id": 1015,
+        "status": "ACTIVE",
+        "title": "Chicago Office",
+        "terminalCode": "102",
+        "location": {"address": "1200 N. Branch St.", "city": "Chicago",
+                     "state": "IL", "postalCode": "60642"},
+        "phoneNumbers": [
+            {"type": "MAIN", "value": "312-300-7447"},
+            {"type": "FAX", "value": "312-300-7447"},
+        ],
+        "emailContacts": [
+            {"type": "MAIN", "value": "Chicago@circledelivers.com"},
+            {"type": "ESCALATION", "value": "chiescalations@circledelivers.com"},
+            {"type": "OFFERS", "value": "carriersales@circledelivers.com"},
+        ],
+    },
+    "phoneNumbers": [
+        {"type": "FAX", "value": "260-220-8703"},
+        {"type": "OFFICE", "value": "312-300-7447 ext8754"},
+    ],
+    "emailContacts": [{"type": "MAIN", "value": "lucas.piqueras@circledelivers.com"}],
+}
+
+
+def user_record(user_id, **overrides):
+    """The example user record, re-keyed and optionally amended."""
+    import copy
+
+    record = copy.deepcopy(USER_RECORD)
+    record["id"] = user_id
+    record.update(copy.deepcopy(overrides))
+    return record
+
+
 # --- GET /contact/search?connnectionRecordType=brokerCarrier --------------- #
 CONTACT_SEARCH = {
     "pagination": {"totalRecords": 2, "perPage": 200},

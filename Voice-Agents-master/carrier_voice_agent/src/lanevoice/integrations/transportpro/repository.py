@@ -23,9 +23,11 @@ Two deliberate degradations, both visible rather than silent:
   a caller who was cut off or started over is still found. A caller we only ever
   hear a fragment from is asked again and then handed to a rep.
 
-* Reps are local. They are warm-transfer targets (a name and a phone), not
-  Transport Pro records, so `available_rep` reads the same seeded table it
-  always did.
+* The FALLBACK rep list is local. The rep a load is assigned to comes from
+  Transport Pro — `internalContacts` names them, `GET /user/{id}` gives the name
+  and phone (`get_rep`) — but "whoever is free" cannot: the API has no presence
+  or on-call concept, so `available_rep` still reads the same seeded table it
+  always did. That table is the §9.5 fallback, not the primary answer.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from __future__ import annotations
 import datetime
 import threading
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from lanevoice.db.repository import Repository
@@ -46,6 +49,7 @@ from lanevoice.integrations.transportpro.mappers import (
     contact_emails,
     map_carrier,
     map_load,
+    map_rep,
 )
 from lanevoice.logging_config import get_logger
 from lanevoice.settings import Settings
@@ -112,6 +116,9 @@ class TransportProRepository:
         self._loads = _TTLCache(settings.transport_pro_load_cache_seconds)
         self._carriers = _TTLCache(settings.transport_pro_carrier_cache_seconds)
         self._emails = _TTLCache(settings.transport_pro_carrier_cache_seconds)
+        # A rep's name and desk phone move about as often as a carrier's vetting
+        # status, so they share its expiry rather than getting a knob of their own.
+        self._reps = _TTLCache(settings.transport_pro_carrier_cache_seconds)
         # usdot (as the rest of the system keys carriers) -> Transport Pro id,
         # so `carrier_emails` can reach `/contact/search` from a USDOT alone.
         self._carrier_ids: dict[str, str] = {}
@@ -161,6 +168,15 @@ class TransportProRepository:
                 "Board Rate (open=%s, max_buy=%s) — the agent has no anchor to "
                 "open at and will hand the call to a rep.",
                 load.load_id, load.open_rate, load.ceiling_rate)
+        if load is not None and load.assigned_rep_id is None:
+            logger.warning(
+                "Transport Pro load %s names no carrier sales rep in its "
+                "internalContacts, so a caller who asks for the rep on this load "
+                "gets whoever is free instead of its owner. If the load DOES show a "
+                "carrier rep in Transport Pro, the contact type is spelled something "
+                "this build does not recognise — the mapper logged the types the "
+                "load carried; put the right one in "
+                "TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES.", load.load_id)
         self._loads.put(key, load)
         return load
 
@@ -171,6 +187,7 @@ class TransportProRepository:
             posted=posted,
             fraud_low_ratio=self._settings.transport_pro_fraud_low_ratio,
             open_statuses=self._settings.open_load_statuses,
+            rep_types=self._settings.carrier_rep_contact_types,
         )
 
     def open_loads(self) -> list[Load]:
@@ -431,12 +448,58 @@ class TransportProRepository:
                            load_id, exc)
             return False
 
-    # -- local audit trail (delegated verbatim) ----------------------------- #
+    # -- reps: the person a load belongs to --------------------------------- #
     def get_rep(self, rep_id: str) -> Rep | None:
-        return self._audit.get_rep(rep_id)
+        """The rep behind a load's `assigned_rep_id`.
 
+        On a Transport Pro load that id is a Transport Pro USER id, lifted from
+        the load's `internalContacts`, so it is resolved with `GET /user/{id}`.
+        A non-numeric id is a local rep id from the seeded fallback list and goes
+        to the audit repository, which is what keeps the offline reps reachable in
+        a deployment that has both.
+
+        **This never raises.** It is called from `TransferService`, which the agent
+        reaches from its failure paths — including the one that already handles
+        `SourceUnavailable` — so an exception here would turn a handoff into a
+        dropped call. A lookup that fails returns None, and the transfer falls back
+        to whoever is free (§9.5).
+        """
+        key = str(rep_id or "").strip()
+        if not key:
+            return None
+        if not key.isdigit():
+            return self._audit.get_rep(key)
+
+        hit, cached = self._reps.get(key)
+        if hit:
+            return cached
+
+        try:
+            record = self._client.user(key)
+        except TransportProError as exc:
+            # Deliberately not cached: the next call on this load should try again
+            # rather than inherit one bad minute for the rest of the TTL.
+            logger.warning(
+                "Could not look up Transport Pro user %s to transfer a call to: "
+                "%s. Falling back to an available rep.", key, exc)
+            return None
+
+        rep = map_rep(record) if record is not None else None
+        if rep is None:
+            logger.warning(
+                "Transport Pro has no user %s, but a load is assigned to them. "
+                "Falling back to an available rep.", key)
+        self._reps.put(key, rep)
+        return rep
+
+    # -- local audit trail (delegated verbatim) ----------------------------- #
     def available_rep(self, exclude_rep_id: str | None = None) -> Rep | None:
+        """The §9.5 fallback: whoever is free. Local — the API has no presence."""
         return self._audit.available_rep(exclude_rep_id)
+
+    def available_reps(self, exclude: Iterable[str] = ()) -> list[Rep]:
+        """The fallback queue, for a rep who doesn't take the whisper."""
+        return self._audit.available_reps(exclude)
 
     def start_call(self, call_id: str) -> None:
         self._audit.start_call(call_id)

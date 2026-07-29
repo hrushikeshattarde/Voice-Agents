@@ -250,13 +250,72 @@ is bigger.
 
 ---
 
-## Scenario 10 — Caller asks for a human
+## Scenario 10 — Caller asks for the sales rep
 | You say | Agent should |
 |---|---|
 | "Load **L one zero zero one**." (then MC, then the empty call) | Give the load, ask $2000 |
-| "**Can I just talk to a rep?**" | "Let me connect you with **Sarah Chen**…" |
+| "**Can I just talk to the sales rep?**" | "Putting you through to **Sarah Chen**, the rep on this load — one moment." |
 
-**Expected outcome:** `transferred` (carrier request).
+**Expected outcome:** `transferred` (carrier request). L1001 is assigned to R01
+(Sarah Chen) in the seed data, and on a real board the rep comes from the load's
+`internalContacts` carrier-rep entry.
+
+On a live phone call, what happens next is the warm handoff — put your own number in
+the `reps` table and you'll hear it:
+
+| | |
+|---|---|
+| **Your phone rings** | dialled out through the outbound trunk |
+| **You hear the briefing** | "This is the Circle Logistics voice assistant. I have a carrier on the line about load L 1 0 0 1, I repeat, load L 1 0 0 1. Chicago, IL to Dallas, TX. You'll be speaking with Blue Sky Logistics LLC, M C 1 2 3 4 5 6. They asked to speak to a person. I offered $2000 and they haven't given me a number. Their truck is empty in Dallas, Texas today. Press 9 to take the call, or 1 to hear this again." |
+| **Press 1** | the same briefing again, up to `WHISPER_MAX_REPEATS` |
+| **Press 9** | you're on with the carrier; the agent goes silent |
+| **Press nothing** | the agent goes back to the carrier: *"Sarah's tied up right now, she'll call you straight back on this load"* |
+
+`transfer_events` tells the story afterwards: `initiated`, then `connected`,
+`declined` or `failed`.
+
+**Three things worth testing deliberately**, because each is a different failure:
+
+* **Let it ring out** → the carrier should hear the busy-and-callback line, not
+  silence and not another rep's phone ringing. Check the load note says
+  `OWES THIS CARRIER A CALL`.
+* **Answer and stay quiet** → same. This is the voicemail case, and it is the whole
+  reason the keypress exists.
+* **Listen for the load number twice.** If you only hear it once, `spell_digits` or
+  the TTS is mangling it — that number is the one thing you have to write down.
+
+---
+
+## Scenario 11 — Everything else is a callback, not a transfer
+
+Only a caller who *asks* for a person gets put through. Run any of these and no
+phone should ring:
+
+| Say | Agent should |
+|---|---|
+| the escalation script (Scenario 6) | "that's not a no — Sarah will call you straight back on this load" |
+| "I'll haul it for **900**" (Scenario 7) | hand it off politely; no rate discussion |
+| an email not on the account (Scenario 4) | "Sarah will call you back" — **never** "you're booked" |
+
+**Expected outcome:** `transferred`, with a `callback` row in `transfer_events` and
+`CALLBACK OWED by …` on the load — as opposed to `initiated` and
+`Transferring the caller to …` in Scenario 10. Nothing should say "hold".
+
+Then, on the same call, ask for a person outright — *"just put me through then"* —
+and it **should** dial. The rule is about who asked, not about what happened
+earlier in the call.
+
+Worth trying at other points in the call too — ask for the rep **before** giving a
+load number, or **after** agreeing a rate. It is answered from every state, and
+the note records where the carrier had got to so the rep doesn't restart them.
+
+Two things this scenario is checking:
+
+* With the load's own rep unavailable (`UPDATE reps SET available=0 WHERE
+  rep_id='R01'`) the call still goes through — to somebody else, and **without**
+  the agent claiming they handle the load.
+* "Let me check with **my** dispatcher" and "I'll talk to **my** driver" must NOT
+  transfer anybody. Say both; the call should carry on normally.
 
 ---
 

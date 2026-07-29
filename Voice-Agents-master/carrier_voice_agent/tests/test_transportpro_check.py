@@ -19,7 +19,9 @@ from tests.transportpro_payloads import (
     CONTACT_SEARCH,
     EMPTY_SEARCH,
     LOAD_DETAIL_WAYPOINTS,
+    internal_contacts,
     record_for,
+    user_record,
 )
 
 LOAD = "1303369"
@@ -217,3 +219,45 @@ def test_a_carrier_status_shape_with_no_numbers_reports_a_mapping_gap(capsys):
     with client(fake) as api:
         _check_carrier(api, "123456", raw=False)
     assert "_MC_KEYS" in capsys.readouterr().out
+
+
+def test_the_rep_a_caller_would_reach_is_reported(capsys):
+    """The third silent failure: a handoff that works, to the wrong desk."""
+    fake = FakeTransportPro()
+    board(fake, record_for(int(LOAD), internalContacts=internal_contacts(
+        ORDERTAKER=1000, CARRIERREP=2423)))
+    fake.json("/user/2423", user_record(2423))
+    with client(fake) as api:
+        _check_load(api, LOAD, raw=False)
+
+    out = capsys.readouterr().out
+    assert "ORDERTAKER, CARRIERREP" in out
+    assert "Lucas Piqueras" in out
+    assert "asking for the rep on this load reaches them" in out
+    # The extension can't travel in a SIP transfer, so it is called out.
+    assert "extension 8754" in out
+
+
+def test_a_load_with_no_carrier_rep_names_the_setting_to_fix(capsys):
+    fake = FakeTransportPro()
+    board(fake, record_for(int(LOAD),
+                           internalContacts=internal_contacts(ORDERTAKER=1000)))
+    with client(fake) as api:
+        _check_load(api, LOAD, raw=False)
+
+    out = capsys.readouterr().out
+    assert "no carrier sales rep on this load" in out
+    assert "TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES" in out
+
+
+def test_a_rep_with_no_dialable_number_is_called_out(capsys):
+    fake = FakeTransportPro()
+    board(fake, record_for(int(LOAD),
+                           internalContacts=internal_contacts(CARRIERREP=2423)))
+    fake.json("/user/2423", user_record(2423, phoneNumbers=[
+        {"type": "FAX", "value": "260-220-8703"}]))
+    with client(fake) as api:
+        _check_load(api, LOAD, raw=False)
+
+    out = capsys.readouterr().out
+    assert "no dialable number on their user record" in out

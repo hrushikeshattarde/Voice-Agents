@@ -6,9 +6,11 @@ from lanevoice.integrations.transportpro.client import (
     TransportProError,
 )
 from lanevoice.integrations.transportpro.mappers import (
+    carrier_rep_id,
     contact_emails,
     map_carrier,
     map_load,
+    map_rep,
 )
 from lanevoice.integrations.transportpro.repository import (
     SourceUnavailable,
@@ -21,7 +23,9 @@ __all__ = [
     "TransportProClient",
     "TransportProError",
     "TransportProRepository",
+    "carrier_rep_id",
     "contact_emails",
     "map_carrier",
     "map_load",
+    "map_rep",
 ]

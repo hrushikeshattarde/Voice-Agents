@@ -16,6 +16,7 @@ Endpoints used, all from the collection's `Voice AI` folder unless noted:
     POST /voiceai/load/{id}/add_note            write the call outcome back
     POST /voiceai/add_carrier_capacity          the empty call, as capacity
     GET  /contact/search                        addresses on the carrier's file
+    GET  /user/{id}                             the rep a load is assigned to
 
 Two things about this API are load-bearing and easy to "fix" by accident:
 
@@ -424,6 +425,17 @@ class TransportProClient:
             },
         )
         return _records(payload)
+
+    # -- Users: the people a load is assigned to ---------------------------- #
+    def user(self, user_id: str | int) -> dict | None:
+        """`GET /user/{id}` — the rep behind an id in a load's `internalContacts`.
+
+        A load names its people as bare ids (`{"type": "CARRIERREP", "id": 2423}`),
+        so this is the second half of "who does this load belong to": the id comes
+        off the load, the name and the phone number come from here. Returns None
+        for an id Transport Pro doesn't know.
+        """
+        return _first_record(self._request("GET", f"/user/{user_id}"))
 
 
 # --------------------------------------------------------------------------- #

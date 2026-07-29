@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Outbound trunk — needed to DIAL A REP for the warm transfer.",
+    "The inbound trunk answers carriers; this one places the call to the rep so",
+    "they can be briefed before the carrier is joined to them.",
+    "",
+    "  lk sip outbound create sip_setup/outbound-trunk.json",
+    "",
+    "Then put the id it prints (ST_...) into .env as LIVEKIT_SIP_OUTBOUND_TRUNK_ID.",
+    "The LiveKit dashboard's Telephony -> Create a new trunk -> Outbound form is the",
+    "same thing if you'd rather click; auth_username / auth_password live under its",
+    "'Optional settings' section.",
+    "",
+    "LiveKit does not carry calls to the PSTN — it is the SIP client. `address` is",
+    "always a CARRIER's SIP host, so a rep's phone is reached through whoever",
+    "terminates your calls (the same Twilio trunk that handles inbound, or another",
+    "provider). Fields:",
+    "",
+    "  address        the carrier's SIP termination host, NO 'sip:' prefix and no",
+    "                 trailing path. Twilio: <your-trunk>.pstn.twilio.com",
+    "  transport      AUTO unless your carrier requires one. TLS if you want the",
+    "                 signalling encrypted and the carrier supports it.",
+    "  numbers        the caller ID the REP sees. Must be a number you own on that",
+    "                 trunk, E.164. Use the main brokerage line so it looks familiar.",
+    "  auth_username  the carrier's termination credentials. Twilio: a Credential",
+    "  auth_password  List attached to the trunk. Some carriers use an IP allow-list",
+    "                 instead, in which case leave these out and whitelist LiveKit.",
+    "",
+    "Never commit real credentials: fill these in a local copy."
+  ],
+  "trunk": {
+    "name": "carrier-sales-outbound",
+    "address": "your-trunk.pstn.twilio.com",
+    "transport": "SIP_TRANSPORT_AUTO",
+    "numbers": ["+12402128297"],
+    "auth_username": "REPLACE_ME",
+    "auth_password": "REPLACE_ME"
+  }
+}

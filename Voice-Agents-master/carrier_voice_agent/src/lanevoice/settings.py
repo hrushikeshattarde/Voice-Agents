@@ -166,6 +166,30 @@ class Settings(BaseSettings):
             if (normalized := normalize_status(part))
         )
 
+    # Which `internalContacts` entry on a load names its carrier sales rep — the
+    # person a caller asking for "the rep on this load" is put through to.
+    #
+    # Configurable for the same reason the load statuses are: the collection's
+    # saved load payloads only show ORDERTAKER, DISPATCHER, CREATEDBY and
+    # LASTUPDATEDBY, so the live spelling of the carrier-rep type is the one field
+    # here taken on trust. If handoffs keep landing on a fallback rep, the log line
+    # from `carrier_rep_id` prints the types the load actually carried — put the
+    # right one here. Comma-separated, in preference order; case and punctuation
+    # are normalised.
+    transport_pro_carrier_rep_contact_types: str = Field(
+        default="carrierrep,carriersalesrep,salesrep",
+        validation_alias="TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES",
+    )
+
+    @property
+    def carrier_rep_contact_types(self) -> tuple[str, ...]:
+        """The configured contact types, in preference order, blanks dropped."""
+        return tuple(
+            part.strip()
+            for part in self.transport_pro_carrier_rep_contact_types.split(",")
+            if part.strip()
+        )
+
     # Transport Pro publishes a Load Board Rate and a Max Buy but no fraud
     # tripwire, so the "suspiciously cheap" threshold is derived from the board
     # rate. An ask below this share of it goes to review instead of being booked:
@@ -212,6 +236,72 @@ class Settings(BaseSettings):
         what the agent should listen for depends on where loads come from.
         """
         return self.uses_transport_pro
+
+    # --- Warm transfer ------------------------------------------------------ #
+    # Actually move the caller's line onto the rep's phone when the call is handed
+    # over, instead of only saying so. Turning it off leaves the PRD's phase-1
+    # behaviour — the handoff is announced and logged, the caller stays on the
+    # line — which is also what the text demo and the test suite run with, since
+    # neither has a SIP participant to transfer.
+    sip_transfer_enabled: bool = Field(
+        default=True, validation_alias="SIP_TRANSFER_ENABLED")
+    # How long to wait for LiveKit to hand the leg over before giving up and
+    # telling the caller we'll ring them back. Long enough for the rep's phone to
+    # be reached, short enough that nobody is holding a dead line.
+    sip_transfer_timeout: float = Field(
+        default=30.0, validation_alias="SIP_TRANSFER_TIMEOUT")
+
+    # Brief the rep before joining them to the call, and let them accept it with a
+    # keypress (PRD §3 step 6b — "warm-transfer with a whisper/context summary").
+    # Off falls back to a blind transfer: the rep's phone rings and they pick up to
+    # a carrier with no idea why, which works but tells them nothing.
+    #
+    # Needs an OUTBOUND trunk, because the rep is dialled rather than REFERred to:
+    #   lk sip outbound create sip_setup/outbound-trunk.json
+    whisper_enabled: bool = Field(
+        default=True, validation_alias="WHISPER_ENABLED")
+    livekit_sip_outbound_trunk_id: str = Field(
+        default="", validation_alias="LIVEKIT_SIP_OUTBOUND_TRUNK_ID")
+    # How a rep who sits behind an extension is reached. Transport Pro records the
+    # office number as "312-300-7447 ext8754", and dialling only the base number
+    # reaches a switchboard — so which of these is right depends on what picks up:
+    #
+    #   dtmf      an auto-attendant answers; the extension is sent as keypresses
+    #             after the call connects. The default, because it works through a
+    #             normal carrier trunk.
+    #   sip_user  the outbound trunk points at YOUR phone system, so the extension
+    #             is dialled as the SIP user (`sip:8754@your-pbx`) and the PBX rings
+    #             that desk directly. Cleanest — no IVR timing to get wrong.
+    #   off       base number only; the extension goes in the call note for the rep.
+    #
+    # See `lanevoice.telephony.transfer.dial_plan`.
+    whisper_extension_mode: str = Field(
+        default="dtmf", validation_alias="WHISPER_EXTENSION_MODE")
+
+    # What the rep presses. 9 to take the call, 1 to hear the briefing again —
+    # matching the convention carriers and desks already meet elsewhere.
+    whisper_accept_digit: str = Field(
+        default="9", validation_alias="WHISPER_ACCEPT_DIGIT")
+    whisper_repeat_digit: str = Field(
+        default="1", validation_alias="WHISPER_REPEAT_DIGIT")
+    # How many times a rep may ask for the briefing again before we stop offering.
+    whisper_max_repeats: int = Field(
+        default=2, validation_alias="WHISPER_MAX_REPEATS")
+    # How long the rep's phone rings before we treat it as not answered and tell the
+    # carrier they'll be called back. Beyond ~25s most mobiles have gone to
+    # voicemail, and a voicemail that never presses 9 is caught by the decision
+    # timeout below.
+    whisper_ring_seconds: float = Field(
+        default=22.0, validation_alias="WHISPER_RING_SECONDS")
+    # How long to wait for the keypress after the briefing has played. Also what
+    # catches a voicemail: it hears the whisper, presses nothing, and the carrier is
+    # told the rep will ring them instead of being dropped into an answering machine.
+    whisper_decision_seconds: float = Field(
+        default=12.0, validation_alias="WHISPER_DECISION_SECONDS")
+    # The carrier is on hold in silence while the rep is briefed. If that runs
+    # past this, say something to them so it doesn't read as a dropped call.
+    whisper_reassure_after: float = Field(
+        default=9.0, validation_alias="WHISPER_REASSURE_AFTER")
 
     # --- Storage ------------------------------------------------------------ #
     # Still used when DATA_SOURCE=transportpro: Transport Pro has no endpoint for

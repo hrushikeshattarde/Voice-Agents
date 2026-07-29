@@ -25,7 +25,7 @@ lanevoice-tpcheck --load 1303369 --mc 343195 --raw
 ```
 
 Read-only — it authenticates, looks the two records up, and prints the raw
-payload next to what the mappers made of it. **Three things to confirm**, all
+payload next to what the mappers made of it. **Four things to confirm**, all
 called out below and all flagged in the tool's own output:
 
 1. **The load status vocabulary.** The agent sells only `Ready To Dispatch` by
@@ -35,7 +35,12 @@ called out below and all flagged in the tool's own output:
 2. **`carrier_status` field names.** If the output says
    `NO STATUS FIELD FOUND`, add the real field name to `_STATUS_KEYS` in
    [`mappers.py`](../src/lanevoice/integrations/transportpro/mappers.py).
-3. **Appointment timestamps.** Check a pickup window in `--raw` against what
+3. **The carrier-rep contact type.** The tool prints the load's
+   `internalContacts` types next to the rep it resolved. If it says
+   `no carrier sales rep on this load` for a load that plainly shows one in the
+   UI, put that type in `TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES`. See
+   *The rep a load is assigned to*.
+4. **Appointment timestamps.** Check a pickup window in `--raw` against what
    the same load shows in the Transport Pro UI. See *Timestamps* below.
 
 ---
@@ -49,6 +54,7 @@ called out below and all flagged in the tool's own output:
 | what else is open, to offer by number? | `GET /load/search?loadStatus=&isPosted=true` |
 | is this MC/USDOT active with us? | `GET /voiceai/carrier_status?mc_number=` / `?dot_number=` |
 | what addresses are on their account? | `GET /contact/search?connnectionRecordType=brokerCarrier&connectionRecordId=` |
+| who is the rep on this load, and what's their number? | `GET /user/{id}`, on the id from the load's `internalContacts` |
 | record the agreed rate | `POST /voiceai/load/{id}/make_offer` |
 | write the call outcome onto the load | `POST /voiceai/load/{id}/add_note` |
 | log a truck we couldn't use *(available, not wired — see below)* | `POST /voiceai/add_carrier_capacity` |
@@ -98,6 +104,7 @@ is read from whichever shape carries it rather than from an assumed layout.
 | `equipment`, `miles`, `commodity`, `pieces`, `weight` | `reference_information[]` pairs | `reference` **object** |
 | `temperature` | — | `reference.reeferTemperature` |
 | `notes` | `sales_notes.public_load_board_notes` | `postingInfo.comments` + each stop's `notes` |
+| `assigned_rep_id` — **who a caller asking for a person is transferred to** | — | `internalContacts[type=CARRIERREP].id` |
 
 `fraud_low_rate` is derived either way: `open_rate × TRANSPORT_PRO_FRAUD_LOW_RATIO`.
 
@@ -248,6 +255,204 @@ stop.
 
 ---
 
+### The rep a load is assigned to → `Rep`
+
+When a caller says *"can I just talk to the sales rep on this one"*, they mean the
+person the load belongs to. Finding them is two hops:
+
+| | |
+|---|---|
+| the load's people | `internalContacts: [{"type": "CARRIERREP", "id": 2423}]` — bare ids |
+| the person | `GET /user/2423` → `firstName`/`lastName`, `title`, `phoneNumbers[]` |
+
+`carrier_rep_id` does the first hop and `map_rep` the second;
+`TransportProRepository.get_rep` joins them and caches the result for the carrier
+TTL. The id lands on `Load.assigned_rep_id`, which is the field
+[`TransferService`](../src/lanevoice/services/transfer.py) has always resolved
+against — so nothing above the repository changed shape.
+
+**The contact type is the one field here read from live data, not from an
+example.** The collection's saved load payloads only ever show `ORDERTAKER`,
+`DISPATCHER`, `CREATEDBY` and `LASTUPDATEDBY`; the endpoint that sets the rep is
+`POST /load/{id}/assign_carrier_sales_rep`, whose body key is `carrierSalesRepId`.
+So the vocabulary is configurable (`TRANSPORT_PRO_CARRIER_REP_CONTACT_TYPES`,
+default `carrierrep,carriersalesrep,salesrep`), anything plainly carrier-side is
+accepted and logged, and `lanevoice-tpcheck --load <id>` prints the types a real
+load carries.
+
+> **No other contact type stands in for it.** An `ORDERTAKER` is whoever keyed the
+> order in and a `DISPATCHER` runs the truck once it's covered — different people
+> on different desks. A load with no carrier rep resolves to *nobody*, and the
+> handoff falls back to whoever is free per §9.5, because a transfer to the wrong
+> desk is worse than an honest one to a free rep.
+
+Three details in `map_rep`:
+
+* **`phoneNumbers` leads with the FAX** in the collection's own user record, so
+  numbers are picked by type (`MOBILE`, `DIRECT`, `OFFICE`, …) and `FAX` is never
+  a fallback. Taking the first entry would transfer a carrier into a fax tone.
+* **Extensions are split off.** `312-300-7447 ext8754` becomes
+  `phone="+13123007447"` plus `extension="8754"`, because a SIP transfer takes one
+  address and an extension cannot travel in it. The transfer reaches the
+  switchboard and the extension goes in the call note — never silently dropped.
+* **A number we cannot dial is treated as no number.** `available` on a
+  Transport Pro rep means "we have something dialable", since user records carry
+  no presence field. That rep is still returned, marked unavailable, so the call
+  note can name the load's real owner while the transfer falls back.
+
+---
+
+## Warm transfer — who gets the call, and how it moves
+
+Deciding **who** and doing the **moving** are deliberately separate, because the
+conversation layer is independent of audio I/O and must stay testable without a
+phone line:
+
+```
+CarrierSalesAgent  ──►  pending_transfer (a TransferResolution)
+                   ──►  whisper_script()  (deterministic, not composed)
+                            │
+lanevoice.telephony.whisper ──►  ring the rep · brief them · press 9 · bridge
+lanevoice.telephony.transfer ──►  blind SIP REFER (WHISPER_ENABLED=0)
+```
+
+`CarrierSalesAgent` resolves the rep, writes the handoff to the audit trail *and*
+onto the load, and publishes `pending_transfer`. The worker acts on it **after the
+"putting you through" line has finished playing** — acting earlier cuts the carrier
+off mid-sentence.
+
+### Only a caller who asks is put through
+
+There is exactly one reason a live call is moved onto a rep's phone: **the caller
+asked for a person.** Every other reason the agent can't finish a call — a rate
+above its authority, the fraud tripwire, an address that isn't on the account, a
+dead board, a booking that wouldn't save — is handed over as a **callback**.
+
+| | transfer | callback |
+|---|---|---|
+| what happens | the rep's phone rings, they're briefed, 9 connects them | nobody's phone rings |
+| what the carrier hears | "putting you through to Sarah — hold a moment" | "Sarah will call you straight back on this load" |
+| `transfer_events` | `initiated` → `connected` / `declined` / `failed` | `callback` |
+| note on the load | `Transferring the caller to …` | `CALLBACK OWED by …` |
+
+An unrequested transfer is a worse experience than a callback: a carrier who asked
+a question and is suddenly listening to a phone ring has lost control of their own
+call, and the rep they land on is interrupted by somebody who didn't ask for them.
+When the carrier *does* ask, all of that flips. `_TRANSFER_ON_REQUEST_ONLY` in
+[`agent.py`](../src/lanevoice/conversation/agent.py) is the list, and it has one
+entry.
+
+> The call **outcome** is `transferred` either way — it means "handed to a human",
+> and the enum has no separate callback value. `transfer_events.transfer_result` is
+> what tells the two apart, so a report on "calls transferred to the right rep" has
+> to read that column and not the outcome.
+
+A request for a person is honoured **in every state**, not just during
+negotiation: `handle()` checks for it before dispatching to the state handler, so
+"can I talk to the sales rep" is answered the same whether it arrives before a
+load number or after a rate is agreed. The matcher requires an our-side determiner
+("*your* rep", "*a* person", "*the* sales rep") so the sentences carriers say
+constantly — "let me check with **my** dispatcher", "I'll talk to **my** driver" —
+never hand a call over.
+
+What is said to the *carrier* depends on whether the rep owns the load.
+`"…who handles this load"` is a claim of fact, so it is only spoken for the
+assigned rep; a fallback rep is introduced without it, because the carrier finds
+out ten seconds later.
+
+### The whisper (PRD §3 step 6b)
+
+```
+   room "call-abc"                    room "call-abc-whisper-2423"
+   ┌───────────────┐                  ┌────────────────────────────┐
+   │ carrier (SIP) │                  │ rep (SIP, dialled OUT)     │
+   │ agent         │                  │ the briefing (audio only)  │
+   └───────────────┘                  └────────────────────────────┘
+           ▲                                        │
+           └──── on the accept digit: ──────────────┘
+                 move_participant(rep → main room)
+```
+
+**Two rooms, on purpose.** The briefing names our last offer and sometimes says the
+carrier was flagged for fraud review. Muting is a setting somebody can get wrong; a
+room the carrier is not in is a structural guarantee. The rep is moved across only
+once they've accepted, by which point the briefing has finished.
+
+**The briefing is the one line in the system that is NOT composed by the LLM.**
+Everything a carrier hears is written by the model, because a reply has to be
+shaped by what they just said. A whisper is the opposite: a data readout to a
+colleague, carrying a load number, an MC number and dollar figures that they will
+act on. A model paraphrasing `1437475` or rounding a rate is a wrong number spoken
+to somebody who will use it, so `whisper_script()` formats it exactly. It says the
+load number **twice**, digit by digit, because a rep is writing it off a speaker.
+
+What it contains, all of it from data the call already had:
+
+| | |
+|---|---|
+| who is calling | "This is the Circle Logistics voice assistant" |
+| the load | number spelled, said twice, plus the lane |
+| the carrier | legal name + MC (or USDOT, labelled, if that's all we have) |
+| why | one sentence per handoff reason — asked for a person, firm above authority, fraud tripwire, address not on the account, … |
+| the money | their ask against our last offer, or the agreed rate — never both saying the same figure twice |
+| their truck | where it's empty, so the rep can sell |
+| the keypress | `WHISPER_ACCEPT_DIGIT` to take it, `WHISPER_REPEAT_DIGIT` to hear it again |
+
+### When the rep can't pick up
+
+A rep whose phone rings out, whose voicemail answers, or who listens and presses
+nothing is a **decline** — all three mean the carrier does not have them. The agent
+then **comes back on the line**: the rep is tied up, and they will call back.
+
+```
+carrier: "can I talk to the sales rep?"
+agent:   "putting you through to Sarah — hold a moment"      [rep's phone rings]
+   …no answer, or no keypress within WHISPER_DECISION_SECONDS…
+agent:   "sorry to keep you — Sarah's tied up right now, she'll call you
+          straight back on this load"                        [call ends]
+```
+
+Nobody else is rung. The carrier asked for the rep on *their* load; being passed
+round three strangers is not what they asked for, and §9.5 names
+voicemail-plus-callback-task as a defined fallback. The note on the load reads
+`Sarah Chen OWES THIS CARRIER A CALL on +1…`, and `transfer_events` gets a
+`declined` row — so the promise has an owner and shows up in a report.
+
+`WHISPER_MAX_REPEATS` caps the repeat key, so a rep leaning on it can't hold a
+carrier indefinitely. A keypress that is neither digit is **ignored**, not treated
+as a refusal — a rep reaching for 9 and hitting 8 has not declined the call.
+
+### While the carrier holds
+
+They hear nothing during the ring and the briefing, because it happens in a room
+they are not in. `WHISPER_REASSURE_AFTER` seconds in, the agent speaks to them so a
+slow rep doesn't sound like a dropped call. That line is composed, and unlike every
+other composed line a failure to produce it is swallowed — the normal fallback for
+an unusable composer is to start another handoff, which would ring a second rep for
+a call already being answered by the first.
+
+### After the bridge
+
+The agent stops answering turns entirely. Its state is `DONE`, and the reply for
+`DONE` is "this call has ended, goodbye" — which would otherwise be spoken over a
+carrier and a rep mid-sentence. It stays in the room silently, which keeps the
+transcript.
+
+Transfer events record what actually happened rather than what was announced:
+`initiated` when a transfer is decided, then `declined`, `connected` or `failed`
+from the telephony layer — or `callback` when no line was ever going to move.
+`WHISPER_ENABLED=0` degrades to a blind REFER — the same two people, none of the
+context. `SIP_TRANSFER_ENABLED=0` keeps the PRD's phase-1 behaviour, announce and
+log, which is what the text demo and the test suite run with.
+
+> **Neither the whisper nor the busy-callback line is simulated in
+> `lanevoice-demo`.** One is audio played to a rep in another room; the other only
+> happens because a real phone went unanswered. Printing either in text mode would
+> show a conversation that never takes place. Their content is pinned in
+> [`tests/test_whisper.py`](../tests/test_whisper.py).
+
+---
+
 ## The three gates
 
 ```
@@ -319,8 +524,11 @@ go-live.** If the API is genuinely returning UTC, `_split_timestamp` in
   location and the MC. Wiring it would mean asking a carrier for contact details
   before they have a reason to give them. `record_capacity` is ready on the
   repository when there is a point in the flow that has those fields.
-* **Reps are local.** A rep here is a warm-transfer target (a name and a phone),
-  not a Transport Pro record, so `available_rep` reads the seeded table.
+* **Only the FALLBACK rep list is local.** The rep a load is assigned to comes
+  from Transport Pro (above). "Whoever is free" cannot: the Public API has no
+  presence or on-call concept, so `available_rep` still reads the seeded `reps`
+  table. Keep that table current — it is where a call goes when the load's own rep
+  can't take it.
 
 ---
 
@@ -332,6 +540,7 @@ reads are cached with an expiry rather than per call:
 * loads — 60s (`TRANSPORT_PRO_LOAD_CACHE_SECONDS`); short, because a load can be
   covered by somebody else mid-call
 * carriers and their contacts — 300s; vetting status does not move
+* reps — the same 300s; a name and a desk phone move about as rarely
 
 Negative results are cached too, so a caller reading a wrong number back twice
 doesn't cost two round trips. Token refresh is locked. Every read is one retry at
@@ -342,3 +551,8 @@ An API failure raises `SourceUnavailable`, which the agent turns into a handoff.
 It is never reported to the caller as "there's no such load" — that is a
 statement of fact, and making it because an API timed out tells a carrier
 something untrue about their freight.
+
+**`get_rep` is the one read that never raises.** It is reached from the handoff
+path, including the handoff that already handles `SourceUnavailable`, so throwing
+there would turn a hand-over into a dropped call. A failed user lookup returns
+`None` and the transfer falls back to whoever is free.

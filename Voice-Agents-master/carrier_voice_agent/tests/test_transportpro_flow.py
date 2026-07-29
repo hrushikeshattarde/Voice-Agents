@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from lanevoice.conversation import CarrierSalesAgent
+from lanevoice.telephony.transfer import dial_target
 from lanevoice.voice import StubComposer
 from tests.transportpro_fake import FakeTransportPro, board, repository, settings
 from tests.transportpro_payloads import (
@@ -33,7 +34,9 @@ from tests.transportpro_payloads import (
     EMPTY_SEARCH,
     LOAD_DETAIL_BOOKABLE,
     LOAD_DETAIL_UNPOSTED,
+    internal_contacts,
     record_for,
+    user_record,
 )
 
 LOAD = "1303369"                                  # seven digits, as Transport Pro keys them
@@ -566,3 +569,65 @@ def test_call_notes_are_mirrored_onto_the_load_in_transport_pro(fake, repo):
     posted = " ".join(body["content"] for body in fake.bodies("add_note"))
     assert "Voice AI call" in posted
     assert "Booking 1303369" in posted
+
+
+# --------------------------------------------------------------------------- #
+# 7. "Can I talk to the sales rep?" — the load's own rep, off the live board
+# --------------------------------------------------------------------------- #
+def test_asking_for_the_rep_transfers_to_the_rep_the_load_is_assigned_to(
+        fake, repo):
+    """The whole path, in one call: the load names its carrier rep under
+    `internalContacts`, `GET /user/{id}` turns that id into a name and a number,
+    and that is who the carrier is told they're going to and whose phone the
+    telephony layer is handed."""
+    board(fake, record_for(int(LOAD), internalContacts=internal_contacts(
+        ORDERTAKER=1000, CARRIERREP=2423)))
+    fake.json("/user/2423", user_record(2423))
+
+    agent = _to_rate(fake, repo)
+    agent.handle("actually, can I just talk to the sales rep on this one")
+
+    assert agent.summary()["outcome"] == "transferred"
+    assert "Lucas Piqueras" in _turns(agent)[-1]["facts"]
+    assert "assigned" in _turns(agent)[-1]["directive"]
+
+    # What the telephony layer will dial, extension kept for the note.
+    pending = agent.pending_transfer
+    assert pending.is_fallback is False
+    assert (pending.rep.phone, pending.rep.extension) == ("+13123007447", "8754")
+    assert dial_target(pending.rep) == "tel:+13123007447"
+
+    # And the desk can see where the call went, on the load itself.
+    assert "Transferring the caller to Lucas Piqueras" in _notes(repo)
+    assert fake.bodies(f"/voiceai/load/{LOAD}/add_note")
+
+
+def test_a_load_with_no_carrier_rep_still_reaches_a_person(fake, repo):
+    """The load names an order taker and nobody else. The carrier is not
+    transferred to the order taker, and is not left talking to a bot either."""
+    board(fake, record_for(int(LOAD),
+                           internalContacts=internal_contacts(ORDERTAKER=1000)))
+    agent = _to_rate(fake, repo)
+    agent.handle("put me through to a rep please")
+
+    assert agent.summary()["outcome"] == "transferred"
+    assert agent.pending_transfer.is_fallback is True
+    assert agent.pending_transfer.rep.rep_id != "1000"
+    assert "no carrier rep assigned to it" in _notes(repo)
+    assert fake.calls("/user/1000") == []
+
+
+def test_a_dead_user_lookup_does_not_drop_the_call(fake, repo):
+    """The board names the rep and the user endpoint is down. A carrier is on the
+    line asking for a human, so they get one — not an exception."""
+    board(fake, record_for(int(LOAD),
+                           internalContacts=internal_contacts(CARRIERREP=2423)))
+    fake.on("/user/2423", httpx.Response(500, text="boom"),
+            httpx.Response(500, text="boom"))
+
+    agent = _to_rate(fake, repo)
+    agent.handle("can I speak to a representative")
+
+    assert agent.summary()["outcome"] == "transferred"
+    assert agent.pending_transfer.rep is not None
+    assert "could not be looked up" in _notes(repo)

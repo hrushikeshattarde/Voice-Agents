@@ -181,16 +181,29 @@ class Repository:
         finally:
             conn.close()
 
-    def available_rep(self, exclude_rep_id: str | None = None) -> Rep | None:
+    def available_reps(self, exclude: Iterable[str] = ()) -> list[Rep]:
+        """Every rep who could take a call right now, in a stable order.
+
+        A list rather than one rep, because a warm transfer can be DECLINED: a rep
+        who doesn't pick up, or who hears the whisper and doesn't press 9, has to
+        escalate to the next one (PRD §9.5) rather than dead-end. Filtered in
+        Python — this table is a handful of rows, and a dynamic `IN` clause built
+        from a caller's set is more moving parts than the saving is worth.
+        """
+        skip = {str(r) for r in exclude if r}
         conn = self._db.connect()
         try:
-            row = conn.execute(
-                "SELECT * FROM reps WHERE available=1 AND rep_id != ? LIMIT 1",
-                (exclude_rep_id or "",),
-            ).fetchone()
-            return self._rep(row) if row else None
+            rows = conn.execute(
+                "SELECT * FROM reps WHERE available=1 ORDER BY rep_id").fetchall()
+            return [self._rep(r) for r in rows if r["rep_id"] not in skip]
         finally:
             conn.close()
+
+    def available_rep(self, exclude_rep_id: str | None = None) -> Rep | None:
+        """The first rep who could take a call. `None` if nobody is free."""
+        reps = self.available_reps(
+            exclude=(exclude_rep_id,) if exclude_rep_id else ())
+        return reps[0] if reps else None
 
     # -- writes / audit trail ---------------------------------------------- #
     def _execute(self, sql: str, params: Iterable) -> None:

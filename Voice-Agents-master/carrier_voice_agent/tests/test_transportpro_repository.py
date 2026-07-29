@@ -19,8 +19,10 @@ from tests.transportpro_payloads import (
     CONTACT_SEARCH,
     EMPTY_SEARCH,
     LOAD_DETAIL_WAYPOINTS,
+    internal_contacts,
     record_for,
     search_available_for,
+    user_record,
 )
 
 LOAD_ID = "1303369"
@@ -392,9 +394,69 @@ def test_the_audit_trail_still_lands_in_sqlite(fake, repo):
         conn.close()
 
 
-def test_reps_are_local_because_they_are_transfer_targets(fake, repo):
-    """A rep here is a name and a phone for a warm transfer, not a Transport Pro
-    record — so the seeded table is still the right source."""
+def test_the_fallback_rep_list_is_local(fake, repo):
+    """"Whoever is free" cannot come from Transport Pro — the API has no presence
+    concept — so the §9.5 fallback is still the seeded table, and reaching for it
+    costs no round trip."""
     tp = _repo(fake, repo)
     assert tp.available_rep() is not None
+    assert fake.requests == []
+
+
+# --------------------------------------------------------------------------- #
+# The rep a load is assigned to
+#
+# Two steps: the load names them by id in `internalContacts`, and `GET /user/{id}`
+# turns that id into a name and a number. This is who a caller asking for the rep
+# on their load is transferred to, so a wrong answer reaches a real desk.
+# --------------------------------------------------------------------------- #
+def test_a_load_names_the_rep_it_is_assigned_to(fake, repo):
+    board(fake, record_for(int(LOAD_ID),
+                           internalContacts=internal_contacts(ORDERTAKER=1000,
+                                                              CARRIERREP=2423)))
+    assert _repo(fake, repo).get_load(LOAD_ID).assigned_rep_id == "2423"
+
+
+def test_the_assigned_rep_is_resolved_through_the_user_endpoint(fake, repo):
+    fake.json("/user/2423", user_record(2423))
+    rep = _repo(fake, repo).get_rep("2423")
+    assert rep.name == "Lucas Piqueras"
+    assert rep.phone == "+13123007447"
+    assert rep.available is True
+    assert len(fake.calls("/user/2423")) == 1
+
+
+def test_a_resolved_rep_is_cached_for_the_life_of_the_call(fake, repo):
+    fake.json("/user/2423", user_record(2423))
+    tp = _repo(fake, repo, transport_pro_carrier_cache_seconds=60)
+    assert tp.get_rep("2423").name == tp.get_rep("2423").name
+    assert len(fake.calls("/user/2423")) == 1
+
+
+def test_a_local_rep_id_still_reads_from_the_seeded_table(fake, repo):
+    """A deployment can hold both: Transport Pro user ids are numeric, the seeded
+    fallback reps are not, so one repository serves both without asking."""
+    tp = _repo(fake, repo)
+    assert tp.get_rep("R01").name == "Sarah Chen"
+    assert fake.requests == []
+
+
+def test_a_failed_rep_lookup_never_raises(fake, repo):
+    """`get_rep` is reached from the agent's failure paths, including the one that
+    already handles a dead API. Raising here would turn a handoff into a dropped
+    call, so the transfer falls back to whoever is free instead."""
+    fake.on("/user/2423", httpx.Response(500, text="boom"),
+            httpx.Response(500, text="boom"))
+    assert _repo(fake, repo).get_rep("2423") is None
+
+
+def test_a_rep_transport_pro_does_not_know_is_not_invented(fake, repo):
+    fake.on("/user/2423", httpx.Response(404, json={"error": "no user"}))
+    assert _repo(fake, repo).get_rep("2423") is None
+
+
+def test_an_empty_rep_id_costs_no_round_trip(fake, repo):
+    tp = _repo(fake, repo)
+    assert tp.get_rep("") is None
+    assert tp.get_rep(None) is None
     assert fake.requests == []

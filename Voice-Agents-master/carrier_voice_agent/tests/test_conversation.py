@@ -67,6 +67,17 @@ def _notes(repo) -> str:
         conn.close()
 
 
+def _transfers(repo) -> list[tuple[str, str]]:
+    """Every transfer event, in order: `(rep_id, result)`."""
+    conn = repo._db.connect()
+    try:
+        return [(r["rep_id"], r["transfer_result"]) for r in conn.execute(
+            "SELECT rep_id, transfer_result FROM transfer_events ORDER BY id"
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
 class _FixedComposer:
     """Says the same thing every turn, whatever it was told. Proves the guardrails
     catch a model that leaks a rate or drops our number."""
@@ -589,6 +600,110 @@ def test_fraud_low_is_transferred(repo):
 def test_carrier_asks_for_human(repo):
     a = _to_rate(repo)
     a.handle("can I talk to a rep")
+    assert a.summary()["outcome"] == "transferred"
+
+
+# --------------------------------------------------------------------------- #
+# "Can I talk to the sales rep?" — answered from any state, by the load's own rep
+# --------------------------------------------------------------------------- #
+def _rep_taking_the_call(agent) -> str:
+    return agent._composer.turns[-1]["facts"]
+
+
+def test_asking_for_the_sales_rep_is_answered_wherever_it_lands(repo):
+    """A caller says this whenever they like. Every state has to answer it the same
+    way, rather than carrying on asking for an MC number."""
+    asks = ["can I talk to the sales rep",
+            "put me through to the rep on this load",
+            "I'd rather deal with a person"]
+    for turn, ask in enumerate(asks):
+        a = _agent(repo)
+        a.greeting()
+        # turn 0 = before a load is even identified; 1 = mid-verification;
+        # 2 = after the empty call, with a rate on the table.
+        for step in ["about L1001", "MC 123456", EMPTY][:turn]:
+            a.handle(step)
+        a.handle(ask)
+        assert a.summary()["outcome"] == "transferred", ask
+        assert "asked to speak to a person" in _notes(repo)
+
+
+def test_the_call_goes_to_the_rep_the_load_is_assigned_to(repo):
+    """L1001 is assigned to R01 in the seed data. That is who the carrier gets —
+    not whoever happens to be free."""
+    a = _to_rate(repo)
+    a.handle("can you put me through to the sales rep")
+    assert "Sarah Chen" in _rep_taking_the_call(a)
+    assert "assigned" in _directives(a)
+    assert a.pending_transfer.rep.rep_id == "R01"
+    assert a.pending_transfer.is_fallback is False
+    assert "the rep this load is assigned to" in _notes(repo)
+
+
+def test_a_fallback_rep_is_never_claimed_to_handle_the_load(repo):
+    """With the load's own rep unavailable the call still goes through — to
+    somebody else. What must not happen is the agent telling the carrier that
+    person handles their load: they don't, and the carrier finds out the moment
+    the rep says hello."""
+    conn = repo._db.connect()
+    try:
+        conn.execute("UPDATE reps SET available=0 WHERE rep_id='R01'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    a = _to_rate(repo)
+    a.handle("transfer me to a rep")
+    assert a.pending_transfer.rep.rep_id != "R01"
+    assert a.pending_transfer.is_fallback is True
+    assert a.pending_transfer.assigned_rep.rep_id == "R01"
+    directive = a._composer.turns[-1]["directive"]
+    assert "NOT say this person handles their load" in directive
+    assert "as a fallback" in _notes(repo)
+
+
+def test_a_handoff_is_logged_as_initiated_until_the_line_actually_moves(repo):
+    """The audit trail must not record a transfer that was only announced. It says
+    `initiated` here, and only the telephony layer can settle it."""
+    a = _to_rate(repo)
+    a.handle("can I speak to a representative")
+    assert _transfers(repo) == [("R01", "initiated")]
+
+    a.transfer_connected()
+    assert _transfers(repo)[-1] == ("R01", "connected")
+    assert a.pending_transfer is None
+
+
+def test_a_transfer_that_fails_is_not_reported_as_a_transfer(repo):
+    """The carrier has already been told to hold. The only honest move left is to
+    come back on the line and promise a callback."""
+    a = _to_rate(repo)
+    a.handle("can I speak to a representative")
+    spoken = a.transfer_failed("TransferError: no SIP participant")
+    assert spoken
+    assert _transfers(repo)[-1] == ("R01", "failed")
+    assert a.pending_transfer is None
+    assert "FAILED" in _notes(repo)
+    assert "didn't go through" in a._composer.turns[-1]["directive"]
+
+
+def test_talking_about_their_own_dispatcher_is_not_a_request_for_a_rep(repo):
+    """Carriers mention their dispatcher and their driver constantly. Reading that
+    as "hand me over" would end calls that were going fine."""
+    for said in ("let me check with my dispatcher",
+                 "I'll talk to my driver and call you back",
+                 "I need someone at the dock to unload"):
+        a = _to_rate(repo)
+        a.handle(said)
+        assert a.summary()["outcome"] is None, said
+        assert a.pending_transfer is None, said
+
+
+def test_a_yes_that_asks_for_a_person_is_a_handoff_not_an_acceptance(repo):
+    """"Yeah, put me through to the rep" contains an accept word and is not an
+    accept. The person request is taken first, in every state."""
+    a = _to_rate(repo)
+    a.handle("yeah sure, put me through to the sales rep")
     assert a.summary()["outcome"] == "transferred"
 
 
