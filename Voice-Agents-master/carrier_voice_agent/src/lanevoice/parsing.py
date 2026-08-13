@@ -37,6 +37,26 @@ def glue_spoken_digits(text: str) -> str:
     return _DIGIT_RUN_RE.sub(lambda m: re.sub(r"\D", "", m.group()), converted)
 
 
+# An MC or USDOT label sitting just in front of a number. Transport Pro load ids
+# and MC numbers are both six or seven digits, so in numeric mode the label is the
+# only thing that tells them apart — and a caller who has just been asked for a
+# load number will often answer with their MC instead ("MC 556949"). Reading that
+# as a load number is worse than hearing nothing: there really are loads with
+# six-digit ids, so the agent goes off and looks one up, then tells the caller
+# their own MC number isn't posted.
+_CARRIER_ID_LABEL_RE = re.compile(r"\bMC\b|\bMC(?=\d)|US ?DOT|\bDOT\b")
+
+
+def _labelled_as_carrier_id(upper_text: str, at: int) -> bool:
+    """True if the number starting at `at` is introduced as an MC or USDOT.
+
+    The same 25-character lookback `extract_mc_dot` classifies with, so the two
+    agree on what counts as labelled — "MC 556949" and "my MC is 556949" both do,
+    and filler words between the label and the digits don't defeat it.
+    """
+    return bool(_CARRIER_ID_LABEL_RE.search(upper_text[max(0, at - 25):at]))
+
+
 def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
     """The load number in what the caller just said, or None.
 
@@ -54,10 +74,15 @@ def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
     be money than a load number — and 'L1001' still needs only four, because the
     letter is doing the disambiguating there.
     """
-    compact = glue_spoken_digits(text).upper().replace(" ", "")
     if numeric:
-        match = re.search(r"\d{5,9}", compact)
-        return match.group() if match else None
+        # Keep the spacing: the MC/USDOT label has to stay adjacent to its digits
+        # for the guard below, and stripping spaces glues "MC" onto the number.
+        spaced = glue_spoken_digits(text).upper()
+        for match in re.finditer(r"\d{5,9}", spaced):
+            if not _labelled_as_carrier_id(spaced, match.start()):
+                return match.group()
+        return None
+    compact = glue_spoken_digits(text).upper().replace(" ", "")
     match = re.search(r"L?\d{4,6}", compact)
     if not match:
         return None
@@ -65,6 +90,135 @@ def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
     digits = re.sub(r"\D", "", token)
     return token if token.startswith("L") else f"L{digits}"
 
+
+
+# --------------------------------------------------------------------------- #
+# Numbers written as WORDS
+#
+# The agent's own replies are the reason this exists. Told to sound like a freight
+# desk, the model states rates the way a rep does — "I'm at twenty-four fifty on
+# this one" — and a digit-only scan finds nothing in that sentence. Measured 6 out
+# of 6 on one live turn.
+#
+# That cut both ways, and the second way was the dangerous one:
+#   * the "did you state OUR number" check rejected a perfectly correct turn three
+#     times and handed the call to a rep;
+#   * the "did you invent a number" check waved through "I can do twenty-six
+#     hundred" when only $2450 was authorised — the money guardrail was bypassable
+#     by spelling the figure out.
+# --------------------------------------------------------------------------- #
+_NUMBER_WORDS = {
+    "zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_TENS_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fourty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+# "grand" is how a rate gets rounded off out loud: "three grand".
+_SCALE_WORDS = {"hundred": 100, "thousand": 1000, "grand": 1000, "k": 1000}
+_FILLER_WORDS = {"and", "a"}
+# Words that are number words in a number and PRONOUNS everywhere else. On a
+# freight desk "this one", "which one of those" and "one moment" are constant, and
+# reading each as the figure 1 made every ordinary sentence look like it contained
+# an unauthorised amount. Only skipped when the word stands ALONE — "one thousand",
+# "twenty-one" and "one fifty" all still parse, because there a neighbour settles
+# that a number was meant.
+_PRONOUN_NUMBERS = {"one", "oh"}
+
+_WORD_RE = re.compile(r"[a-z]+")
+
+
+def _chunk(tokens: list[str]) -> list[int]:
+    """A run of number words -> the plain values it is built from.
+
+    A chunk is one ordinary number under a hundred: a teen, a tens word with an
+    optional unit, or a bare unit. `"twenty four fifty"` is TWO chunks (24, 50),
+    while `"twenty four"` is one (24) — which is the whole distinction the pair
+    form below rests on.
+    """
+    values: list[int] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _TENS_WORDS:
+            value = _TENS_WORDS[token]
+            if index + 1 < len(tokens) and tokens[index + 1] in _NUMBER_WORDS \
+                    and _NUMBER_WORDS[tokens[index + 1]] < 10:
+                value += _NUMBER_WORDS[tokens[index + 1]]
+                index += 1
+            values.append(value)
+        elif token in _NUMBER_WORDS:
+            values.append(_NUMBER_WORDS[token])
+        index += 1
+    return values
+
+
+def _run_value(tokens: list[str]) -> int | None:
+    """One run of number words -> the number a person meant by it."""
+    words = [w for w in tokens if w not in _FILLER_WORDS]
+    if not words:
+        return None
+    if len(words) == 1 and words[0] in _PRONOUN_NUMBERS:
+        return None
+    scales = [w for w in words if w in _SCALE_WORDS]
+
+    if not scales:
+        chunks = _chunk(words)
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        # The rate idiom: "twenty-four fifty" is 2450, not 74. Only ever two
+        # chunks — "one two three" is somebody reading digits, not a number, and
+        # `glue_spoken_digits` already handles that case elsewhere.
+        if len(chunks) == 2 and all(0 <= c < 100 for c in chunks):
+            return chunks[0] * 100 + chunks[1]
+        return None
+
+    # Ordinary English with scale words: "two thousand four hundred fifty".
+    total = current = 0
+    for word in words:
+        if word in _SCALE_WORDS:
+            scale = _SCALE_WORDS[word]
+            if scale == 100:
+                current = (current or 1) * 100
+            else:
+                total += (current or 1) * scale
+                current = 0
+        elif word in _TENS_WORDS:
+            current += _TENS_WORDS[word]
+        elif word in _NUMBER_WORDS:
+            current += _NUMBER_WORDS[word]
+    return (total + current) or None
+
+
+def spoken_numbers(text: str) -> set[int]:
+    """Every number the text states in WORDS. `{}` when it states none.
+
+    Deliberately additive: it never removes anything a digit scan found, so a
+    parse this misses leaves behind exactly the previous behaviour rather than a
+    new hole.
+    """
+    tokens = _WORD_RE.findall(str(text or "").lower().replace("-", " "))
+    found: set[int] = set()
+    run: list[str] = []
+    for token in tokens:
+        if token in _NUMBER_WORDS or token in _TENS_WORDS or token in _SCALE_WORDS:
+            run.append(token)
+            continue
+        # A filler only stays inside a run that has already started.
+        if token in _FILLER_WORDS and run:
+            run.append(token)
+            continue
+        if (value := _run_value(run)) is not None:
+            found.add(value)
+        run = []
+    if (value := _run_value(run)) is not None:
+        found.add(value)
+    return found
 
 def heard_digits(text: str) -> str:
     """Every digit in an utterance, in order, with everything else dropped.
@@ -214,6 +368,17 @@ _STATE_ABBREVS = (
     "mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|"
     "wi|wy|dc"
 )
+
+# The two lists above are PARALLEL — alabama/al, alaska/ak, … — so the name ->
+# code map is zipped out of them rather than written a third time. `strict=True`
+# is the guard: adding a state to one list and not the other fails at import
+# rather than silently mis-coding a state on a live call.
+STATE_CODES: dict[str, str] = {
+    name: abbrev.upper()
+    for name, abbrev in zip(_STATE_NAMES.split("|"), _STATE_ABBREVS.split("|"),
+                            strict=True)
+}
+
 
 _WHEN_RE = re.compile(
     r"\b(?:"

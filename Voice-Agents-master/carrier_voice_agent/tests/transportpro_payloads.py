@@ -481,7 +481,45 @@ CARRIER_STATUS_NO_STATUS_FIELD = {
     "state": "TN",          # the address, which must never be read as a status
 }
 
-# --- GET /contact/search?connnectionRecordType=brokerCarrier --------------- #
+# --- GET /contact/search — the REAL shape, from the live tenant ------------- #
+#
+# Addresses arrive as `emailContacts: [{"type": ..., "value": ...}]` — a LIST
+# under an email-ish key, holding objects whose address sits under a neutral
+# `value`. Nothing here is named plainly "email", which is why the mapper matches
+# on the SHAPE of an address rather than on a field name.
+CONTACT_SEARCH_LIVE = {
+    "pagination": {"totalRecords": 2, "perPage": 200},
+    "results": [
+        {
+            "id": 2328,
+            "firstName": "Alicia",
+            "lastName": None,
+            "title": "Dispatcher",
+            "location": {"city": None, "state": "TN", "countryCode": "USA"},
+            "phoneNumbers": [{"type": "OFFICE", "value": "6157937833"}],
+            "emailContacts": [
+                {"type": "MAIN", "value": "johnsontrucking@tds.net"},
+            ],
+            "comments": None,
+            "isVerified": False,
+        },
+        {
+            "id": 2329,
+            "firstName": "James",
+            "lastName": None,
+            "title": "Owner",
+            "location": {"city": None, "state": "TN", "countryCode": "USA"},
+            "phoneNumbers": [],
+            "emailContacts": [
+                {"type": "MAIN", "value": "james@johnsontruckingtn.com"},
+            ],
+            "comments": None,
+            "isVerified": False,
+        },
+    ],
+}
+
+# --- A flat `email` field — kept so the shape-based match stays covered ------ #
 CONTACT_SEARCH = {
     "pagination": {"totalRecords": 2, "perPage": 200},
     "results": [

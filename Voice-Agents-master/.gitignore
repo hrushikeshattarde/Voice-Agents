@@ -1,5 +1,5 @@
 # Secrets — NEVER commit these.
-# The real .env holds the LiveKit API secret, the Groq key and the Transport Pro
+# The real .env holds the LiveKit API secret, the OpenRouter key and the Transport Pro
 # production password. `carrier_voice_agent/.gitignore` covers a .env inside that
 # directory, which is not the same file as this one at the repo root — the root
 # needs its own rule, and lacking it is how a credential reaches GitHub.

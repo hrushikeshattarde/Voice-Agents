@@ -2,7 +2,11 @@
 LiveKit worker — connects the deterministic brain to real phone calls.
 
 Pipeline:  phone -> LiveKit SIP -> this worker
-           Silero VAD -> Groq Whisper STT -> CarrierSalesAgent -> Groq TTS
+           Silero VAD -> OpenRouter Whisper STT -> CarrierSalesAgent
+                      -> OpenRouter TTS
+
+Every AI hop runs on OpenRouter: transcription, the composer that writes each
+spoken turn, and the voice that says it. One key, three endpoints.
 
 Run:  lanevoice-worker dev      (local)
       lanevoice-worker start    (production)
@@ -22,7 +26,7 @@ from livekit.agents import (
     cli,
 )
 from livekit.agents import tts as lk_tts
-from livekit.plugins import groq as lk_groq
+from livekit.plugins import openai as lk_openai
 from livekit.plugins import silero
 
 try:  # StopResponse moved across livekit-agents versions
@@ -41,7 +45,7 @@ from lanevoice.db import Repository
 from lanevoice.env import load_env
 from lanevoice.logging_config import get_logger, setup_logging
 from lanevoice.settings import get_settings
-from lanevoice.voice import GroqComposer, GroqTTS, StubComposer
+from lanevoice.voice import OpenRouterTTS, build_composer
 
 # Runtime setup (kept below imports so linting stays clean). load_env() runs
 # before get_settings() so a .env — found by searching upward from the working
@@ -53,11 +57,11 @@ logger = get_logger("lanevoice.worker")
 
 
 # --------------------------------------------------------------------------- #
-# TTS adapter: wrap GroqTTS in LiveKit's TTS interface
+# TTS adapter: wrap OpenRouterTTS in LiveKit's TTS interface
 # --------------------------------------------------------------------------- #
-class GroqTTSPlugin(lk_tts.TTS):
+class OpenRouterTTSPlugin(lk_tts.TTS):
     def __init__(self):
-        self._model = GroqTTS(_settings)
+        self._model = OpenRouterTTS(_settings)
         super().__init__(
             capabilities=lk_tts.TTSCapabilities(streaming=False),
             sample_rate=self._model.sample_rate, num_channels=1,
@@ -98,14 +102,30 @@ def prewarm(proc):
         activation_threshold=0.6,
         min_speech_duration=0.2,
     )
-    proc.userdata["stt"] = lk_groq.STT(
+    # OpenRouter's `/audio/transcriptions` is OpenAI-shaped, so the OpenAI plugin
+    # drives it verbatim once it is pointed at the gateway — no bespoke STT class.
+    # The model is a namespaced OpenRouter slug (`openai/whisper-large-v3`), which
+    # is also why the plugin sends `response_format=json` rather than the
+    # `verbose_json` it reserves for a model named exactly `whisper-1`; OpenRouter
+    # accepts both.
+    #
+    # `prompt` is documented by OpenRouter as accepted and IGNORED, so the freight
+    # vocabulary in STT_PROMPT is not biasing anything today. It costs nothing to
+    # keep sending and starts working if that changes.
+    proc.userdata["stt"] = lk_openai.STT(
         model=_settings.stt_model,
-        prompt=_settings.stt_prompt,   # bias Whisper toward freight vocabulary
+        base_url=_settings.openrouter_base_url,
+        api_key=_settings.openrouter_api_key,
+        language="en",
+        prompt=_settings.stt_prompt,
     )
-    proc.userdata["tts"] = GroqTTSPlugin()
+    proc.userdata["tts"] = OpenRouterTTSPlugin()
     # The agent has no scripted lines, so the composer is what lets it talk at all.
-    proc.userdata["composer"] = (
-        GroqComposer(_settings) if _settings.use_llm else StubComposer(_settings))
+    # `build_composer` picks the provider from LLM_PROVIDER and falls back to the
+    # offline stub when USE_LLM is off or the provider's key is missing.
+    proc.userdata["composer"] = build_composer(_settings)
+    logger.info("composer: %s / %s", _settings.llm_provider,
+                _settings.resolved_llm_model)
 
     # Background-noise / echo removal tuned for 8 kHz phone audio. Optional:
     # if the native lib isn't available on this host, carry on without it.
@@ -166,9 +186,16 @@ async def entrypoint(ctx: JobContext):
 
 
 def main() -> None:
+    # OpenRouter is always required: STT and TTS run on it whichever LLM composes.
     _settings.require(
-        "livekit_url", "livekit_api_key", "livekit_api_secret", "groq_api_key"
+        "livekit_url", "livekit_api_key", "livekit_api_secret", "openrouter_api_key"
     )
+    if _settings.use_llm and not _settings.llm_api_key:
+        raise RuntimeError(
+            f"LLM_PROVIDER={_settings.llm_provider} needs "
+            f"{_settings.llm_key_name}. Set it in .env, switch provider, or set "
+            "USE_LLM=false to drive the flow with the offline stub."
+        )
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
 
 

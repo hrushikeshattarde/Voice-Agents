@@ -38,7 +38,7 @@ Creates `.venv`, installs runtime + dev dependencies, and installs the
 
 ## 2. Case A — Try it with NO keys (text simulation)
 
-The fastest way to see the whole flow. No LiveKit, no Groq, no models.
+The fastest way to see the whole flow. No LiveKit, no OpenRouter, no models.
 
 ```bash
 make demo
@@ -83,13 +83,17 @@ cp .env.example .env
 ```
 Fill in (see [table below](#7-configuration--changing-models)):
 - `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
-- `GROQ_API_KEY`
+- `OPENROUTER_API_KEY` — one key covers STT, the LLM and TTS
 
 ### 4.2 TTS model
-Defaults to `canopylabs/orpheus-v1-english` (Groq's Orpheus). The old
-`playai-tts` model was shut down 2025-12-31 — no terms to accept. Override the
-model/voice via `TTS_MODEL` / `TTS_VOICE` in `.env` if you like (voices: `troy`,
-`autumn`, `diana`, `hannah`, `austin`, `daniel`).
+Defaults to `fish-audio/s2.1-pro-free:free` — Fish Audio S2.1 Pro on OpenRouter's
+free tier, which has the same weights as the paid model but **no latency or
+uptime guarantee**. For production set `TTS_MODEL=fish-audio/s2.1-pro`.
+
+`TTS_VOICE` is empty by default, which means "let the model use its own default
+voice". Voices are namespaced to the TTS provider, so an OpenAI name like `alloy`
+means nothing to Fish Audio — to pick a specific voice, open it on
+[fish.audio](https://fish.audio) and paste the 32-hex id from its URL.
 
 ### 4.3 One-time: wire the phone number (SIP)
 Follow [docs/LIVE_SETUP.md](LIVE_SETUP.md) — create a LiveKit inbound trunk +
@@ -141,8 +145,8 @@ make docker                 # docker build -t lanevoice:latest .
 docker run --env-file .env lanevoice:latest
 ```
 The worker connects **out** to LiveKit, so no inbound ports are needed. Run it on
-any always-on host (a small Linux VM). GPU is not required — STT/LLM/TTS run on
-Groq.
+any always-on host (a small Linux VM). GPU is not required — STT/LLM/TTS all run
+on OpenRouter.
 
 ---
 
@@ -154,10 +158,13 @@ is overridable via `.env` (env var wins). **Change a model = change one value.**
 | Setting | Env var | Default |
 |---|---|---|
 | LiveKit URL / key / secret | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | — (required for live) |
-| Groq key | `GROQ_API_KEY` | — (required for live) |
-| STT model | `STT_MODEL` | `whisper-large-v3-turbo` |
-| LLM model | `LLM_MODEL` | `llama-3.1-8b-instant` |
-| TTS model / voice | `TTS_MODEL` / `TTS_VOICE` | `canopylabs/orpheus-v1-english` / `troy` |
+| OpenRouter key | `OPENROUTER_API_KEY` | — (required for live: STT + LLM + TTS) |
+| STT model | `STT_MODEL` | `openai/whisper-large-v3` |
+| LLM provider | `LLM_PROVIDER` | `openrouter` (or `anthropic`) |
+| LLM model | `LLM_MODEL` | unset = `anthropic/claude-haiku-4.5` |
+| TTS model | `TTS_MODEL` | `microsoft/mai-voice-2-flash` |
+| TTS voice | `TTS_VOICE` | `en-US-Ethan:MAI-Voice-2` |
+| TTS timeout (sec) | `TTS_TIMEOUT` | `15.0` |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
 | Turn buffer (sec) | `MIN_ENDPOINTING_DELAY` / `MAX_ENDPOINTING_DELAY` | `0.8` / `8.0` |
 | Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `8` |
@@ -173,11 +180,12 @@ is overridable via `.env` (env var wins). **Change a model = change one value.**
 
 Examples:
 ```bash
-# smarter phrasing:
-echo "USE_LLM=1" >> .env
-echo "LLM_MODEL=llama-3.3-70b-versatile" >> .env
-# a different TTS voice:
-echo "TTS_VOICE=autumn" >> .env
+# compose on Claude first-party instead of through the gateway
+# (still needs OPENROUTER_API_KEY for speech):
+echo "LLM_PROVIDER=anthropic" >> .env
+echo "ANTHROPIC_API_KEY=sk-ant-..." >> .env
+# the paid, production-grade voice:
+echo "TTS_MODEL=fish-audio/s2.1-pro" >> .env
 ```
 
 ---
@@ -186,13 +194,15 @@ echo "TTS_VOICE=autumn" >> .env
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Missing required settings: …` on start | `.env` not filled | Add LiveKit + `GROQ_API_KEY` to `.env` |
-| Worker starts, call connects, **silent** | wrong/removed `TTS_MODEL` (e.g. old `playai-tts`) | Use `canopylabs/orpheus-v1-english` (default) |
+| `Missing required settings: …` on start | `.env` not filled | Add LiveKit + `OPENROUTER_API_KEY` to `.env` |
+| `OpenRouter /audio/speech -> HTTP 400` at startup | `TTS_MODEL` is not a TTS model, or `TTS_VOICE` is one this model doesn't have | Use the default model; clear `TTS_VOICE` to fall back to the model's own voice |
+| Voice sounds **too fast / too slow** | the response carried no rate and `TTS_SAMPLE_RATE` is wrong | Check the logged `at N Hz` line; set `TTS_SAMPLE_RATE` to match |
+| Call connects, agent speaks, then **long gaps** | free-tier TTS has no latency guarantee | `TTS_MODEL=fish-audio/s2.1-pro` (paid) |
 | Call connects but **agent never joins** | dispatch rule missing | `lk sip dispatch list`; recreate per LIVE_SETUP §B3 |
 | Call **fails to connect** | number not attached / SIP URI mismatch | Recheck LIVE_SETUP §B |
 | STT hears wrong **digits** ("L1001"→"anyone") | phone audio + model | Say digits slowly, one at a time |
 | `uv sync` tries to compile / fails | Python 3.13/3.14 | `uv venv --python 3.12 && uv sync` |
-| `GROQ_API_KEY` errors / 401 | bad/rotated key | Regenerate in Groq console, update `.env` |
+| `OPENROUTER_API_KEY` errors / 401 | bad/rotated key | Regenerate at [openrouter.ai/keys](https://openrouter.ai/keys), update `.env` |
 | Two workers answer oddly | more than one worker registered | Run only one `lanevoice-worker` at a time |
 | Import errors running `python foo.py` | package not on path | Use `uv run …` (or `uv sync` first) |
 

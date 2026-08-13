@@ -612,6 +612,12 @@ def test_load_requirements_are_confirmed_before_any_rate(repo):
     assert a.state.value == "check_requirements"
     assert a._composer.turns[-1]["speakable"] == ""     # no rate yet
     assert "zero degrees" in a._composer.turns[-1]["facts"]
+    # The requirements are their own turn: this one reads them out...
+    a.handle("go ahead")
+    assert a.state.value == "check_requirements"
+    assert "cover this load's requirements from FACTS" in \
+        a._composer.turns[-1]["directive"]
+    # ...and only an actual yes moves to the rate.
     a.handle("yeah, I can do that")
     assert a.state.value == "state_price"
     assert a._composer.turns[-1]["speakable"] == "$1400"

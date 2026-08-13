@@ -25,7 +25,18 @@ import json
 import re
 from typing import Protocol, runtime_checkable
 
+from lanevoice.logging_config import get_logger
 from lanevoice.settings import Settings, get_settings
+
+logger = get_logger(__name__)
+
+# Appended to a prompt whose first attempt was cut off by the token limit.
+_TOO_LONG = (
+    "\n\nYOUR LAST ATTEMPT RAN PAST THE LENGTH LIMIT and was cut off mid-sentence. "
+    "Say the same thing in FAR fewer words: group what you have to cover instead of "
+    "listing it, and get to the question at the end. Being brief matters more than "
+    "being complete here."
+)
 
 _SYSTEM = (
     "You are Alex, a carrier sales rep at Circle Logistics, on the phone with a "
@@ -118,31 +129,35 @@ class TurnComposer(Protocol):
     def read(self, dialogue: str, fields: dict[str, str]) -> dict: ...
 
 
-class GroqComposer:
-    """Hosted composition via Groq. Any OpenAI-compatible client works the same."""
+class _ChatComposer:
+    """Everything about composing a turn that isn't provider-specific.
+
+    The prompt assembly below — what the model is told, in what order, and the
+    guardrail that money outside SPEAKABLE is forbidden — is the product. Which
+    vendor answers is not. Subclasses supply `_chat` and nothing else, so a
+    provider swap can never quietly change what the agent says.
+    """
 
     def __init__(self, settings: Settings | None = None):
-        from groq import Groq
-
         self._settings = settings or get_settings()
-        self._client = Groq(api_key=self._settings.groq_api_key or None)
-        self._model = self._settings.llm_model
+        self._model = self._settings.resolved_llm_model
 
+    # -- the one provider-specific method ---------------------------------- #
     def _chat(self, system: str, user: str, *, max_tokens: int,
-              temperature: float, json_mode: bool = False) -> str:
-        kwargs = {}
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            **kwargs,
-        )
-        return (resp.choices[0].message.content or "").strip()
+              temperature: float, json_mode: bool = False) -> tuple[str, bool]:
+        """`(text, truncated)`. `truncated` is True when the model ran out of
+        tokens mid-sentence rather than finishing its reply.
 
+        That flag exists because a truncated turn is WORSE than no turn. It is not
+        malformed output a caller can spot — it is a grammatical, plausible reply
+        that simply stops, and it goes straight to a speech synthesiser and out of
+        a telephone. Observed live: a load pitch ended "...you'll get paid a
+        hundred bucks for" and the carrier said "Hello.", assuming the line had
+        dropped.
+        """
+        raise NotImplementedError
+
+    # -- shared behaviour -------------------------------------------------- #
     def compose(self, directive: str, facts: str = "", dialogue: str = "",
                 speakable: str = "", correction: str = "") -> str:
         parts = []
@@ -160,17 +175,42 @@ class GroqComposer:
             parts.append(f"YOUR LAST ATTEMPT WAS REJECTED: {correction}")
         parts.append("Say your next turn out loud now. Speech only — no labels, "
                      "no quotation marks around it, no stage directions.")
-        text = self._chat(
-            _SYSTEM, "\n\n".join(parts),
+        prompt = "\n\n".join(parts)
+        text, truncated = self._chat(
+            _SYSTEM, prompt,
             max_tokens=self._settings.llm_max_tokens,
             temperature=self._settings.llm_temperature,
         )
+        if truncated:
+            # Retried HERE rather than left to `_say`, because the fix is known and
+            # specific: the same prompt would be cut off again, and `_say`'s retry
+            # loop has no way to ask for something shorter. One extra attempt only —
+            # a carrier is on the line.
+            logger.warning(
+                "Composed turn hit the %d-token limit and was cut off mid-sentence "
+                "(%d chars). Retrying with an explicit length instruction.",
+                self._settings.llm_max_tokens, len(text))
+            text, truncated = self._chat(
+                _SYSTEM, prompt + _TOO_LONG,
+                max_tokens=self._settings.llm_max_tokens,
+                temperature=self._settings.llm_temperature,
+            )
+            if truncated:
+                # Still cut off. Returning "" makes `_say` re-prompt and then hand
+                # the call to a rep, which is the right end for a turn that cannot
+                # be said cleanly — far better than speaking half a sentence.
+                logger.error(
+                    "Composed turn was cut off twice at %d tokens. Refusing to speak "
+                    "half a sentence; the call goes to a rep. Raise LLM_MAX_TOKENS "
+                    "or shorten what this turn is being asked to cover.",
+                    self._settings.llm_max_tokens)
+                return ""
         return text.strip().strip('"')
 
     def read(self, dialogue: str, fields: dict[str, str]) -> dict:
         """Extract `fields` ({name: what to look for}) from the dialogue."""
         wanted = "\n".join(f"- {name}: {desc}" for name, desc in fields.items())
-        raw = self._chat(
+        raw, truncated = self._chat(
             _READ_SYSTEM,
             f"CALL SO FAR:\n{dialogue}\n\nPull out these fields:\n{wanted}\n\n"
             f"Return JSON with exactly these keys: {', '.join(fields)}.",
@@ -178,7 +218,140 @@ class GroqComposer:
             temperature=0.0,
             json_mode=True,
         )
+        if truncated:
+            # Truncated JSON does not parse, and `_parse_json` already degrades to
+            # all-nulls — "they didn't say" rather than a guess. Logged because the
+            # cause is our limit, not the model.
+            logger.warning("Field extraction hit the %d-token limit; every field "
+                           "will read as not stated.",
+                           self._settings.llm_read_max_tokens)
         return _parse_json(raw, fields)
+
+
+class OpenRouterComposer(_ChatComposer):
+    """Claude (or anything else OpenRouter fronts) via its OpenAI-compatible API.
+
+    The default composer, and a GATEWAY rather than Anthropic. It is the default
+    because the same key already has to be present for speech — STT and TTS both
+    run on OpenRouter — so a stock deployment needs exactly one AI credential.
+    The trade is real and worth knowing:
+
+      * One extra network hop on every turn — and the composer runs on each turn
+        of a live call, up to `LLM_ATTEMPTS` times when a reply breaks a rule.
+      * Anthropic-native features aren't reachable through the OpenAI shape —
+        prompt caching, `thinking`, structured outputs, `stop_reason: "refusal"`.
+        None are used here, so nothing is lost today.
+
+    `AnthropicComposer` is the first-party path; prefer it when there's an
+    Anthropic key to hand. Same prompts, same guardrails, one hop fewer.
+    """
+
+    def __init__(self, settings: Settings | None = None):
+        from openai import OpenAI
+
+        super().__init__(settings)
+        # Sent for OpenRouter's dashboard attribution; both are optional.
+        self._client = OpenAI(
+            base_url=self._settings.openrouter_base_url,
+            api_key=self._settings.openrouter_api_key or None,
+            timeout=self._settings.llm_timeout,
+            default_headers={"X-Title": "LaneVoice carrier sales agent"},
+        )
+
+    def _chat(self, system: str, user: str, *, max_tokens: int,
+              temperature: float, json_mode: bool = False) -> tuple[str, bool]:
+        kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            **kwargs,
+        )
+        # OpenRouter reports upstream failures as a body field on a 200 rather
+        # than an HTTP error, and can answer with no choices at all. Either way
+        # the caller needs a falsy string, which it re-prompts or hands over —
+        # never an AttributeError on `choices[0]`.
+        if not getattr(resp, "choices", None):
+            error = getattr(resp, "error", None)
+            raise RuntimeError(f"OpenRouter returned no completion: {error or resp}")
+        choice = resp.choices[0]
+        return ((choice.message.content or "").strip(),
+                choice.finish_reason == "length")
+
+
+class AnthropicComposer(_ChatComposer):
+    """Claude via the official Anthropic SDK — the first-party path.
+
+    Deliberately plain: no `thinking` and no `effort`. This composes one short
+    spoken sentence while a carrier waits on the line, so latency is the budget
+    and there is nothing here worth reasoning about. (`effort` would in any case
+    be rejected on Haiku 4.5 — it arrived with the Opus 4.5 generation.)
+    """
+
+    def __init__(self, settings: Settings | None = None):
+        import anthropic
+
+        super().__init__(settings)
+        self._client = anthropic.Anthropic(
+            api_key=self._settings.anthropic_api_key or None,
+            timeout=self._settings.llm_timeout,
+        )
+
+    def _chat(self, system: str, user: str, *, max_tokens: int,
+              temperature: float, json_mode: bool = False) -> tuple[str, bool]:
+        # `json_mode` needs no special handling: `_READ_SYSTEM` already demands a
+        # bare JSON object and `_parse_json` extracts one out of any surrounding
+        # prose. Haiku 4.5 does support structured outputs — worth reaching for
+        # only if `read()` ever lands on the call path, which it hasn't yet.
+        message = self._client.messages.create(
+            model=self._model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        # Safety classifiers can decline with HTTP 200 and an empty `content`,
+        # so check `stop_reason` before reading blocks. An empty string is the
+        # right answer here — the conversation layer re-prompts, and hands the
+        # call to a rep if it can't get a compliant turn.
+        if message.stop_reason == "refusal":
+            return "", False
+        text = "".join(
+            block.text for block in message.content if block.type == "text"
+        ).strip()
+        return text, message.stop_reason == "max_tokens"
+
+
+_PROVIDERS = {
+    "openrouter": OpenRouterComposer,
+    "anthropic": AnthropicComposer,
+}
+
+
+def build_composer(settings: Settings | None = None) -> TurnComposer:
+    """The composer named by `LLM_PROVIDER`, or the offline stub.
+
+    Raises on an unknown provider rather than quietly falling back to the
+    default: a typo in `LLM_PROVIDER` should stop the worker at startup, not
+    surface three calls later as "why is it billing the wrong account?".
+
+    The stub is returned when `USE_LLM=false` or no key is configured for the
+    chosen provider. It cannot hold a conversation — the agent has no scripted
+    lines — so callers that can print a warning should.
+    """
+    settings = settings or get_settings()
+    name = settings.llm_provider.strip().lower()
+    composer = _PROVIDERS.get(name)
+    if composer is None:
+        raise ValueError(
+            f"Unknown LLM_PROVIDER {settings.llm_provider!r}. "
+            f"Expected one of: {', '.join(sorted(_PROVIDERS))}."
+        )
+    if not settings.use_llm or not settings.llm_api_key:
+        return StubComposer(settings)
+    return composer(settings)
 
 
 class StubComposer:

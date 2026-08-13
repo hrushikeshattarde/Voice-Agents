@@ -79,7 +79,10 @@ def _to_rate(fake, repo, load=LOAD, mc="MC 123456"):
     agent.handle(f"calling about load {load}")
     agent.handle(mc)
     agent.handle(EMPTY)
-    agent.handle("yeah we can do that")     # the load has board notes to confirm
+    # The pitch and the requirements are separate turns now — read together
+    # they ran to 25 seconds of speech and hit the token limit mid-sentence.
+    agent.handle("go ahead")                # -> the requirements get read
+    agent.handle("yeah we can do that")     # -> and confirmed
     return agent
 
 
@@ -152,6 +155,157 @@ def test_a_genuinely_covered_load_is_still_called_covered(fake, repo):
     agent.greeting()
     agent.handle(f"load {LOAD}")
     assert "already covered" in _turns(agent)[-1]["directive"].lower()
+
+
+def test_a_covered_load_ends_the_call_without_a_cross_sell(fake, repo):
+    """The desk's instruction: tell them, thank them, done.
+
+    A carrier ringing about one specific posting is not shopping a list, and
+    reading five other load numbers at somebody who wanted that lane is the part
+    that sounds like a machine. So this branch closes the call rather than pivoting
+    into a pitch.
+    """
+    board(fake, record_for(int(LOAD), load_status="Covered"))
+    agent = _agent(fake, repo)
+    agent.greeting()
+    agent.handle(f"load {LOAD}")
+
+    assert agent.state.value == "done"
+    assert agent.summary()["outcome"] == "no_deal"
+
+    directive = _turns(agent)[-1]["directive"].lower()
+    assert "already covered" in directive
+    assert "thank them for calling" in directive
+    # The prohibitions have to be explicit, since every other unsellable branch
+    # DOES offer alternatives and the model has seen those patterns.
+    assert "do not offer another load" in directive
+    assert "do not read out any other load number" in directive
+
+
+def test_a_covered_load_never_puts_another_load_number_in_reach(fake, repo):
+    """Belt and braces on the guardrail rather than the prompt: any figure not in
+    the directive or facts is a breach, so the open-load numbers being absent from
+    BOTH is what actually makes them unspeakable."""
+    board(fake, record_for(int(LOAD), load_status="Covered"))
+    agent = _agent(fake, repo)
+    agent.greeting()
+    agent.handle(f"load {LOAD}")
+
+    turn = _turns(agent)[-1]
+    source = turn["directive"] + turn["facts"]
+    # The load they asked about is sayable; nothing else numeric is.
+    assert LOAD in source
+    assert turn["speakable"] == ""
+    for other in ("1303370", "1303371", "L1002", "L1003"):
+        assert other not in source, other
+
+
+def test_a_covered_load_does_not_scan_the_board_at_all(fake, repo):
+    """Latency, not just wording. The open-load scan is a round trip per office
+    terminal and the caller waits through it — so a branch that offers nothing must
+    not pay for the list it will never read."""
+    board(fake, record_for(int(LOAD), load_status="Covered"))
+    agent = _agent(fake, repo)
+    agent.greeting()
+    agent.handle(f"load {LOAD}")
+
+    assert agent.state.value == "done"
+    assert fake.calls("/load/search") == []
+    # The load itself WAS fetched — that is how we know it is covered.
+    assert fake.calls(f"/load/{LOAD}")
+
+
+def test_no_branch_scans_the_board_any_more(fake, repo):
+    """The agent never reads out a list, so it never needs one. The board scan is
+    a round trip per office terminal, and it is now off the call path entirely."""
+    for kwargs in ({"load_status": "Covered"},
+                   {"postingInfo": {"isPosted": False}},
+                   {"load_status": "Available"}):
+        server = FakeTransportPro()
+        board(server, record_for(int(LOAD), **kwargs))
+        agent = _agent(server, repo)
+        agent.greeting()
+        agent.handle(f"load {LOAD}")
+        assert server.calls("/load/search") == [], kwargs
+
+
+def test_a_covered_load_records_which_load_it_was(fake, repo):
+    """The call ends before `self.load` would normally be set, so it is set anyway —
+    a call record with no load id is one nobody can reconcile against the board."""
+    board(fake, record_for(int(LOAD), load_status="Covered"))
+    agent = _agent(fake, repo)
+    agent.greeting()
+    agent.handle(f"load {LOAD}")
+
+    assert agent.summary()["load_id"] == LOAD
+    assert "is covered" in _notes(repo)
+    assert "without offering alternatives" in _notes(repo)
+
+
+def test_no_unsellable_state_ever_offers_another_load(fake, repo):
+    """The rule, across every branch: tell them about the load they asked for and
+    nothing else. Five load numbers spoken down a phone at somebody who wanted one
+    specific lane is what makes this sound like a machine."""
+    for status, kwargs in (("not found", {}),
+                           ("not posted", {"postingInfo": {"isPosted": False}}),
+                           ("not ready", {"load_status": "Available"}),
+                           ("covered", {"load_status": "Covered"})):
+        server = FakeTransportPro()
+        if status == "not found":
+            server.json(f"/load/{LOAD}", EMPTY_SEARCH)
+            server.json("/load/search", EMPTY_SEARCH)
+        else:
+            board(server, record_for(int(LOAD), **kwargs))
+        agent = _agent(server, repo)
+        agent.greeting()
+        agent.handle(f"load {LOAD}")
+
+        turn = _turns(agent)[-1]
+        source = turn["directive"] + turn["facts"]
+        assert "do not offer" in source.lower(), status
+        assert turn["speakable"] == "", status
+        # Nothing numeric beyond the load they actually asked about.
+        for other in ("1303370", "1303371", "L1002", "L1003"):
+            assert other not in source, (status, other)
+
+
+def test_the_three_non_covered_states_keep_the_call_open(fake, repo):
+    """Nobody else has that freight, so the caller is asked whether they have
+    another number — a real rep's next line, and the caller may well be holding a
+    second posting. Only COVERED ends the call outright."""
+    for status, kwargs in (("not posted", {"postingInfo": {"isPosted": False}}),
+                           ("not ready", {"load_status": "Available"})):
+        server = FakeTransportPro()
+        board(server, record_for(int(LOAD), **kwargs))
+        agent = _agent(server, repo)
+        agent.greeting()
+        agent.handle(f"load {LOAD}")
+
+        assert agent.state.value == "identify_load", status
+        assert agent.outcome is None, status
+        assert "another number off the board" in _turns(agent)[-1]["directive"], status
+
+
+def test_the_call_is_wrapped_up_after_three_numbers_that_do_not_work(fake, repo):
+    """Removing the list removed the call's way forward, so this is the new one. A
+    caller working from a stale posting, or a mangled transcript, must not be able
+    to keep the line open indefinitely."""
+    board(server := FakeTransportPro(), record_for(int(LOAD), load_status="Available"))
+    agent = _agent(server, repo)
+    agent.greeting()
+
+    agent.handle(f"load {LOAD}")
+    assert agent.state.value == "identify_load"
+    agent.handle(f"load {LOAD}")
+    assert agent.state.value == "identify_load"
+    agent.handle(f"load {LOAD}")
+
+    assert agent.state.value == "done"
+    assert agent.summary()["outcome"] == "no_deal"
+    directive = _turns(agent)[-1]["directive"].lower()
+    assert "thank them for calling" in directive
+    assert "do not ask for another number" in directive
+    assert "3 load numbers in a row" in _notes(repo)
 
 
 def test_no_rate_is_ever_authorised_for_a_load_that_is_not_sellable(fake, repo):

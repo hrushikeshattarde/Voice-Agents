@@ -46,12 +46,28 @@ called out below and all flagged in the tool's own output:
 |---|---|
 | authenticate | `POST /auth` (HTTP Basic, **no body**), refresh via the same path with a JSON body |
 | is this load number real, and is it sellable? | `GET /load/{id}` |
-| what else is open, to offer by number? | `GET /load/search?loadStatus=&isPosted=true` |
+| what else is open, to offer by number? | `GET /load/search?loadStatus=&isPosted=true&terminalId=` |
+| which office owns which terminal? | `GET /terminal/search` |
 | is this MC/USDOT active with us? | `GET /voiceai/carrier_status?mc_number=` / `?dot_number=` |
 | what addresses are on their account? | `GET /contact/search?connnectionRecordType=brokerCarrier&connectionRecordId=` |
-| record the agreed rate | `POST /voiceai/load/{id}/make_offer` |
+| record the agreed rate (log only, no link) | `POST /voiceai/load/{id}/make_offer` |
+| create an offer we can then accept | `POST /offer` (JSON, real ints) |
 | write the call outcome onto the load | `POST /voiceai/load/{id}/add_note` |
 | log a truck we couldn't use *(available, not wired — see below)* | `POST /voiceai/add_carrier_capacity` |
+
+And on the **HappyRobot endpoint** — same host, path `/svc/happyrobot.php`, auth
+by static bearer token rather than the `/auth` login:
+
+| Question the call is asking | Action |
+|---|---|
+| turn an offer into a link the carrier can sign | `accept_offer` -> `book_now_url` |
+| invite a PASS carrier to connect on Highway | `invite_carrier` |
+| what classifications does this carrier hold? | `carrier_lookup` |
+
+`carrier_lookup` is needed because **`/voiceai/carrier_status` has no
+classification list at all** — verified against the live tenant, it returns only
+`{carrier_name, city, state, dot_number, mc_number, id, status}`. Highway is the
+authority on qualifications; this is the fallback where Highway has no verdict.
 
 Two details that look like mistakes and are not:
 
@@ -72,7 +88,61 @@ Because that endpoint serves *any* load regardless of posting, a payload with no
 here, and the opposite of the Voice AI feed's provenance rule below.
 
 `GET /voiceai/load/search_available` is still implemented and tested but is not on
-the call path; it is the only endpoint returning `carrier_sales_data.book_now_url`.
+the call path. It **does not** reliably carry
+`carrier_sales_data.book_now_url` — measured across the live posted board, that
+field was absent from every row. The link only exists once an offer has been
+accepted; see "Booking is recorded before it is announced" below.
+
+### Office scope, and two traps in the terminal tree
+
+Every load hangs off a terminal (`assignedTerminal`, an integer **id**). Terminals
+form a tree: an office at the root, PODs and teams beneath. A deployment scoped to
+one office must accept the office **and its whole subtree**.
+
+Measured on the live tenant: Fort Wayne Office (id 1003, `terminalCode "1001"`) has
+**4** posted loads; its 49 PODs have **338**. Scoping to the office id alone looks
+like it works and hides almost everything.
+
+Two silent traps in `/terminal/search`:
+
+* **`id` is an int, `parentTerminalId` is a STRING** — `{"id": 1058,
+  "parentTerminalId": "1003"}`, across all 172 rows. A walk that compares them raw
+  finds no children and every office reads as childless. Everything is keyed on
+  normalised strings.
+* **`terminalCode` is not `id`** — the office is code `"1001"` and id `1003`, and
+  its PODs run codes 100–331. The root is resolved by CODE (a human can look that
+  up), then the walk and the load comparison both use `id`.
+
+`terminalId` on `/load/search` is a real server-side filter but matches **one**
+terminal exactly. `terminalId=1003,1078` returns the same rows as `1003` alone, so
+covering an office means one request per terminal.
+
+### Pagination
+
+`/load/search` and `/terminal/search` page at **200 rows** and report
+`{"pagination": {"totalRecords": 785, "perPage": 200, "currentPage": 0,
+"totalPages": 4}}`. The live posted board runs to ~785, so reading page 0 only
+truncated it to a quarter.
+
+**`page` is the parameter, and the only spelling this API honours.**
+`currentPage`, `pageNumber`, `pageNo`, `offset`, `start` and `skip` were each
+tried against the live tenant and every one is silently IGNORED — the response is
+page 0 again. A paginator built on any of them never terminates. `perPage` is
+ignored too (50, 200 and 500 all answer 200), so page size is read off the
+response rather than chosen.
+
+`client._paginate` handles it, with four independent stops: an empty page, a
+`currentPage` that doesn't match what was asked, a page containing nothing not
+already yielded, and a `max_pages` backstop
+(`TRANSPORT_PRO_MAX_SEARCH_PAGES`, default 10). Records are deduplicated by
+`id`/`load_id` across pages, which is also correct for a board that MOVES while
+being read — `totalRecords` was observed going 826 → 787 → 785 across three
+requests minutes apart.
+
+`iter_search_loads` is a generator so the later pages are never fetched when the
+caller has enough: `open_loads` wants five loads and stops, costing one request.
+`search_loads` is the eager form. Scoping by terminal also brings each request
+inside one page, so an office-scoped deployment pays nothing for this.
 
 ---
 
@@ -277,13 +347,38 @@ endpoint, so `add_carrier_email` returns False and the agent never claims to hav
 saved one. New addresses are captured in the call note and in the posted offer,
 which is where a rep will look.
 
-### Booking is recorded before it is announced
+### Booking is a link, not a write
 
-`make_offer` is what "booked" means through this API — there is no separate book
-endpoint. If that write fails, **nobody is told they're booked**; the call goes to
-a rep with the rate and address already in the note. A carrier who hears "you're
-booked" and has no load against their name shows up at a shipper for freight that
-isn't theirs.
+There **is** a booking step beyond `make_offer`, contrary to what this document
+and the code both said until it was checked against the CircleConnect email agent.
+It is three steps across two APIs, and the order matters:
+
+```
+POST /offer          -> offer_id       the rate is now on the record
+accept_offer         -> book_now_url   the carrier can now sign
+carrier opens link   -> booked         the load is finally theirs
+```
+
+`make_offer` alone **logs a rate for a rep to action**. Nothing it returns can be
+given to a carrier, and a call that ends there has not booked anything. That is
+still the fallback path when no HappyRobot credentials are configured, and the
+worker says so at startup.
+
+The CONFIRM_EMAIL state picks between the two at runtime
+(`_can_issue_booking_link`). When the link path is configured but fails, the call
+goes to a rep and **does not** fall back to `make_offer`: `POST /offer` may
+already have landed, and a second offer against the same load is how a lane gets
+double-sold. The note records which of the two happened.
+
+The load is not the carrier's until they open the link and sign, which is why the
+agent says *"open it and sign to lock it in"* and never *"you're booked"*. A
+carrier told they are booked, who then loses the load because they took an hour
+over the link, was told something false by us.
+
+If any step fails, **nobody is told they're booked**; the call goes to a rep with
+the rate and address already in the note. The log distinguishes the cases, because
+"the offer exists but has no link" and "nothing was recorded" need different
+things from whoever reads it — the first is finishable by hand, the second is not.
 
 ---
 

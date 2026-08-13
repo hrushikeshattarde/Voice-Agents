@@ -26,6 +26,7 @@ from tests.transportpro_payloads import (
     CARRIER_STATUS_SUSPENDED_ENVELOPED,
     CARRIER_STATUS_UNKNOWN_WORD,
     CONTACT_SEARCH,
+    CONTACT_SEARCH_LIVE,
     LOAD_DETAIL_BOOKABLE,
     LOAD_DETAIL_UNPOSTED,
     LOAD_DETAIL_WAYPOINTS,
@@ -135,10 +136,15 @@ def test_a_cap_below_the_anchor_never_produces_an_inverted_range():
     assert load.is_quotable
 
 
-def test_a_cap_with_no_anchor_anchors_at_the_cap():
+def test_a_cap_with_no_anchor_is_not_quotable():
+    """A Max Buy is not an anchor. Opening at the cap is the worst opening there
+    is — the carrier simply accepts it and the desk has paid its maximum with no
+    chance of having done better — so this goes to a rep, like a load with no
+    rates at all. Three loads on the live board are in this state."""
     load = _load(carrier_sales_data={"load_board_rate": None, "max_buy": 1800})
-    assert load.open_rate == 1800 and load.ceiling_rate == 1800
-    assert load.is_quotable
+    assert load.ceiling_rate == 1800     # the cap is still known and still binding
+    assert load.open_rate == 0
+    assert not load.is_quotable
 
 
 def test_rates_typed_as_strings_still_parse():
@@ -580,6 +586,106 @@ def test_contact_search_addresses_are_lowercased_and_deduplicated():
                       "billing@blueskylogistics.com")
 
 
+def test_the_live_nested_email_contacts_shape_is_found():
+    """`emailContacts: [{"type": "MAIN", "value": "..."}]` — the real shape. A
+    field-name match found the list and stopped there, so the booking gate saw no
+    addresses for any live carrier and no call could ever be confirmed."""
+    emails = contact_emails(CONTACT_SEARCH_LIVE["results"])
+    assert emails == ("johnsontrucking@tds.net", "james@johnsontruckingtn.com")
+
+
+def test_an_address_is_matched_by_shape_not_by_field_name():
+    """Whatever the API calls the field, an @-shaped string in a contact record is
+    an address. This is what keeps the gate working through a rename."""
+    for record in (
+        {"emailContacts": [{"type": "MAIN", "value": "a@b.com"}]},
+        {"email": "a@b.com"},
+        {"contactMethods": [{"kind": "EMAIL", "detail": "a@b.com"}]},
+        {"primary": {"addresses": {"work": "A@B.COM"}}},
+        {"notes": "reach dispatch at a@b.com any time"},
+    ):
+        assert contact_emails([record]) == ("a@b.com",), record
+
+
+def test_phone_numbers_are_not_mistaken_for_addresses():
+    """`phoneNumbers` uses the same `{type, value}` shape as `emailContacts`, so
+    the two are only told apart by what the value looks like."""
+    record = {
+        "phoneNumbers": [{"type": "OFFICE", "value": "6157937833"}],
+        "emailContacts": [{"type": "MAIN", "value": "dispatch@carrier.com"}],
+    }
+    assert contact_emails([record]) == ("dispatch@carrier.com",)
+
+
 def test_contacts_with_no_address_contribute_nothing():
     assert contact_emails([{"name": "No Email", "phone": "615-555-0100"}]) == ()
     assert contact_emails([]) == ()
+
+
+# --------------------------------------------------------------------------- #
+# Carrier qualifications a load demands
+#
+# Every shape below was observed on the live tenant on 2026-08-12, across the 200
+# posted loads in the next-7-days window. `requiredClassifications` was populated
+# on 19 of them and `commodityValue` on 4, so the null case is the common one and
+# has to mean "nothing extra required" rather than "we couldn't tell".
+# --------------------------------------------------------------------------- #
+def test_required_classifications_are_read_off_the_reference_object():
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["reference"]["requiredClassifications"] = ["Temperature Controlled"]
+    load = map_load(record, posted=True)
+    assert load.required_classifications == ("Temperature Controlled",)
+
+
+def test_a_doubled_classification_is_deduplicated():
+    """The live feed really does answer `["Critical Cargo", "Critical Cargo"]` —
+    loads 2487956, 2487957 and 2518880 all did. A doubled entry would make any
+    count-based check wrong."""
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["reference"]["requiredClassifications"] = ["Critical Cargo", "Critical Cargo"]
+    assert map_load(record, posted=True).required_classifications == ("Critical Cargo",)
+
+
+def test_the_voice_ai_feeds_spelling_is_also_read():
+    """The load endpoints say `requiredClassifications`; the Voice AI feed says
+    `required_carrier_classifications`. Reading only one turns a gated load into
+    an ungated one."""
+    record = copy.deepcopy(RECORD)
+    record["reference"] = {"required_carrier_classifications": ["Critical Cargo"]}
+    assert map_load(record, posted=True).required_classifications == ("Critical Cargo",)
+
+
+def test_no_classifications_means_nothing_extra_is_required():
+    """Null on ~90% of the live board, so this is the ordinary case."""
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["reference"]["requiredClassifications"] = None
+    assert map_load(record, posted=True).required_classifications == ()
+    del record["reference"]["requiredClassifications"]
+    assert map_load(record, posted=True).required_classifications == ()
+
+
+def test_qualifications_never_reach_what_the_carrier_is_told():
+    """These gate the call; they are not facts about the freight. Reciting the
+    classifications a carrier must hold tells them which answer to give, and
+    reading the load's declared value invites a different conversation."""
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["reference"]["requiredClassifications"] = ["Critical Cargo"]
+    record["reference"]["commodityValue"] = 250000
+    spoken = map_load(record, posted=True).facts()
+    assert "Critical Cargo" not in spoken
+    assert "250000" not in spoken
+    assert "250,000" not in spoken
+
+
+def test_commodity_value_parses_and_zero_means_not_filled_in():
+    record = copy.deepcopy(LOAD_DETAIL_BOOKABLE)
+    record["reference"]["commodityValue"] = 250000
+    assert map_load(record, posted=True).commodity_value == 250000.0
+    # Strings and thousands separators both appear in this feed.
+    record["reference"]["commodityValue"] = "1,250,000"
+    assert map_load(record, posted=True).commodity_value == 1250000.0
+    # A declared value of 0 is "nobody filled this in". Treating it as a real $0
+    # would make every carrier's insurance limit look sufficient.
+    for blank in (0, "0", None, False, ""):
+        record["reference"]["commodityValue"] = blank
+        assert map_load(record, posted=True).commodity_value is None, blank

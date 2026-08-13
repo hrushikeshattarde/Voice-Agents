@@ -470,6 +470,50 @@ _REFERENCE_ONLY_RE = re.compile(
 )
 
 
+# A sentence whose content after the colon is an IDENTIFIER rather than prose:
+# "PRO: 9003713875", "SCAC: CLNC", "EDISenderId: GPIAMERICASEZV", "Load Mode: TL".
+# Detected by the absence of any ordinary lowercase word after a colon, which is
+# what separates EDI plumbing from a real instruction like "Detention: paid at
+# thirty an hour". Load 2513446's delivery stop is nine of these in a row, and read
+# aloud they were 40% of everything the agent said about that load.
+_PROSE_AFTER_COLON_RE = re.compile(r":.*\b[a-z]{3,}\b")
+
+
+def _is_reference_metadata(sentence: str) -> bool:
+    return ":" in sentence and not _PROSE_AFTER_COLON_RE.search(sentence)
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|(?<=\.)(?=[A-Z])", text)
+            if s.strip()]
+
+
+def _tidy_note_body(text: str) -> str:
+    """Drop reference metadata, then drop sentences we have already said.
+
+    Both matter because the same instructions arrive from more than one place. The
+    load's own notes and the shipper's Instructions/Directions field overlap almost
+    entirely on the live tenant — "Must check in as Circle Logistics" appears in
+    both, one with a full stop and one without — and every repeat is a sentence
+    spoken twice down a phone.
+
+    Comparison is on the folded text (lowercase, punctuation stripped) so a
+    trailing full stop does not defeat it, which is exactly how the duplicate
+    survived the block-level check in `_notes`.
+    """
+    kept: list[str] = []
+    seen: set[str] = set()
+    for sentence in _sentences(text):
+        if _is_reference_metadata(sentence):
+            continue
+        folded = " ".join(re.sub(r"[^a-z0-9 ]", " ", sentence.lower()).split())
+        if not folded or folded in seen:
+            continue
+        seen.add(folded)
+        kept.append(sentence.rstrip(". "))
+    return ". ".join(kept)
+
+
 def _clean_note(raw: Any) -> str | None:
     """A notes field -> something speakable, or None if nothing survives."""
     text = _text(raw)
@@ -487,7 +531,11 @@ def _clean_note(raw: Any) -> str | None:
         return None
     if _REFERENCE_ONLY_RE.match(text):
         return None
-    return text
+    # Deduplicate and strip reference plumbing SENTENCE by sentence. The check
+    # above only catches a note that is nothing but a reference number; a stop
+    # whose note is nine of them in a row got through it intact.
+    text = _tidy_note_body(text)
+    return text or None
 
 
 def _load_status_text(record: dict) -> str:
@@ -554,10 +602,27 @@ def _notes(record: dict, shipment: dict, pickup: dict | None,
     whether they can comply with a BOL number is nonsense.
     """
     found: list[str] = []
+    said: set[str] = set()
 
     def add(text: str | None) -> None:
-        if text and text not in found:
-            found.append(text)
+        """Append a note, minus any sentence an earlier note already covered.
+
+        Cross-source deduplication, which is where most of the length came from:
+        the board comment, the load notes and the shipper's own instructions are
+        largely the same sentences in a different order.
+        """
+        if not text:
+            return
+        fresh = []
+        for sentence in _sentences(text):
+            folded = " ".join(
+                re.sub(r"[^a-z0-9 ]", " ", sentence.lower()).split())
+            if not folded or folded in said:
+                continue
+            said.add(folded)
+            fresh.append(sentence.rstrip(". "))
+        if fresh:
+            found.append(". ".join(fresh))
 
     # Board comments: the Voice AI feed's `sales_notes`, the load endpoints'
     # `postingInfo.comments`.
@@ -579,6 +644,61 @@ def _notes(record: dict, shipment: dict, pickup: dict | None,
             add(f"{label}: {text}")
 
     return " ".join(found) or None
+
+
+# Where each feed spells the carrier qualifications a load demands. The load
+# endpoints use `reference.requiredClassifications`; the Voice AI feed uses
+# `reference.required_carrier_classifications`.
+_REQUIRED_CLASSIFICATION_KEYS = ("requiredclassifications",
+                                 "requiredcarrierclassifications")
+
+
+def _required_classifications(*holders: Any) -> tuple[str, ...]:
+    """Qualifications the carrier must hold, from whichever feed answered.
+
+    Deduplicated while keeping first-seen order: this tenant really does return
+    `["Critical Cargo", "Critical Cargo"]` (load 2487956 among others), and a
+    doubled entry would make any "how many requirements" check wrong.
+
+    Read straight off the `reference` object rather than through `_references`,
+    which drops list values on purpose — everything that goes through there can
+    end up spoken, and a list of qualifications must never be read to a caller.
+    """
+    found: list[str] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        reference = holder.get("reference")
+        if not isinstance(reference, dict):
+            continue
+        for key, raw in reference.items():
+            if _norm(key) not in _REQUIRED_CLASSIFICATION_KEYS:
+                continue
+            # A single classification may arrive bare rather than in a list.
+            values = raw if isinstance(raw, list | tuple) else [raw]
+            for value in values:
+                if (text := _text(value)) and text not in found:
+                    found.append(text)
+    return tuple(found)
+
+
+def _commodity_value(*holders: Any) -> float | None:
+    """The load's declared freight value, or None when it doesn't declare one.
+
+    Zero is folded into None by `_number`'s callers here on purpose: a declared
+    value of 0 is "nobody filled this in", and treating it as a real $0 would
+    make every carrier's insurance limit look sufficient.
+    """
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        reference = holder.get("reference")
+        if not isinstance(reference, dict):
+            continue
+        for key, raw in reference.items():
+            if _norm(key) == "commodityvalue" and (value := _number(raw)):
+                return value
+    return None
 
 
 def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
@@ -637,10 +757,18 @@ def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
     max_buy = (_number(rates.get("max_buy"))
                or _number(posting.get("maxBuy"))
                or _number(posting.get("max_buy")))
+    # A Max Buy with no Load Board Rate is NOT an anchor. Opening at the cap is
+    # the one number the agent must never say first: the carrier accepts it, and
+    # the desk has paid its own maximum with no room to have done better. It is
+    # strictly worse than not quoting, so the load goes to a rep exactly like one
+    # with no rates at all. (Observed live: a handful of loads on the board sit in
+    # this state, one of them at $8300.)
     if floor is None and max_buy is not None:
-        # No anchor published but a cap is: anchor at the cap so the agent can
-        # still work the load without ever exceeding what it's allowed to pay.
-        floor = max_buy
+        logger.warning(
+            "Transport Pro load %s publishes a Max Buy of %s but no Load Board "
+            "Rate. There is no anchor to open at — opening at the cap would spend "
+            "the whole range on the first sentence — so it will go to a rep.",
+            load_id, max_buy)
     open_rate = floor or 0.0
     # A cap below the anchor would let the engine build an inverted range.
     ceiling_rate = max(max_buy, open_rate) if max_buy is not None else open_rate
@@ -706,7 +834,53 @@ def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
         pickup_window=pickup_window,
         delivery_date=delivery_date,
         delivery_window=delivery_window,
+        # Gate inputs, not spoken facts — see the fields' comments on `Load`.
+        required_classifications=_required_classifications(record, shipment),
+        commodity_value=_commodity_value(record, shipment),
+        terminal_id=_terminal_id(record, shipment),
+        origin_lat=_coordinate(pickup, "latitude"),
+        origin_lon=_coordinate(pickup, "longitude"),
     )
+
+
+def _coordinate(waypoint: Any, key: str) -> float | None:
+    """`waypoints[n].location.latitude` — a real number, or None.
+
+    Zero is rejected along with the usual absences. A stop at exactly 0°N 0°E is
+    in the Atlantic off Ghana, so a zero here is a placeholder, and treating it as
+    a position would put every such load a few thousand miles from the caller.
+    """
+    if not isinstance(waypoint, dict):
+        return None
+    location = waypoint.get("location")
+    source = location if isinstance(location, dict) else waypoint
+    value = _number(source.get(key))
+    return value if value else None
+
+
+def _terminal_id(*holders: Any) -> str | None:
+    """Which terminal owns this load, as a string.
+
+    `assignedTerminal` holds the terminal's integer **id** — 1003 is Fort Wayne
+    Office, 1078 is one of its PODs — NOT its `terminalCode`. Confirmed against
+    live data on both `/load/search` and `/load/{id}`.
+
+    Normalised to a string because the terminal tree types the same identifier
+    both ways (`{"id": 1058, "parentTerminalId": "1003"}`), and comparing an int
+    against a str silently matches nothing.
+    """
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        for key in ("assignedTerminal", "assigned_terminal", "terminalId"):
+            if (value := _value(holder.get(key))) is not None:
+                text = str(value).strip()
+                if text and text != "0":
+                    return text
+        nested = holder.get("terminal")
+        if isinstance(nested, dict) and (value := _value(nested.get("id"))):
+            return str(value).strip()
+    return None
 
 
 def _temperature(raw: Any) -> str | None:
@@ -771,26 +945,39 @@ def _authority(flat: dict[str, Any]) -> tuple[AuthorityStatus, str | None]:
     return AuthorityStatus(text), text
 
 
-def _emails(record: dict) -> tuple[str, ...]:
-    """Every address the carrier record itself carries, in order, deduplicated."""
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def _emails(record: Any) -> tuple[str, ...]:
+    """Every address anywhere in a record, in order, lowercased, deduplicated.
+
+    Matched by SHAPE, not by field name. The live `/contact/search` returns them
+    as `emailContacts: [{"type": "MAIN", "value": "..."}]` — a list under an
+    email-ish key, holding objects whose address sits under a neutral `value`.
+    Keying on the field name matched `emailContacts`, found a list where it wanted
+    a string, and stopped: the booking gate then saw no addresses for any live
+    carrier, and no call could ever reach a confirmed booking. Any `@`-shaped
+    string in a contact record is an address, so that is what this looks for —
+    and it survives whatever the API renames the field to next.
+    """
     found: list[str] = []
 
-    def collect(node: Any, level: int = 0) -> None:
-        if level > 3:
+    def walk(node: Any, level: int = 0) -> None:
+        if level > 6:
             return
         if isinstance(node, dict):
-            for key, raw in node.items():
-                if "email" in _norm(key) and (text := _text(raw)):
-                    address = text.lower()
-                    if "@" in address and address not in found:
-                        found.append(address)
-                elif isinstance(raw, dict | list):
-                    collect(raw, level + 1)
-        elif isinstance(node, list):
-            for item in node[:20]:
-                collect(item, level + 1)
+            for value in node.values():
+                walk(value, level + 1)
+        elif isinstance(node, list | tuple):
+            for item in node[:200]:
+                walk(item, level + 1)
+        elif isinstance(node, str):
+            for match in _EMAIL_RE.findall(node):
+                address = match.strip().lower()
+                if address not in found:
+                    found.append(address)
 
-    collect(record)
+    walk(record)
     return tuple(found)
 
 

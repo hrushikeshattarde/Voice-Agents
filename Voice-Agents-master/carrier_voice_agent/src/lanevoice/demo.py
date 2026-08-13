@@ -85,22 +85,25 @@ def _build_composer(settings):
     one you got matters a great deal to what you're about to read. Say so plainly
     rather than letting the difference show up as a mystery handoff.
     """
-    from lanevoice.voice import StubComposer
+    from lanevoice.voice import StubComposer, build_composer
 
+    reason = None
     if not settings.use_llm:
-        print("[composer: offline stub — USE_LLM=false. Turns below are the agent's "
+        reason = "USE_LLM=false"
+    elif not settings.llm_api_key:
+        reason = f"no {settings.llm_key_name} set"
+    if reason:
+        print(f"[composer: offline stub — {reason}. Turns below are the agent's "
               "INTENT, not speech.]")
         return StubComposer(settings)
-    if not settings.groq_api_key:
-        print("[composer: offline stub — no GROQ_API_KEY set. Turns below are the "
-              "agent's INTENT, not speech.]")
-        return StubComposer(settings)
     try:
-        from lanevoice.voice import GroqComposer
-        return GroqComposer(settings)
+        composer = build_composer(settings)
+        print(f"[composer: {settings.llm_provider} / {settings.resolved_llm_model}]")
+        return composer
     except Exception as exc:  # noqa: BLE001
-        print(f"[composer: offline stub — could not start the Groq composer ({exc}). "
-              "Turns below are the agent's INTENT, not speech.]")
+        print(f"[composer: offline stub — could not start the "
+              f"{settings.llm_provider} composer ({exc}). Turns below are the "
+              "agent's INTENT, not speech.]")
         return StubComposer(settings)
 
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -180,12 +181,18 @@ class TransportProClient:
         *,
         params: dict | None = None,
         data: dict | None = None,
+        json: dict | None = None,
     ) -> Any:
         """One authenticated call, with a single retry for 401s and blips.
 
         Retries are capped at one extra attempt on purpose. This runs while a
         carrier is holding the line, so a second and third round trip against a
         struggling endpoint costs more (in dead air) than it can possibly win.
+
+        `data` is form-encoded and stringifies every value, which is what the
+        `/voiceai/*` writes want. `json` is passed through with its types intact
+        for `POST /offer`, which needs real ints — it rejects `"loadId": "2520571"`
+        where it accepts `2520571`. Pass one or the other, never both.
         """
         params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
         body = {k: str(v) for k, v in (data or {}).items() if v not in (None, "")}
@@ -202,6 +209,7 @@ class TransportProClient:
                     # collection; httpx's `data=` gives urlencoded form, which
                     # these endpoints accept and which keeps bodies loggable.
                     data=body or None,
+                    json=json,
                     headers={"Authorization": f"Bearer {token}"},
                 )
             except httpx.HTTPError as exc:
@@ -236,6 +244,121 @@ class TransportProClient:
             f"{method} {path} failed after 2 attempts: {last_error}"
         ) from last_error
 
+    # -- pagination --------------------------------------------------------- #
+    #
+    # The search endpoints answer `{"pagination": {"totalRecords": 787, "perPage":
+    # 200, "currentPage": 0, "totalPages": 4}, "results": [...]}` and cap a page at
+    # 200 rows. Reading only the first page silently truncated the board.
+    #
+    # `page` is the parameter, and it is the ONLY spelling this API honours —
+    # `currentPage`, `pageNumber`, `pageNo`, `offset`, `start` and `skip` were all
+    # measured against the live tenant and every one of them is IGNORED, returning
+    # page 0 again. That is why the guards below exist: a paginator built on an
+    # ignored parameter loops forever, yielding the same 200 rows.
+    #
+    # `perPage` is ignored too — 50, 200 and 500 all come back as 200 — so page
+    # size is not ours to choose.
+    def _paginate(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        max_pages: int = 10,
+    ) -> Iterator[dict]:
+        """Yield records across pages, lazily.
+
+        A GENERATOR on purpose. `open_loads` needs five loads, not the whole
+        board, and laziness means a satisfied caller simply stops iterating — no
+        page is fetched to answer a question nobody asked. Materialise it with
+        `list()` when you really do want everything.
+
+        Four independent stops, because the failure mode is an infinite loop
+        while a carrier is on the line:
+
+          1. an empty page
+          2. the response's own `currentPage` not matching what we asked for —
+             the direct signal that `page` was ignored
+          3. a page containing no records we have not already yielded — the
+             backstop for a response that reports no pagination at all
+          4. `max_pages`, which no legitimate board should ever reach
+
+        Deduplicated by `id` / `load_id` across pages, which is also right for a
+        moving board: `totalRecords` was observed dropping from 826 to 787 between
+        two requests, so records genuinely shift across page boundaries while we
+        read them.
+        """
+        base = dict(params or {})
+        seen: set[str] = set()
+        per_page: int | None = None
+        page = 0
+
+        while page < max_pages:
+            payload = self._request("GET", path, params={**base, "page": page})
+            records = _records(payload)
+            if not records:
+                return
+            pagination = payload.get("pagination") if isinstance(payload, dict) else None
+            pagination = pagination if isinstance(pagination, dict) else {}
+
+            reported = pagination.get("currentPage")
+            if page and reported is not None:
+                try:
+                    if int(reported) != page:
+                        logger.error(
+                            "%s ignored page=%d and answered with page %s — refusing "
+                            "to keep asking. Some of the board was not read.",
+                            path, page, reported)
+                        return
+                except (TypeError, ValueError):
+                    pass
+
+            fresh = []
+            for record in records:
+                key = str(record.get("id") or record.get("load_id") or "").strip()
+                if key:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                fresh.append(record)
+            if not fresh:
+                logger.warning(
+                    "%s page=%d returned nothing new — treating the board as fully "
+                    "read rather than looping.", path, page)
+                return
+            yield from fresh
+
+            # No pagination envelope at all means the response is not paginated —
+            # a bare object or a bare array, both of which this API also returns.
+            # Asking for page 1 would be a wasted round trip whose only possible
+            # answer is the same rows again.
+            if not pagination:
+                return
+
+            # A short page is the last page. Checked before `totalPages` because it
+            # only needs the row count, and it saves a wasted round trip whenever
+            # everything fitted on page 0.
+            if per_page is None:
+                try:
+                    per_page = int(pagination.get("perPage") or 0)
+                except (TypeError, ValueError):
+                    per_page = 0
+            if per_page <= 0 or len(records) < per_page:
+                return
+
+            total_pages = pagination.get("totalPages")
+            if total_pages is not None:
+                try:
+                    if page + 1 >= int(total_pages):
+                        return
+                except (TypeError, ValueError):
+                    pass
+            page += 1
+        else:
+            logger.error(
+                "%s hit the %d-page cap and may be truncated. Raise "
+                "TRANSPORT_PRO_MAX_SEARCH_PAGES, or narrow the search.",
+                path, max_pages)
+
     # -- Voice AI: carrier vetting ------------------------------------------ #
     def carrier_status(
         self, *, mc_number: str | None = None, dot_number: str | None = None
@@ -266,7 +389,7 @@ class TransportProClient:
         """
         return _first_record(self._request("GET", f"/load/{load_id}"))
 
-    def search_loads(
+    def iter_search_loads(
         self,
         *,
         pickup_date_start: str | None = None,
@@ -274,16 +397,26 @@ class TransportProClient:
         load_status: str | None = None,
         is_posted: bool | None = None,
         equipment_type: str | None = None,
-    ) -> list[dict]:
-        """`GET /load/search` — the board, filtered.
+        terminal_id: str | int | None = None,
+        max_pages: int = 10,
+    ) -> Iterator[dict]:
+        """`GET /load/search` — the board, filtered, across every page.
 
-        `loadStatus` and `isPosted` are real filters here, so the desk's two
-        conditions are applied server-side rather than only checked on the way
-        back. They are still re-checked on each record: a search endpoint that
+        `loadStatus`, `isPosted` and `terminalId` are real filters here, so the
+        desk's conditions are applied server-side rather than only checked on the
+        way back. They are still re-checked on each record: a search endpoint that
         doesn't recognise a filter tends to ignore it rather than reject it.
+
+        `terminalId` takes ONE id and matches it exactly — it does not walk the
+        terminal tree, and a comma-separated list is not honoured (`1003,1078`
+        returns the same rows as `1003`). Covering an office therefore means one
+        request per terminal in its subtree; see `terminals.build_scope`.
+
+        A generator, because the board is bigger than any caller needs: 787 posted
+        loads over 4 pages when last measured, against an agent that reads out
+        five. Stop iterating and the later pages are never fetched.
         """
-        payload = self._request(
-            "GET",
+        yield from self._paginate(
             "/load/search",
             params={
                 "pickupDateStart": pickup_date_start,
@@ -291,9 +424,33 @@ class TransportProClient:
                 "loadStatus": load_status,
                 "isPosted": None if is_posted is None else str(is_posted).lower(),
                 "equipmentType": equipment_type,
+                "terminalId": terminal_id,
             },
+            max_pages=max_pages,
         )
-        return _records(payload)
+
+    def search_loads(self, **kwargs: Any) -> list[dict]:
+        """Every matching load, all pages materialised.
+
+        The eager form of `iter_search_loads`. Prefer the iterator on the call
+        path — this one pays for pages the caller may not read.
+        """
+        return list(self.iter_search_loads(**kwargs))
+
+    def terminal_search(self, *, max_pages: int = 10) -> list[dict]:
+        """`GET /terminal/search` — every terminal, flat, with parent links.
+
+        Rows look like `{"id": 1058, "parentTerminalId": "1003", "terminalCode":
+        "100", "title": "POD 1 (Ford Dedicated)", "status": "INACTIVE"}`. Mind the
+        types: `id` is an int and `parentTerminalId` is a STRING, so the tree walk
+        normalises both (see `terminals._key`).
+
+        Materialised rather than streamed: the tree is only useful whole, and it
+        fits one page today (172 rows). Paginated anyway, because an org that
+        crosses 200 terminals would otherwise lose its deepest PODs from every
+        office's scope — silently, and only for the offices at the end of the list.
+        """
+        return list(self._paginate("/terminal/search", max_pages=max_pages))
 
     def search_available_loads(
         self,
@@ -406,6 +563,73 @@ class TransportProClient:
                 "notes": notes,
             },
         )
+
+    # -- The booking link: offer -> accept -> URL ---------------------------- #
+    #
+    # This is a THREE-step relationship and the steps live on two different APIs:
+    #
+    #   1. POST /offer              (this base URL)  -> offer_id
+    #   2. accept_offer             (happyrobot.php) -> book_now_url
+    #   3. the carrier opens the URL and signs       -> actually booked
+    #
+    # `make_offer` above logs a rate for a rep to action later. It is NOT a
+    # booking, and nothing it returns can be given to a carrier. Only step 2
+    # produces a link, and the load is not theirs until step 3 — which is why the
+    # agent must never tell a caller they are booked on the strength of step 1.
+    def create_offer(
+        self,
+        load_id: str,
+        *,
+        carrier_name: str,
+        offer_amount: float | int,
+        mc_number: str | None = None,
+        carrier_id: str | None = None,
+        contact_name: str | None = None,
+        email: str | None = None,
+        phone: str | None = None,
+        comments: str | None = None,
+        record_as_user_id: int | None = None,
+    ) -> str | None:
+        """`POST /offer` -> the new offer's id, or None if it didn't land.
+
+        JSON, not form-encoded, and typed: this endpoint wants `loadId` as an int
+        and `amount` as an int, unlike the Voice AI writes above.
+
+        Blank required strings are rejected outright, so an absent contact name or
+        phone is sent as "." — a placeholder the desk already recognises from the
+        email agent. Sending nothing instead fails the whole call with a code that
+        does not say which field was empty.
+        """
+        body: dict[str, Any] = {
+            "loadId": int(str(load_id).strip()),
+            "carrierName": (carrier_name or "").strip() or ".",
+            "contactName": (contact_name or carrier_name or "").strip() or "Dispatcher",
+            "phone": (phone or "").strip() or ".",
+            "email": (email or "").strip() or ".",
+            "amount": int(round(float(offer_amount))),
+            "mcNumber": str(mc_number or ""),
+            "comments": comments or "",
+        }
+        if carrier_id:
+            try:
+                body["brokerCarrierId"] = int(str(carrier_id).strip())
+            except (TypeError, ValueError):
+                logger.warning("Transport Pro carrier id %r is not an int; omitting "
+                               "brokerCarrierId from the offer.", carrier_id)
+        if record_as_user_id:
+            body["recordAsUserId"] = int(record_as_user_id)
+
+        payload = self._request("POST", "/offer", json=body)
+        if not isinstance(payload, dict):
+            return None
+        # `{"STATUS": "SUCCESS", "result": {"id": 123}}`
+        if str(payload.get("STATUS") or "").upper() != "SUCCESS":
+            logger.error("Transport Pro POST /offer did not succeed: %s",
+                         str(payload)[:300])
+            return None
+        result = payload.get("result")
+        offer_id = result.get("id") if isinstance(result, dict) else None
+        return str(offer_id) if offer_id else None
 
     # -- Contacts: the addresses on a carrier's file ------------------------ #
     def carrier_contacts(self, carrier_id: str) -> list[dict]:

@@ -266,7 +266,10 @@ uv run python -c "import sqlite3; c=sqlite3.connect('carrier_agent.db'); c.row_f
 ```
 
 ## If the agent keeps saying "I didn't catch a load ID"
-Groq's `whisper-large-v3-turbo` is accurate, but spoken digits over phone audio
-can still slip. Say it slowly — **"load L, one, zero, zero, one."** If a specific
-number is consistently misheard, tell me and I'll add digit-biasing + a read-back
-confirmation step.
+`openai/whisper-large-v3` is accurate, but spoken digits over phone audio can
+still slip — and note that OpenRouter documents the transcription `prompt` field
+as accepted and **ignored**, so the freight vocabulary in `STT_PROMPT` is not
+biasing the model today. Say it slowly — **"load L, one, zero, zero, one."** The
+agent already reads the number back digit by digit to confirm, and
+`parsing.digit_readings` reconstructs a number a caller was cut off mid-way
+through.

@@ -16,11 +16,15 @@ from lanevoice.integrations.transportpro import (
     TransportProClient,
     TransportProRepository,
 )
+from lanevoice.integrations.transportpro.happyrobot import HappyRobotClient
 from lanevoice.settings import get_settings
 
 BASE = "https://api.example.test/publicapi"
 USERNAME = "apiuser"
 PASSWORD = "secret"
+# Same host as BASE, different path — as it is on the real tenant. The fake routes
+# on the URL's path, so one transport serves both APIs.
+HAPPYROBOT_URL = "https://api.example.test/svc/happyrobot.php"
 
 
 def settings(**overrides):
@@ -120,7 +124,17 @@ def client(fake, **overrides):
 
 
 def repository(fake, audit, **overrides):
-    """A `TransportProRepository` over the fake, with a real SQLite audit trail."""
+    """A `TransportProRepository` over the fake, with a real SQLite audit trail.
+
+    The HappyRobot client is attached only when the overrides configure it, which
+    keeps the default path (log an offer, no booking link) exactly as it was. Pass
+    `happyrobot_url=HAPPYROBOT_URL, happyrobot_token="hr-token"` to exercise the
+    link path; the same fake serves it, since it routes on the URL's path.
+    """
     config = settings(**overrides)
+    happyrobot = None
+    if config.uses_happyrobot:
+        happyrobot = HappyRobotClient(config, transport=fake.transport())
     return TransportProRepository(
-        TransportProClient(config, transport=fake.transport()), audit, config)
+        TransportProClient(config, transport=fake.transport()), audit, config,
+        happyrobot=happyrobot)

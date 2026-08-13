@@ -1,14 +1,17 @@
 [project]
 name = "lanevoice"
 version = "0.1.0"
-description = "In-house carrier-sales voice AI agent (LiveKit SIP + Groq STT/LLM/TTS)"
+description = "In-house carrier-sales voice AI agent (LiveKit SIP + OpenRouter STT/LLM/TTS)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "groq>=0.11.0",
-    "httpx>=0.27",              # Transport Pro Public API client
+    "anthropic>=0.40",          # LLM_PROVIDER=anthropic (official SDK)
+    "httpx>=0.27",              # Transport Pro Public API client; OpenRouter TTS
+    "openai>=1.40",             # LLM_PROVIDER=openrouter (OpenAI-compatible gateway)
     "livekit-agents>=1.0",
-    "livekit-plugins-groq",
+    # STT: the OpenAI plugin pointed at OpenRouter's base URL, which serves the
+    # same /audio/transcriptions shape.
+    "livekit-plugins-openai",
     "livekit-plugins-noise-cancellation>=0.3.0",
     "livekit-plugins-silero",
     "num2words>=0.5.14",
@@ -39,6 +42,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lanevoice"]
+# The bundled US city table (`lanevoice/data/us_cities.csv.gz`) is what lets the
+# agent tell a carrier roughly how far their truck is from the pickup without a
+# geocoding call. Named explicitly so a packaging change can't silently drop it —
+# the symptom would be the agent quietly never mentioning distance again, with no
+# error anywhere. `tests/test_geo.py` asserts it loads.
+artifacts = ["src/lanevoice/data/*.csv.gz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

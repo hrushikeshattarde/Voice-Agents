@@ -3,6 +3,10 @@
 __pycache__/
 *.py[cod]
 carrier_agent.db
+carrier_agent.db-journal
+
+# Audio written by tools/audition_voices.py when comparing TTS voices.
+voice-samples/
 
 # build / packaging
 build/

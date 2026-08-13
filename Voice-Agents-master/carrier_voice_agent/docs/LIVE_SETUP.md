@@ -77,8 +77,8 @@ puts it in a `call-…` room → your worker answers.
 ```bash
 uv sync
 ```
-No local ML models — STT/LLM/TTS all run on Groq, so there's nothing heavy to
-download and no GPU needed.
+No local ML models — STT/LLM/TTS all run on OpenRouter, so there's nothing heavy
+to download and no GPU needed.
 
 ### C2. Initialize the database once
 ```bash
@@ -112,11 +112,15 @@ Watch the terminal for the live transcript; the call is logged to `carrier_agent
 - [ ] Dial the number → agent answers
 
 ## If the call connects but the agent is silent / errors
-- **Silent / TTS error:** the old `playai-tts` model was shut down 2025-12-31.
-  Use the default `canopylabs/orpheus-v1-english`, or set another `TTS_MODEL` in `.env`.
+- **Silent / TTS error:** the worker synthesises one warm-up phrase at startup,
+  so a bad `TTS_MODEL` or a `TTS_VOICE` the model doesn't offer fails there with
+  the HTTP status in the log rather than as silence on the call. Use the default
+  `microsoft/mai-voice-2-flash` with `TTS_VOICE=en-US-Ethan:MAI-Voice-2`.
+  Do NOT leave `TTS_VOICE` empty on a model that has no stable default — fish-audio
+  picks a different speaker per request, so the agent changes voice mid-call.
 - **Dead air / no answer:** the worker isn't picking up the room — confirm it's
   running and that the dispatch rule was created (`lk sip dispatch list`).
-- **`Missing required env vars`:** fill `.env` (LiveKit + `GROQ_API_KEY`).
+- **`Missing required env vars`:** fill `.env` (LiveKit + `OPENROUTER_API_KEY`).
 
 ## Cost note
 LiveKit free tier + Twilio per-minute apply. The HF models are free. A cloud GPU

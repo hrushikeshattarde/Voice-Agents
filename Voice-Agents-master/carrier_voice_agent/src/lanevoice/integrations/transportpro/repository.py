@@ -30,6 +30,7 @@ Two deliberate degradations, both visible rather than silent:
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import threading
 import time
@@ -38,14 +39,25 @@ from typing import Any
 from lanevoice.db.repository import Repository
 from lanevoice.domain.errors import SourceUnavailable
 from lanevoice.domain.models import Carrier, Load, OfferParty, Rep
+from lanevoice.integrations.highway import mappers as highway_mappers
+from lanevoice.integrations.highway.client import HighwayClient, HighwayError
 from lanevoice.integrations.transportpro.client import (
     TransportProClient,
     TransportProError,
+)
+from lanevoice.integrations.transportpro.happyrobot import (
+    HappyRobotClient,
+    HappyRobotError,
 )
 from lanevoice.integrations.transportpro.mappers import (
     contact_emails,
     map_carrier,
     map_load,
+)
+from lanevoice.integrations.transportpro.terminals import (
+    TerminalScope,
+    TerminalScopeCache,
+    build_scope,
 )
 from lanevoice.logging_config import get_logger
 from lanevoice.settings import Settings
@@ -92,6 +104,33 @@ def _digits(value: str) -> str:
     return "".join(ch for ch in str(value) if ch.isdigit())
 
 
+@dataclasses.dataclass(frozen=True)
+class BookingAttempt:
+    """What actually happened when we tried to produce a booking link.
+
+    Two fields rather than one, because "no link" has two meanings that need
+    different things from whoever reads the call afterwards:
+
+        offer_id set, url None   the rate IS on the load; a rep finishes it by
+                                 hand, and must NOT create a second offer
+        both None                nothing was recorded; the lane is untouched
+
+    Collapsing those into a bare `None` is how a disputed booking ends up with two
+    offers against it, so the caller gets to tell them apart.
+    """
+
+    url: str | None = None
+    offer_id: str | None = None
+
+    @property
+    def link_issued(self) -> bool:
+        return bool(self.url)
+
+    @property
+    def offer_recorded(self) -> bool:
+        return bool(self.offer_id)
+
+
 class TransportProRepository:
     """Loads and carriers from Transport Pro; call audit trail in SQLite.
 
@@ -105,16 +144,87 @@ class TransportProRepository:
         client: TransportProClient,
         audit: Repository,
         settings: Settings,
+        *,
+        highway: HighwayClient | None = None,
+        happyrobot: HappyRobotClient | None = None,
     ):
         self._client = client
         self._audit = audit
         self._settings = settings
+        # Both optional. Absent = that capability is simply off, and the agent
+        # behaves exactly as it did before it existed: no Highway means vetting
+        # runs on Transport Pro's list alone, no HappyRobot means a booking logs
+        # the rate without producing a link.
+        self._highway = highway
+        self._happyrobot = happyrobot
         self._loads = _TTLCache(settings.transport_pro_load_cache_seconds)
         self._carriers = _TTLCache(settings.transport_pro_carrier_cache_seconds)
         self._emails = _TTLCache(settings.transport_pro_carrier_cache_seconds)
         # usdot (as the rest of the system keys carriers) -> Transport Pro id,
         # so `carrier_emails` can reach `/contact/search` from a USDOT alone.
         self._carrier_ids: dict[str, str] = {}
+        # Which office's freight this deployment may sell. Resolved lazily on the
+        # first load lookup and then held for an hour — it is org structure.
+        self._terminals = TerminalScopeCache(
+            settings.transport_pro_terminal_cache_seconds)
+
+    # -- office scope ------------------------------------------------------- #
+    def _scope(self) -> TerminalScope:
+        """The terminals this deployment may sell out of.
+
+        An UNCONFIGURED scope means "no filtering" and is the default. A configured
+        one that resolves to nothing is a configuration error, logged loudly by
+        `build_scope` — and it still reads as unconfigured here, which is the safe
+        direction: the alternative is an agent that silently cannot sell anything.
+        """
+        if not self._settings.scopes_by_office:
+            return TerminalScope()
+
+        pinned = self._settings.office_terminal_ids
+        if pinned:
+            # Manual pin: no walk, no round trip. Every pinned terminal is
+            # searchable, since we have no status information without the tree.
+            return TerminalScope(ids=frozenset(pinned),
+                                 searchable=tuple(sorted(pinned)))
+
+        def resolve() -> TerminalScope:
+            try:
+                rows = self._client.terminal_search(
+                    max_pages=self._settings.transport_pro_max_search_pages)
+            except TransportProError as exc:
+                logger.error(
+                    "Could not read the terminal tree (%s), so this office's scope "
+                    "is unknown. Falling back to the WHOLE company board — set "
+                    "TRANSPORT_PRO_OFFICE_TERMINAL_IDS to pin the scope instead of "
+                    "depending on this endpoint.", exc)
+                return TerminalScope()
+            return build_scope(
+                rows,
+                root_code=self._settings.transport_pro_office_terminal_code.strip(),
+                extra_ids=self._settings.extra_terminal_ids,
+            )
+
+        return self._terminals.get(resolve)
+
+    def _in_scope(self, load: Load, scope: TerminalScope) -> bool:
+        """May this deployment sell this load?
+
+        A load with no readable terminal is OUT of scope by default: the
+        requirement is "this office's loads only", and an unreadable one must not
+        be assumed to be ours. `TRANSPORT_PRO_ALLOW_UNKNOWN_TERMINAL` inverts that
+        for the window where field names are being verified against live data.
+        """
+        if not scope.configured:
+            return True
+        if load.terminal_id is None:
+            allowed = self._settings.transport_pro_allow_unknown_terminal
+            logger.warning(
+                "Load %s carries no assignedTerminal, so which office owns it "
+                "cannot be established — treating it as %s "
+                "(TRANSPORT_PRO_ALLOW_UNKNOWN_TERMINAL=%s).",
+                load.load_id, "IN scope" if allowed else "OUT of scope", allowed)
+            return allowed
+        return scope.contains(load.terminal_id)
 
     # -- loads -------------------------------------------------------------- #
     def get_load(self, load_id: str) -> Load | None:
@@ -150,6 +260,21 @@ class TransportProRepository:
             else:
                 load = self._map(record, posted=False)
 
+        # Another office's freight is not ours to sell. Dropped to None — the same
+        # answer as a load that doesn't exist — because from this desk's point of
+        # view it isn't on their board, and the agent then offers its own loads
+        # instead. The log says what really happened, since "we don't have that
+        # load" about a load the company plainly does have is confusing to debug.
+        if load is not None:
+            scope = self._scope()
+            if not self._in_scope(load, scope):
+                logger.info(
+                    "Load %s belongs to %s, which is outside this deployment's "
+                    "office scope (%s). Treating it as not on the board.",
+                    load.load_id, scope.title(load.terminal_id),
+                    scope.title(scope.root_id))
+                load = None
+
         if load is not None and not load.is_bookable:
             logger.info(
                 "Transport Pro load %s is not sellable: status=%s, posted=%s. "
@@ -183,6 +308,13 @@ class TransportProRepository:
         Reading two hundred numbers down a phone line is not a thing a rep does,
         hence the cap — applied to the loads that PASSED, so a board full of
         unsellable ones doesn't crowd out the good ones.
+
+        When the deployment is scoped to one office this walks that office's
+        terminals, one request each, and stops as soon as the cap is met.
+        `terminalId` matches a single terminal exactly — it does not descend the
+        tree — so there is no one-request version of this. The office's own
+        terminal is tried first, then its PODs, and in practice the cap is reached
+        within the first request or two.
         """
         hit, cached = self._loads.get("__open__")
         if hit:
@@ -197,39 +329,74 @@ class TransportProRepository:
         # The desk's two conditions, applied server-side this time — and still
         # re-checked on every record by `_map`.
         wanted = sorted(self._settings.open_load_statuses)
+        status = wanted[0] if len(wanted) == 1 else None
+        cap = self._settings.transport_pro_max_offered_loads
+
+        scope = self._scope()
+        # `[None]` = one unfiltered request, the whole company board. That request
+        # sees only the first 200 rows of a board that runs to 826, which is
+        # another reason an office-scoped deployment is the better configuration.
+        targets = scope.searchable if scope.configured else (None,)
+
+        loads: list[Load] = []
+        seen, skipped, searched = set(), 0, 0
         try:
-            records = self._client.search_loads(
-                pickup_date_start=today.isoformat(),
-                pickup_date_end=horizon.isoformat(),
-                load_status=wanted[0] if len(wanted) == 1 else None,
-                is_posted=True,
-            )
+            for terminal in targets:
+                if len(loads) >= cap:
+                    break
+                searched += 1
+                # An ITERATOR, so the board's later pages are fetched only if the
+                # earlier ones didn't yield enough sellable loads. The unfiltered
+                # board runs to ~800 over 4 pages; the agent needs five.
+                records = self._client.iter_search_loads(
+                    pickup_date_start=today.isoformat(),
+                    pickup_date_end=horizon.isoformat(),
+                    load_status=status,
+                    is_posted=True,
+                    terminal_id=terminal,
+                    max_pages=self._settings.transport_pro_max_search_pages,
+                )
+                for record in records:
+                    # The search asked for posted loads, so that is the provenance
+                    # when a summary record carries no flag of its own.
+                    load = self._map(record, posted=True)
+                    if load is None or load.load_id in seen:
+                        skipped += 1
+                        continue
+                    # Re-checked per record: a filter the endpoint ignored would
+                    # otherwise put another office's freight in the agent's mouth.
+                    if not self._in_scope(load, scope):
+                        logger.warning(
+                            "Load %s came back from a terminalId=%s search but "
+                            "belongs to terminal %s — the filter was not applied. "
+                            "Dropping it.", load.load_id, terminal, load.terminal_id)
+                        skipped += 1
+                        continue
+                    if load.is_bookable and load.is_quotable:
+                        seen.add(load.load_id)
+                        loads.append(load)
+                        if len(loads) >= cap:
+                            break
+                    else:
+                        skipped += 1
         except TransportProError as exc:
             raise SourceUnavailable(f"open load search failed: {exc}") from exc
 
-        loads, skipped = [], 0
-        for record in records:
-            # The search asked for posted loads, so that is the provenance when a
-            # summary record carries no flag of its own.
-            load = self._map(record, posted=True)
-            if load is not None and load.is_bookable and load.is_quotable:
-                loads.append(load)
-                if len(loads) >= self._settings.transport_pro_max_offered_loads:
-                    break
-            else:
-                skipped += 1
         if skipped:
             logger.info(
-                "Skipped %d of %d loads on the board: not %s, posting off, or no "
-                "published rate.", skipped, len(records),
+                "Skipped %d load(s) across %d search(es): not %s, posting off, no "
+                "published rate, or out of office scope.", skipped, searched,
                 " / ".join(sorted(self._settings.open_load_statuses)) or "(none)")
-        if not loads and records:
+        if not loads:
             logger.error(
-                "None of the %d loads on the board are sellable. If they look fine "
-                "in Transport Pro, the status vocabulary probably differs from "
+                "No sellable loads found across %d search(es)%s. If the board looks "
+                "fine in Transport Pro, the status vocabulary probably differs from "
                 "TRANSPORT_PRO_OPEN_LOAD_STATUSES (%r) — run `lanevoice-tpcheck "
                 "--load <id> --raw` to see the real value.",
-                len(records), self._settings.transport_pro_open_load_statuses)
+                searched,
+                f" of {scope.title(scope.root_id)}'s terminals" if scope.configured
+                else "",
+                self._settings.transport_pro_open_load_statuses)
         self._loads.put("__open__", loads)
         return loads
 
@@ -256,6 +423,16 @@ class TransportProRepository:
             raise SourceUnavailable(
                 f"carrier lookup for {mc_or_dot} failed: {exc}") from exc
 
+        looked_up = None
+        if record is None:
+            # `/voiceai/carrier_status` does not have every carrier the desk knows
+            # about — MC 1798414 is absent from it and present, as an explicit
+            # FAIL, on the HappyRobot endpoint. Without this fallback that carrier
+            # read as "we could not capture your number", got asked twice more and
+            # was handed to a rep, when the honest answer was a decline.
+            looked_up = self._carrier_lookup_record(number)
+            record = looked_up
+
         carrier = None
         if record is not None:
             carrier = map_carrier(
@@ -263,6 +440,11 @@ class TransportProRepository:
                 insurance_reported_only=(
                     self._settings.transport_pro_require_insurance_field),
             )
+            # Enrich BEFORE caching, so the extra lookups are paid once per
+            # carrier per TTL rather than once per call. `looked_up` is handed
+            # through so the fallback's response is reused rather than fetched a
+            # second time — the same call, on the critical path, twice.
+            carrier = self._enrich_carrier(carrier, number, looked_up=looked_up)
         if carrier is not None:
             if not carrier.authority_reported:
                 logger.error(
@@ -281,6 +463,126 @@ class TransportProRepository:
         else:
             self._carriers.put(number, None)
         return carrier
+
+    def _carrier_lookup_record(self, number: str) -> dict | None:
+        """The HappyRobot record for a carrier `/voiceai/carrier_status` lacks.
+
+        Its rows carry the same fields `map_carrier` already reads — `status`,
+        `carrier_name`, `mc_number`, `us_dot_number`, `id` — so nothing special is
+        needed to map one. Crucially it carries a STATUS, including an explicit
+        `FAIL`, which is what turns an unknown caller into a definite answer.
+
+        Never raises: this is a fallback, and a carrier we cannot look up at all
+        must stay "not found" (a re-ask, then a rep) rather than becoming an error
+        mid-call.
+        """
+        if self._happyrobot is None:
+            return None
+        try:
+            record = self._happyrobot.carrier_lookup(mc=number)
+            if record is None:
+                record = self._happyrobot.carrier_lookup(dot=number)
+        except (HappyRobotError, ValueError) as exc:
+            logger.warning(
+                "HappyRobot carrier_lookup fallback failed for %s: %s", number, exc)
+            return None
+        if record is not None:
+            logger.info(
+                "Carrier %s is not on /voiceai/carrier_status but IS on the "
+                "HappyRobot endpoint as %r — using that.",
+                number, record.get("status"))
+        return record
+
+    def _enrich_carrier(self, carrier: Carrier | None, heard: str, *,
+                        looked_up: dict | None = None) -> Carrier | None:
+        """Add what `/voiceai/carrier_status` doesn't carry: qualifications.
+
+        That endpoint returns only {carrier_name, city, state, dot_number,
+        mc_number, id, status} — verified against the live tenant — so on its own
+        the agent cannot tell whether a carrier is allowed to haul a load that
+        demands Critical Cargo. Two sources fill the gap:
+
+          Highway `rules_assessment`   the AUTHORITY, pass/fail per classification
+          HappyRobot `carrier_lookup`  the list Transport Pro holds, used only
+                                       where Highway has no verdict
+
+        Costs up to two extra round trips, which is why it sits inside the cached
+        `get_carrier` (once per carrier per `TRANSPORT_PRO_CARRIER_CACHE_SECONDS`)
+        and behind shorter timeouts than the Transport Pro calls themselves.
+
+        Never raises, and never turns a found carrier into None. Both sources are
+        enrichment: unreachable, misconfigured, no record, or an unrecognised
+        shape all leave the carrier as Transport Pro described them. Letting an
+        outage in either decline live carriers would be worse than the
+        stale-classification problem they are here to fix.
+        """
+        if carrier is None:
+            return carrier
+
+        # MC first: it is what a carrier volunteers, and both APIs key on it. Fall
+        # back to the digits the caller actually read out when the record carries
+        # no MC of its own.
+        mc = _digits(carrier.mc_number or "")
+        dot = _digits(carrier.usdot_number or "")
+        updates: dict[str, object] = {}
+
+        if self._highway is not None:
+            try:
+                record = self._highway.carrier(
+                    mc=mc or None, dot=None if mc else (dot or heard))
+            except (HighwayError, ValueError) as exc:
+                logger.warning(
+                    "Highway lookup failed for MC %s / DOT %s (%s) — vetting falls "
+                    "back to Transport Pro's list.", mc or "-", dot or "-", exc)
+                record = None
+            if record is not None:
+                if assessment := highway_mappers.classifications(record):
+                    updates["highway_assessment"] = assessment
+                if overall := highway_mappers.overall_result(record):
+                    updates["highway_overall_result"] = overall
+                    if overall == "fail":
+                        logger.info(
+                            "Highway's overall verdict on MC %s is FAIL — the "
+                            "carrier does not clear its rules.", mc or dot)
+                if (limit := highway_mappers.cargo_insurance_limit(record)) is not None:
+                    updates["cargo_insurance_limit"] = limit
+                # The trading name, for the read-back. Transport Pro frequently
+                # returns a PERSON here (an owner-operator's own name) where
+                # Highway has the company, and the agent is told to confirm
+                # carriers by COMPANY name.
+                if self._settings.highway_prefer_company_name:
+                    name = highway_mappers.company_name(record)
+                    if name and name != carrier.legal_name:
+                        logger.info(
+                            "Using Highway's company name %r for MC %s (Transport "
+                            "Pro said %r) — the agent confirms by company name.",
+                            name, mc or dot, carrier.legal_name)
+                        updates["legal_name"] = name
+
+        # The classification list Transport Pro's `carrier_status` doesn't carry.
+        # Reuse the fallback's response when there is one: without this it would be
+        # the same request twice, on the critical path of a live call.
+        hr_record = looked_up
+        if hr_record is None and self._happyrobot is not None:
+            try:
+                hr_record = self._happyrobot.carrier_lookup(
+                    mc=mc or None, dot=None if mc else (dot or heard))
+            except (HappyRobotError, ValueError) as exc:
+                logger.warning("HappyRobot carrier_lookup failed for MC %s (%s) — "
+                               "Highway's verdicts stand alone.", mc or dot, exc)
+        if isinstance(hr_record, dict):
+            listed = hr_record.get("classifications")
+            if isinstance(listed, list):
+                held = tuple(dict.fromkeys(
+                    c.strip() for c in listed
+                    if isinstance(c, str) and c.strip()))
+                if held:
+                    updates["qualifications"] = held
+
+        if not updates:
+            return carrier
+        logger.debug("Enriched carrier MC %s: %s", mc or dot, sorted(updates))
+        return dataclasses.replace(carrier, **updates)
 
     def carriers_matching_digits(self, digits: str, limit: int = 5) -> list[Carrier]:
         """Not supported by this API — see the module docstring."""
@@ -345,9 +647,10 @@ class TransportProRepository:
     ) -> bool:
         """Put the agreed rate on the load as an offer. False if it didn't land.
 
-        `make_offer` is what "booked" means through this API — there is no
-        separate book endpoint — and it is also what triggers the confirmation
-        Transport Pro sends to the carrier's address.
+        This LOGS a rate for a rep to action. It is not, by itself, a booking —
+        see `booking_link`, which is what actually produces something the carrier
+        can act on. Kept as the fallback path for a deployment with no HappyRobot
+        credentials, where a logged offer is the most the agent can achieve.
         """
         if not (email or phone):
             logger.error("Not posting the offer on load %s: Transport Pro requires "
@@ -374,6 +677,127 @@ class TransportProRepository:
         except (TransportProError, ValueError) as exc:
             logger.error("Transport Pro: could not post the $%s offer on load %s "
                          "for %s: %s", int(rate), load.load_id,
+                         carrier.legal_name, exc)
+            return False
+
+    def booking_link(
+        self,
+        load: Load,
+        carrier: Carrier,
+        rate: float,
+        *,
+        email: str | None = None,
+        phone: str | None = None,
+        contact_name: str | None = None,
+        notes: str | None = None,
+    ) -> BookingAttempt:
+        """The URL the carrier opens to actually take the load.
+
+        Two writes, in this order, and the order matters:
+
+            POST /offer   -> offer_id      (the rate is now on the record)
+            accept_offer  -> book_now_url  (the carrier can now sign)
+
+        The load is NOT the carrier's until they open that link and sign. Nothing
+        here books anything — which is precisely why the link exists, and why the
+        agent must say "open it and sign to lock it in" rather than "you're
+        booked". A carrier told they are booked, who then loses the load because
+        they took an hour over the link, was told something false by us.
+
+        A `BookingAttempt` with no url means no link, for one of three reasons, and
+        `offer_recorded` is what tells them apart:
+
+          * HappyRobot isn't configured -> nothing recorded; `record_booking` is
+                                           the fallback path
+          * `POST /offer` failed        -> nothing recorded; the lane is untouched
+          * accept_offer gave no URL    -> the offer IS on the record, so a rep can
+                                           finish it — and must not duplicate it
+
+        Never raises: by the time this runs the carrier has already agreed a rate,
+        and the call must end in something coherent whatever the TMS does.
+        """
+        if self._happyrobot is None:
+            logger.info(
+                "No HappyRobot credentials, so no booking link can be produced for "
+                "load %s. Logging the offer instead — a rep finishes it.",
+                load.load_id)
+            return BookingAttempt()
+        if not (email or phone):
+            logger.error("Not creating an offer on load %s: an email or phone is "
+                         "required and we have neither.", load.load_id)
+            return BookingAttempt()
+
+        try:
+            offer_id = self._client.create_offer(
+                load.load_id,
+                carrier_name=carrier.legal_name,
+                contact_name=contact_name or carrier.legal_name,
+                offer_amount=rate,
+                mc_number=carrier.mc_number,
+                carrier_id=carrier.carrier_id,
+                email=email,
+                phone=phone,
+                comments=notes or "",
+                record_as_user_id=self._settings.transport_pro_booking_user_id,
+            )
+        except (TransportProError, ValueError) as exc:
+            logger.error("Could not create the $%s offer on load %s for %s: %s",
+                         int(rate), load.load_id, carrier.legal_name, exc)
+            return BookingAttempt()
+        if not offer_id:
+            logger.error("POST /offer returned no offer id for load %s — no link.",
+                         load.load_id)
+            return BookingAttempt()
+
+        try:
+            url = self._happyrobot.accept_offer(offer_id)
+        except (HappyRobotError, ValueError) as exc:
+            # The offer EXISTS at this point. Say so in the log, or whoever reads
+            # it will assume nothing was recorded and double-book the lane.
+            logger.error(
+                "Offer %s of $%s is recorded on load %s, but accept_offer failed "
+                "(%s) so no booking link went out. A rep can finish it from the "
+                "offer.", offer_id, int(rate), load.load_id, exc)
+            return BookingAttempt(offer_id=offer_id)
+
+        self._loads.clear()   # the load's status just moved underneath us
+        if not url:
+            return BookingAttempt(offer_id=offer_id)
+        logger.info("Booking link issued for load %s at $%s for %s (offer %s)",
+                    load.load_id, int(rate), carrier.legal_name, offer_id)
+        return BookingAttempt(url=url, offer_id=offer_id)
+
+    def invite_to_onboard(self, carrier: Carrier) -> bool:
+        """Send the Highway connect invite to a carrier who passed vetting.
+
+        Only for `AuthorityStatus.NOT_CONNECTED`. The address is taken from the
+        carrier's FILE, never from what a caller said on the phone: an unverified
+        address plus a broker-branded onboarding link is a phishing message aimed
+        at a real carrier, and refusing to trust a spoken address is the entire
+        point of the email gate.
+        """
+        if self._happyrobot is None:
+            logger.info("No HappyRobot credentials, so no Highway invite can be "
+                        "sent to %s.", carrier.legal_name)
+            return False
+        if not carrier.mc_number:
+            logger.warning("Cannot invite %s to onboard: no MC number on the "
+                           "record, and invite_carrier is keyed on MC.",
+                           carrier.legal_name)
+            return False
+
+        on_file = self.carrier_emails(carrier.usdot_number)
+        if not on_file:
+            logger.warning(
+                "Not sending a Highway invite to %s: no address on their Transport "
+                "Pro file, and an address heard on the call is exactly what must "
+                "not be trusted here.", carrier.legal_name)
+            return False
+        try:
+            return self._happyrobot.invite_carrier(
+                mc_number=carrier.mc_number, email=on_file[0])
+        except (HappyRobotError, ValueError, SourceUnavailable) as exc:
+            logger.error("Could not send the Highway invite to %s: %s",
                          carrier.legal_name, exc)
             return False
 

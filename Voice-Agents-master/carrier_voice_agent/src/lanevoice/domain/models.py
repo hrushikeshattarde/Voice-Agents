@@ -38,14 +38,26 @@ class AuthorityStatus(str, Enum):
     INACTIVE = "inactive"
     SUSPENDED = "suspended"   # suspended, revoked, out-of-service, failed vetting
     PENDING = "pending"       # onboarding not finished — a person decides
+    # Transport Pro's `PASS`: the carrier cleared the vetting RULES but has not
+    # connected with us on Highway yet, so there is no agreement to haul under.
+    # Deliberately NOT folded into ACTIVE — "passed vetting" and "cleared to
+    # book" are different claims, and reading PASS as ACTIVE means booking a
+    # carrier we have no signed relationship with. It is also the one non-active
+    # status with a specific remedy: send the Highway invite (see
+    # `CarrierVerificationService` and `VerificationResult.invite_to_onboard`).
+    NOT_CONNECTED = "not_connected"
 
     @classmethod
     def _missing_(cls, value: object) -> AuthorityStatus:
         raw = str(value).strip().lower().replace("-", " ").replace("_", " ")
         raw = " ".join(raw.split())
-        if raw in {"active", "authorized", "authorized for property", "a", "pass",
-                   "passed", "approved", "ok"}:
+        if raw in {"active", "authorized", "authorized for property", "a",
+                   "approved", "ok"}:
             return cls.ACTIVE
+        # `pass` lands here, NOT on ACTIVE — see NOT_CONNECTED above.
+        if raw in {"pass", "passed", "not connected", "not onboarded",
+                   "invited", "connect pending"}:
+            return cls.NOT_CONNECTED
         if raw in {"inactive", "not in operation", "dormant", "none", "i"}:
             return cls.INACTIVE
         if raw in {"review", "in review", "pending", "pending review", "onboarding",
@@ -64,10 +76,11 @@ class AuthorityStatus(str, Enum):
     def is_definite(self) -> bool:
         """True when the source gave a settled answer, good or bad.
 
-        PENDING is the one that isn't: the carrier is mid-onboarding, so the
-        honest response is a handoff rather than a refusal.
+        Two values aren't: PENDING (mid-review) and NOT_CONNECTED (passed the
+        rules, hasn't connected). Neither has failed anything, so the honest
+        response to both is a handoff rather than a refusal.
         """
-        return self is not AuthorityStatus.PENDING
+        return self not in (AuthorityStatus.PENDING, AuthorityStatus.NOT_CONNECTED)
 
 
 class CallOutcome(str, Enum):
@@ -133,6 +146,35 @@ class Load:
     # detail — a driver who agrees to haul ice cream without hearing "minus
     # twenty" has agreed to something else.
     temperature: str | None = None
+
+    # -- qualification gates: what the CARRIER must hold to haul this ------- #
+    # These two are inputs to vetting, NOT things a caller is ever told, so they
+    # are deliberately absent from `facts()`. Reading a load's declared value out
+    # loud invites a different conversation entirely, and reciting the
+    # classifications a carrier has to hold tells them which answer to give.
+    #
+    # `reference.requiredClassifications`, e.g. ("Critical Cargo",). Populated on
+    # roughly one posted load in ten on the live tenant, so an empty tuple means
+    # "nothing extra required", never "we couldn't tell".
+    required_classifications: tuple[str, ...] = ()
+    # Which office/POD owns this load (`assignedTerminal`), as a string because
+    # the two Transport Pro endpoints type it differently. None when the payload
+    # didn't say. A deployment scoped to one office refuses to sell anything
+    # outside it — see `TerminalScope`. Never spoken: the carrier does not care
+    # which POD it is, and naming internal structure on a sales call is noise.
+    terminal_id: str | None = None
+
+    # Where the pickup physically is, from the waypoint's own `latitude` /
+    # `longitude`. Used to estimate how far a caller's empty truck is from it.
+    # None on plenty of real records — a stop can carry a city with null
+    # coordinates — and the deadhead estimate is simply skipped for those rather
+    # than guessed from the city name.
+    origin_lat: float | None = None
+    origin_lon: float | None = None
+    # `reference.commodityValue` — the declared value of the freight, checked
+    # against the carrier's cargo insurance limit. None when the load doesn't
+    # declare one, which is the common case.
+    commodity_value: float | None = None
 
     @property
     def is_open(self) -> bool:
@@ -211,6 +253,30 @@ class Carrier:
     # the reason in the call log is the source's word, not our interpretation.
     raw_authority_status: str | None = None
 
+    # -- what the carrier is qualified to haul ------------------------------- #
+    # Classifications the SOURCE SYSTEM lists them as holding, e.g.
+    # ("Interstate", "Critical Cargo"). Compared against a load's
+    # `required_classifications`.
+    qualifications: tuple[str, ...] = field(default_factory=tuple)
+    # Highway's own `rules_assessment`, as (classification, result) pairs where
+    # result is "pass" / "fail" / "review". A tuple rather than a dict so the
+    # dataclass stays hashable and genuinely frozen.
+    #
+    # Empty means Highway was not consulted or could not be reached, which
+    # degrades to the source system's list — never to a refusal.
+    highway_assessment: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    # Highway's `rules_assessment.overall_result` — "pass" / "fail" / "review", its
+    # verdict on the carrier as a whole rather than per classification. A "fail"
+    # here is a definite no and is treated as one: MC 1798414 came back with every
+    # classification failing and `needs_to_connect_eld`, which is exactly the
+    # "doesn't meet our requirements" case. None when Highway wasn't consulted or
+    # had no record, which must NOT read as a failure.
+    highway_overall_result: str | None = None
+    # Highest ACTIVE motor_truck_cargo policy limit, from Highway. None when we
+    # could not read one, in which case the commodity-value gate SKIPS rather
+    # than blocks: a lookup failure must not decline a legitimate carrier.
+    cargo_insurance_limit: float | None = None
+
     @property
     def latest_email(self) -> str | None:
         return self.contact_emails[-1] if self.contact_emails else None
@@ -219,6 +285,32 @@ class Carrier:
     def authority_reported(self) -> bool:
         """False when we could not find a vetting status on the record at all."""
         return self.raw_authority_status is not None
+
+    def qualifies_for(self, classification: str) -> bool:
+        """Does the carrier hold `classification`? Highway wins where it speaks.
+
+        Highway is authoritative in BOTH directions, which is the whole point of
+        consulting it — the source system's list has been observed wrong each way:
+
+          Highway "pass" -> qualified, even if the source's list omits it
+          Highway "fail" -> NOT qualified, even if the source's list claims it
+          "review" / absent -> no opinion, fall back to the source's list
+
+        Matched case-insensitively: the two systems disagree on capitalisation of
+        the same classification often enough that an exact compare silently drops
+        qualifications the carrier really holds.
+        """
+        wanted = classification.strip().lower()
+        for name, result in self.highway_assessment:
+            if name.strip().lower() != wanted:
+                continue
+            verdict = (result or "").strip().lower()
+            if verdict == "pass":
+                return True
+            if verdict == "fail":
+                return False
+            break   # "review" — Highway has no opinion; fall through
+        return any(q.strip().lower() == wanted for q in self.qualifications)
 
 
 @dataclass(frozen=True)
@@ -241,6 +333,11 @@ class VerificationResult:
     approved: bool = True
     risk_flags: tuple[str, ...] = field(default_factory=tuple)
     reason: str | None = None
+    # True only for a NOT_CONNECTED carrier: they passed vetting and the one thing
+    # standing between them and this load is a Highway connection, so the agent
+    # sends the invite before handing over. Never set for a carrier who FAILED
+    # something — inviting them to onboard would be the wrong message entirely.
+    invite_to_onboard: bool = False
 
 
 @dataclass(frozen=True)

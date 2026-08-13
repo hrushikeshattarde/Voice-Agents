@@ -110,6 +110,25 @@ wheels = [
 ]
 
 [[package]]
+name = "anthropic"
+version = "0.121.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "docstring-parser" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0f/ca/3cb2c20ee729736fbd4546d5d8b67e818288529fe70cb7a80dbf80aef70b/anthropic-0.121.0.tar.gz", hash = "sha256:e79d6e08ab3376602fc9a70d4d5ea3540817c76cf7e16658bed790834e1833d6", size = 1013292, upload-time = "2026-08-07T17:11:07.241Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fa/91/b3d41643f1f639927e8c5fb02c3bd8bffe6f1f29e219b3bd4c61e267b15c/anthropic-0.121.0-py3-none-any.whl", hash = "sha256:6048713fa441e59e1cba8363171cd2a86273b25bd213e9c7ac70a523af88b011", size = 1035493, upload-time = "2026-08-07T17:11:08.508Z" },
+]
+
+[[package]]
 name = "anyio"
 version = "4.14.2"
 source = { registry = "https://pypi.org/simple" }
@@ -344,23 +363,6 @@ wheels = [
 ]
 
 [[package]]
-name = "groq"
-version = "1.6.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "sniffio" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/67/3e/687064918e861082cb02165872bbda31269126a108a78794dae86ddadae2/groq-1.6.0.tar.gz", hash = "sha256:c4237ecf0053ba85fd926bb31cb4b178996310474b4618867994e3e40d8e3c02", size = 158424, upload-time = "2026-07-24T17:25:49.517Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/40/164338d796cf41ea5930a42023e986d8c993720bed670d5aa143e5854873/groq-1.6.0-py3-none-any.whl", hash = "sha256:fa16db582455db324adcff1b5908519474736872e28cd5c8fa2b8bef6860e12a", size = 143693, upload-time = "2026-07-24T17:25:48.2Z" },
-]
-
-[[package]]
 name = "grpcio"
 version = "1.83.0"
 source = { registry = "https://pypi.org/simple" }
@@ -516,15 +518,16 @@ name = "lanevoice"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "groq" },
+    { name = "anthropic" },
     { name = "httpx" },
     { name = "livekit-agents" },
-    { name = "livekit-plugins-groq" },
     { name = "livekit-plugins-noise-cancellation" },
+    { name = "livekit-plugins-openai" },
     { name = "livekit-plugins-silero" },
     { name = "num2words" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "openai" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "soundfile" },
@@ -539,14 +542,15 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "groq", specifier = ">=0.11.0" },
+    { name = "anthropic", specifier = ">=0.40" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "livekit-agents", specifier = ">=1.0" },
-    { name = "livekit-plugins-groq" },
     { name = "livekit-plugins-noise-cancellation", specifier = ">=0.3.0" },
+    { name = "livekit-plugins-openai" },
     { name = "livekit-plugins-silero" },
     { name = "num2words", specifier = ">=0.5.14" },
     { name = "numpy", specifier = ">=1.24.0" },
+    { name = "openai", specifier = ">=1.40" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "python-dotenv" },
@@ -627,9 +631,6 @@ codecs = [
 images = [
     { name = "pillow" },
 ]
-openai = [
-    { name = "livekit-plugins-openai" },
-]
 
 [[package]]
 name = "livekit-api"
@@ -679,20 +680,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/76/6f/9a580a0d3f0c4bb63e7ab627467aeaf66980d21ea52e5946eb054e6f8150/livekit_local_inference-0.2.6-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:425469dff5505b35a3fab587993b320c829826d041a85c17c53475f64b99f444", size = 34823583, upload-time = "2026-06-24T16:55:13.728Z" },
     { url = "https://files.pythonhosted.org/packages/72/3d/c4a73813247faa704e9eef1cbf52ebc0f8070ad08b295419033ec3bcea5c/livekit_local_inference-0.2.6-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c0cc28d6e2e1431940b37a8c6d931e4dac914806e2c874a05513db6b65a01d7e", size = 34868325, upload-time = "2026-06-24T16:55:16.789Z" },
     { url = "https://files.pythonhosted.org/packages/c3/44/4f5a633f962142480a54eff1e4aea96848e4b54972c617da65e234d51b7d/livekit_local_inference-0.2.6-cp312-cp312-win_amd64.whl", hash = "sha256:5dc4a0574dc2e4a0745e8fcf29c26ca9f3983b885e63ada9761d26311a778d7b", size = 34906570, upload-time = "2026-06-24T16:55:19.914Z" },
-]
-
-[[package]]
-name = "livekit-plugins-groq"
-version = "1.6.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "livekit" },
-    { name = "livekit-agents", extra = ["codecs", "openai"] },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/61/1c/54d311d2f284d11f6c8bd4ce98a2dd7ec49771d1ede8faa2f030081d54af/livekit_plugins_groq-1.6.6.tar.gz", hash = "sha256:421f273a3a151a1fb7928ef201e9acdcc7af4a8a9b60f2e432897663280a305c", size = 6131, upload-time = "2026-07-18T04:18:00.022Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/76/aa/7798b0017a3d6b335bb73a0311956a7491cd7814bfbd3af7242b8c28e429/livekit_plugins_groq-1.6.6-py3-none-any.whl", hash = "sha256:b3ac5ef91525a23e4c5f0cdb93c438d8f70c19f28e7d0a3fdf98045da649a51d", size = 7318, upload-time = "2026-07-18T04:17:58.899Z" },
 ]
 
 [[package]]
