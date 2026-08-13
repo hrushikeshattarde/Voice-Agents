@@ -206,8 +206,20 @@ class Settings(BaseSettings):
     allow_interruptions: bool = Field(default=True, validation_alias="ALLOW_INTERRUPTIONS")
     # Wait this long after the caller stops before replying. Higher = fewer
     # cut-offs / fragment replies on a noisy phone line.
+    #
+    # MIN applies when the turn detector is CONFIDENT the caller finished; MAX
+    # when it is not. The gap between them is the single largest thing the caller
+    # waits on — bigger than the model, bigger than the voice.
+    #
+    # MAX was 8.0, and on a measured live call 5 turns out of 11 spent every one
+    # of those seconds. In all five the caller had plainly finished ("Okay.", at
+    # an end-of-turn probability of 0.05) — the detector was merely unsure, and
+    # eight seconds of silence bought nothing on any of them. 3.0 is still a long
+    # pause by phone standards and cuts up to 5 seconds off roughly half the
+    # turns. Raise it back toward 6-8 if callers start getting clipped
+    # mid-sentence; that is the failure this number guards against.
     min_endpointing_delay: float = Field(default=1.3, validation_alias="MIN_ENDPOINTING_DELAY")
-    max_endpointing_delay: float = Field(default=8.0, validation_alias="MAX_ENDPOINTING_DELAY")
+    max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
 
     # --- Deadhead ------------------------------------------------------------ #
     # Driving miles over straight-line miles. The agent estimates how far a

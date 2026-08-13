@@ -489,8 +489,29 @@ def extract_empty_location(text: str) -> str | None:
     return None
 
 
+# The smallest figure worth reading as a rate. Matches the 3-digit minimum the
+# digit pattern below already enforces, and it is what keeps "a couple hundred
+# more" (which parses as the number 100) from being heard as a $100 ask — an ask
+# that low trips the fraud tripwire and ends the call at a human.
+_MIN_RATE = 300
+
+# "twenty-four seventy-five" is how every rep on the phone says $2475, and
+# Whisper renders it as the fraction "24/75". Nothing in the digit or word paths
+# below sees a number in that at all, so the turn reached the negotiator as "they
+# gave me no rate" — and the composer, having just read the caller say it, spoke
+# $2475, was rejected three times for naming money it wasn't given, and the call
+# was handed to a rep. Observed live on load 2513446.
+#
+# Both halves must be exactly two digits, which keeps "2.50 a mile" and single-
+# digit dates ("8/17") out. A two-by-two date ("12/25") would still read as
+# $1225 — accepted deliberately: it is far rarer on a rate turn than the form
+# this exists for, and it fails safe, since a rate that far off the board rate
+# goes to review rather than into a booking.
+_SLASHED_RATE_RE = re.compile(r"\b(\d{2})\s*/\s*(\d{2})\b")
+
+
 def extract_money(text: str) -> float | None:
-    """Extract a dollar amount: '$2,100', '2100', '2.1k'."""
+    """Extract a dollar amount: '$2,100', '2100', '2.1k', 'twenty-four fifty'."""
     lowered = text.lower().replace(",", "")
     match = re.search(r"\$?\s*(\d{3,6})(?:\s*(?:dollars|bucks))?", lowered)
     if match:
@@ -498,4 +519,19 @@ def extract_money(text: str) -> float | None:
     kilo = re.search(r"(\d+(?:\.\d+)?)\s*k", lowered)
     if kilo:
         return float(kilo.group(1)) * 1000
+    if slashed := _SLASHED_RATE_RE.search(lowered):
+        return float(f"{slashed.group(1)}{slashed.group(2)}")
+    # Said in words. `spoken_numbers` already knows the rate idiom — "twenty-four
+    # fifty" is 2450, not 74 — and it is the same reader the money guardrail uses
+    # on the agent's own replies, so both sides of the call read a spoken rate the
+    # same way.
+    #
+    # ONLY when it finds exactly one plausible rate. A set has no order, so
+    # "I was at twenty-six hundred, I'll take twenty-five hundred" gives no way to
+    # tell the operative ask from the one they just abandoned. Returning None
+    # there is the previous behaviour — the agent asks what their number is —
+    # which is a great deal better than booking the wrong one.
+    spoken = {n for n in spoken_numbers(lowered) if n >= _MIN_RATE}
+    if len(spoken) == 1:
+        return float(spoken.pop())
     return None

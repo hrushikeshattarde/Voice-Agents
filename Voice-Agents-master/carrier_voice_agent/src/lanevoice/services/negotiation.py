@@ -39,6 +39,14 @@ from lanevoice.domain.models import Decision, Load, NegotiationResult
 
 _MIN_STEP = 10           # floor on a single upward nudge
 _MIN_CARRIER_MOVE = 25   # a drop smaller than this isn't a real concession
+# Absolute floor under `settle_gap`, which is otherwise a share of the
+# floor -> Max Buy span. On a NARROW board that share collapses: a load posted
+# 2450 / 2500 has a $50 span, so the default 10% put "not worth haggling over"
+# at $10 and the agent went on grinding at a carrier $25 away that it was
+# already cleared to pay. Deliberately the same number as `_MIN_CARRIER_MOVE` —
+# if a $25 drop is too small to count as a concession, a $25 gap is too small to
+# spend a round of a phone call on.
+_MIN_SETTLE_GAP = 25
 
 
 def _round(amount: float) -> int:
@@ -79,7 +87,7 @@ class NegotiationEngine:
         self.max_offer = max(self.floor, _round(min(
             self.agent_max, self.floor + span * discretion_rate)))
         # Gap we won't haggle over — just book it.
-        self.settle_gap = max(_MIN_STEP, _round(span * settle_gap_rate))
+        self.settle_gap = max(_MIN_SETTLE_GAP, _round(span * settle_gap_rate))
         # Gap that's close enough to reach for the split-the-difference close.
         self.split_gap = max(self.settle_gap, _round(span * split_gap_rate))
 

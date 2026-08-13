@@ -106,6 +106,33 @@ _UNRETRYABLE = re.compile(
 # like one consistent human rep.
 REP_NAME = "Alex"
 
+# What a load pitch actually has to contain, shared by the two turns that give one
+# out (with the rate, and without).
+#
+# The list used to be everything on the record — lane, both appointment windows,
+# commodity, piece count, equipment, weight, miles — and it read exactly like a
+# screen being dictated. Measured on a live call: 27 seconds of speech for the
+# rundown and 33 for the requirements right behind it, a solid minute before the
+# carrier was asked anything. A rep does not do that; a rep gives the lane, the
+# days and the equipment, and answers the rest as it comes up.
+#
+# Nothing is LOST by cutting it. Every field stays in FACTS and the composer is
+# told to answer from FACTS, so a carrier who asks the piece count or the
+# delivery window gets it — on the turn they actually want it, instead of thirty
+# seconds of detail they have to hold in their head to find the one they wanted.
+_PITCH_ESSENTIALS = (
+    "COVER, and nothing else: the lane (both cities), the pickup day and the "
+    "delivery day, the equipment, and the weight with what it is. Add the miles "
+    "only if it fits without a fourth sentence.\n"
+    "LEAVE OUT unless they ask: piece count, dimensions, temperature, the "
+    "appointment windows, and anything about how check-in works. It is all in "
+    "FACTS and you answer it gladly IF ASKED — reciting it unprompted is what "
+    "makes a rundown impossible to follow on a phone.\n"
+    "If FACTS gives a deadhead to the pickup, work it in the way a rep would — "
+    "'it's about ninety miles from you' — and ONLY as the approximation it is; "
+    "never state it as an exact figure and never invent one.\n"
+)
+
 # Non-price levers a rep leans on when a carrier is stuck on their number. ONE
 # per turn, and never the same one twice on a call — a pitch delivered verbatim
 # two or three times is the most bot-like thing a caller can hear. These are
@@ -136,6 +163,12 @@ _DECLARES_FINAL_RE = re.compile(
     r"\b(?:that'?s|it'?s) (?:my|the) best\b"
     r"|\bmy best\b"
     r"|\bbest i can (?:do|go)\b"
+    # "that's my last" / "last I can do" — the same declaration as "my best", and
+    # just as common. Missing it cost a live call: the carrier said "2500, that's
+    # my last", the engine read it as an ordinary repeat and kept pushing.
+    r"|\b(?:that'?s|it'?s) (?:my|the) last\b"
+    r"|\bmy last (?:offer|number)?\b"
+    r"|\blast i can (?:do|go)\b"
     r"|\ball i can do\b"
     r"|\b(?:lowest|as low as) i can\b"
     r"|\bbottom line\b"
@@ -987,19 +1020,14 @@ class CarrierSalesAgent:
         if self.load.notes:
             self.state = CallState.CHECK_REQUIREMENTS
             return self._say(
-                "Give them the load: what it is, the lane, when it picks up and delivers "
-                "with the appointment windows, the commodity and piece count, the "
-                "equipment, and the miles. One flowing rundown, the way a rep reads it off "
-                "a screen — not a list. If FACTS gives a deadhead to the pickup, work it "
-                "in naturally the way a rep would — 'it's about ninety miles from you' — "
-                "and ONLY as the approximation it is; never state it as an exact figure "
-                "and never invent one if FACTS doesn't give you it. Do NOT read them "
-                "the special requirements yet — that is the very next thing you will "
-                "do, and cramming both into one breath makes a turn too long to "
-                "follow on a phone. Finish by telling them there are a couple of "
-                "specific requirements on this one that you need to run through. Say "
-                "NOTHING about rate yet; that comes only once they have said they can "
-                "meet those requirements.",
+                "Give them the load, SHORT — the way a rep rattles it off, not the way a "
+                "screen lists it. THREE SENTENCES AT MOST, and under about twelve seconds "
+                "of speech.\n"
+                + _PITCH_ESSENTIALS +
+                "Do NOT read them the special requirements yet — that is the very next "
+                "thing you will do. Finish by telling them there are a couple of specific "
+                "requirements you need to run through. Say NOTHING about rate yet; that "
+                "comes only once they have said they can meet those requirements.",
                 amounts=set(),
             )
         return self._present_offer(with_details=True)
@@ -1025,18 +1053,14 @@ class CarrierSalesAgent:
         if with_details:
             self._load_revealed = True
             return self._say(
-
-                "Give them the load: what it is, the lane, when it picks up and delivers "
-                "with the appointment windows, the commodity and piece count, the "
-                "equipment, and the miles. One flowing rundown, the way a rep reads it off "
-                "a screen — not a list. If FACTS gives a deadhead to the pickup, work it "
-                "in naturally the way a rep would — 'it's about ninety miles from you' — "
-                "and ONLY as the approximation it is; never state it as an exact figure "
-                f"and never invent one. Then put YOUR number on it: you're asking "
-                f"${opening} on this one. It is YOUR asking rate, not theirs — \"I've got "
-                f"it at ${opening}\", never \"you're at ${opening}\". Finish by asking if "
-                "they want the load. They already know they're verified, so don't tell "
-                "them again.",
+                "Give them the load and your number, SHORT — the way a rep rattles it "
+                "off, not the way a screen lists it. THREE SENTENCES AT MOST, and under "
+                "about twelve seconds of speech.\n"
+                + _PITCH_ESSENTIALS +
+                f"Then put YOUR number on it: you're asking ${opening} on this one. It is "
+                f"YOUR asking rate, not theirs — \"I've got it at ${opening}\", never "
+                f"\"you're at ${opening}\". Finish by asking if they want the load. They "
+                "already know they're verified, so don't tell them again.",
                 amounts={opening},
                 must_say=opening,
             )
@@ -1078,17 +1102,21 @@ class CarrierSalesAgent:
             self._requirements_read = True
             return self._say(
                 "Now cover this load's requirements from FACTS and ask outright whether "
-                "they can do it.\n"
+                "they can do it. TWO SENTENCES, then the question.\n"
                 "SAY every CONDITION THEY HAVE TO MEET — the trailer spec, tracking, "
                 "check-in, paperwork, anything they must or must not do. Never drop or "
                 "soften one of those: a driver who agrees without having heard "
-                "'food grade' has agreed to something else. Group them into two or "
-                "three plain sentences instead of reciting a list.\n"
+                "'food grade' has agreed to something else. Compress them — run the "
+                "trailer specs together in one breath ('clean dry food-grade van, swing "
+                "doors, under ten years old') rather than giving each its own clause, "
+                "and drop the reasons and the small print behind them: they need to "
+                "know WHAT to meet, not why or how it gets checked.\n"
                 "DO NOT read out the money terms — detention rates, layover pay, extra "
-                "stop pay, TONU or fee disclaimers, reimbursement windows. They are in "
-                "FACTS and you answer them gladly IF ASKED, but reciting them makes "
-                "this turn twice as long and none of it is something they need to agree "
-                "to.\n"
+                "stop pay, TONU or fee disclaimers, reimbursement windows — and do not "
+                "read out anything that is not theirs to agree to, like what the shipper "
+                "might do or where else they might get sent. All of it is in FACTS and "
+                "you answer it gladly IF ASKED, but reciting it makes this turn twice as "
+                "long and none of it is something they need to agree to.\n"
                 "Then stop and let them answer. No rate yet.",
                 amounts=set(),
             )

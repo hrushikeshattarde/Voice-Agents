@@ -172,7 +172,27 @@ def test_the_pitch_no_longer_reads_the_requirements(repo):
     agent = _to_requirements(repo)
     directive = agent._composer.turns[-1]["directive"]
     assert "Do NOT read them the special requirements yet" in directive
-    assert "specific requirements on this one" in directive
+    assert "specific requirements" in directive
+
+
+def test_the_pitch_is_held_to_a_phone_length(repo):
+    """The rundown is capped, and the screen detail is left for the asking.
+
+    Uncapped it listed every field on the record — both appointment windows, the
+    piece count, the dimensions — and ran 27 seconds before the carrier was asked
+    anything. None of it is gone: it stays in FACTS, so a carrier who wants the
+    piece count gets it on the turn they ask for it.
+    """
+    agent = _to_requirements(repo)
+    directive = agent._composer.turns[-1]["directive"]
+    assert "THREE SENTENCES AT MOST" in directive
+    assert "LEAVE OUT unless they ask" in directive
+    # The lane, the days and the equipment still have to be said.
+    assert "the lane (both cities)" in directive
+    assert "pickup day and the delivery day" in directive
+    # And the detail is deferred, not dropped — it is still on the record.
+    facts = agent._composer.turns[-1]["facts"]
+    assert "Pieces" in facts or "Pickup window" in facts
 
 
 def test_the_requirements_are_read_in_their_own_turn(repo):
@@ -186,7 +206,10 @@ def test_the_requirements_are_read_in_their_own_turn(repo):
     assert "Never drop or soften one of those" in directive
     # ...and the money terms are not, because none of them is something to agree to.
     assert "DO NOT read out the money terms" in directive
-    assert "answer them gladly IF ASKED" in directive
+    assert "gladly IF ASKED" in directive
+    # Held to a phone length too — this turn measured 33 seconds of speech before
+    # the caller was asked to agree to any of it.
+    assert "TWO SENTENCES" in directive
     assert agent.state.value == "check_requirements"      # still waiting on a yes
     assert agent._composer.turns[-1]["speakable"] == ""   # and still no rate
 

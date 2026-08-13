@@ -267,3 +267,41 @@ def test_full_authority_config_closes_at_max_buy():
         result = eng.evaluate(2450)
     assert result.decision == Decision.ACCEPT      # inside Max Buy -> booked, not escalated
     assert result.rate == 2450
+
+
+def test_a_narrow_board_still_closes_instead_of_grinding():
+    """A load posted 2450 / 2500 — a $50 span — must not degenerate.
+
+    Every threshold on the engine is a SHARE of the floor -> Max Buy span, and on
+    a narrow board those shares collapse: at 10% the "not worth haggling over"
+    gap came out at $10, so a carrier who had walked all the way down to $2475 —
+    inside the agent's own authority — got asked to come down again rather than
+    booked. Observed live on load 2513446.
+    """
+    tmp = pathlib.Path(tempfile.mkdtemp()) / "t.db"
+    repo = Repository(Database(tmp))
+    repo._db.reset(seed=True)
+    load = repo.get_load("L1001").__class__(
+        **{**repo.get_load("L1001").__dict__,
+           "open_rate": 2450, "ceiling_rate": 2500, "fraud_low_rate": 1225})
+    eng = NegotiationEngine(load, buffer=0)
+
+    assert eng.settle_gap >= 25          # not the $10 a 10% share would have given
+    assert eng.max_offer <= eng.ceiling  # authority still capped below Max Buy
+
+    assert eng.evaluate(2600).decision == Decision.HOLD   # no move -> no money
+    assert eng.evaluate(2500).decision == Decision.PULL   # they moved -> ask again
+    done = eng.evaluate(2475)                             # $25 apart, and we can pay it
+    assert done.decision == Decision.ACCEPT
+    assert done.rate == 2475
+    assert done.reason == "close_enough"
+
+
+def test_a_wide_board_is_unchanged_by_the_settle_floor():
+    """The floor must not loosen a normal board: L1001's 2000 -> 2500 span still
+    settles at the 10% share ($50), not at the absolute minimum."""
+    tmp = pathlib.Path(tempfile.mkdtemp()) / "t.db"
+    repo = Repository(Database(tmp))
+    repo._db.reset(seed=True)
+    eng = NegotiationEngine(repo.get_load("L1001"), buffer=0)
+    assert eng.settle_gap == 50

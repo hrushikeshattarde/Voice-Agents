@@ -21,6 +21,38 @@ def test_extract_money():
     assert parsing.extract_money("no price") is None
 
 
+def test_a_rate_said_the_way_a_rep_says_it():
+    """"Twenty-four seventy-five" is how a rate gets said out loud, and Whisper
+    writes it as the fraction "24/75". Neither form used to parse at all.
+
+    The live cost: the ask never reached the negotiator, the turn was handled as
+    "they gave me no number", and the composer — having just read the caller say
+    2475 — spoke it, was rejected three times for naming unauthorised money, and
+    the call was handed to a rep. Load 2513446.
+    """
+    assert parsing.extract_money("24/75") == 2475
+    assert parsing.extract_money("twenty four seventy five") == 2475
+    assert parsing.extract_money("twenty-four fifty") == 2450
+    assert parsing.extract_money("I can do twenty five hundred") == 2500
+    assert parsing.extract_money("two thousand four hundred") == 2400
+
+
+def test_words_that_are_not_rates_are_not_heard_as_rates():
+    """The word path runs on every negotiation turn, so a false positive here is
+    a rate the carrier never asked for."""
+    # Parses as the number 100, which is not an offer of $100.
+    assert parsing.extract_money("a couple hundred more") is None
+    assert parsing.extract_money("I've got two drivers") is None
+    assert parsing.extract_money("no") is None
+    assert parsing.extract_money("that works for me") is None
+    # Two rates and no way to tell which is the operative ask -> ask them, don't
+    # guess. This is the pre-existing behaviour, kept deliberately.
+    assert parsing.extract_money(
+        "I was at twenty six hundred but I'll take twenty five hundred") is None
+    # Digits still win outright when they are there.
+    assert parsing.extract_money("I'll do 2500, not twenty six hundred") == 2500
+
+
 def test_is_probably_noise():
     # Whisper silence-hallucinations -> noise
     assert parsing.is_probably_noise("Thank you.") is True
