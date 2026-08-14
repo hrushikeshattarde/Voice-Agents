@@ -251,9 +251,15 @@ def _numbers(text: str) -> set[int]:
     Applied identically to the reply and to the directive/facts it came from, so a
     figure mentioned in either form is recognised in either form.
     """
-    found = _to_ints(_NUMBER_RE.findall(text))
-    found |= parsing.spoken_numbers(text)
-    found |= {int(h) * 100 + int(m) for h, m in _CLOCK_RE.findall(text)}
+    # Fold "26 hundred" into "2600" BEFORE scanning, or the digit pass reports a
+    # bare 26 alongside the word pass's 2600 and the turn is rejected over a
+    # fragment of a figure it was authorised to say. Measured: this is the whole
+    # difference between Haiku 4.5 passing the guardrail half the time and
+    # passing it every time (`tools/measure_latency.py`).
+    folded = parsing.fold_mixed_numbers(text)
+    found = _to_ints(_NUMBER_RE.findall(folded))
+    found |= parsing.spoken_numbers(folded)
+    found |= {int(h) * 100 + int(m) for h, m in _CLOCK_RE.findall(folded)}
     return found
 
 

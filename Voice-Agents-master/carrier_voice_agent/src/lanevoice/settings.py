@@ -60,11 +60,33 @@ class Settings(BaseSettings):
     llm_timeout: float = Field(default=20.0, validation_alias="LLM_TIMEOUT")
 
     # The model each provider uses when LLM_MODEL is left unset. Both are Claude
-    # Haiku 4.5; only the spelling differs. OpenRouter namespaces by vendor with a
+    # Sonnet 5; only the spelling differs. OpenRouter namespaces by vendor with a
     # dotted version, Anthropic uses a hyphenated id and no date suffix.
+    #
+    # SONNET 5 IS THE LOW-LATENCY CHOICE HERE, which is not the obvious answer.
+    # Per call it is twice as slow as Haiku 4.5 — but a reply that names money the
+    # engine did not sanction is rejected and re-prompted, and three rejections
+    # hand the call to a rep. What the caller waits on is per-call latency times
+    # attempts. Measured over 8 turns each with `tools/measure_latency.py`, on the
+    # commonest turn there is (hold at our number against a higher ask):
+    #
+    #   model              per call   complies   effective   ends at a rep
+    #   haiku-4.5             1.82s     1 of 8       4.81s        67%
+    #   sonnet-5              3.23s     8 of 8       3.23s         0%
+    #
+    # Haiku's failure is abbreviation, and it survived an explicit instruction not
+    # to do it: it writes "what's driving the 26 on this one?" for $2600. The
+    # guardrail is right to reject that — the voice would say "twenty-six" and the
+    # carrier would hear twenty-six dollars. Sonnet 5 wrote "$2600" every time.
+    #
+    # Haiku is still the cheaper model and its pass rate swung 1-4 of 8 across
+    # runs, so it is a reasonable choice for a desk watching spend: set
+    # LLM_MODEL=anthropic/claude-haiku-4.5. Do NOT reach for Opus 5 for this —
+    # thinking is ON by default there, which is latency this call cannot afford,
+    # and LLM_MAX_TOKENS caps thinking and speech together so turns would truncate.
     _PROVIDER_MODELS = {
-        "openrouter": "anthropic/claude-haiku-4.5",
-        "anthropic": "claude-haiku-4-5",
+        "openrouter": "anthropic/claude-sonnet-5",
+        "anthropic": "claude-sonnet-5",
     }
 
     @property
@@ -109,9 +131,32 @@ class Settings(BaseSettings):
     # transcription model and TTS_MODEL a text-to-speech one — the two endpoints
     # reject each other's models.
     #
-    # whisper-large-v3 is the accuracy/price sweet spot on the board:
-    # `openai/whisper-large-v3-turbo` is listed but costs ~25x more per minute.
-    stt_model: str = Field(default="openai/whisper-large-v3", validation_alias="STT_MODEL")
+    # Measured with `tools/measure_latency.py` on synthesised clean audio, two
+    # lines a carrier actually says. Latency is a median of 3; the transcript is
+    # what the model heard:
+    #
+    #   line          model                    lat    heard
+    #   rate spoken   whisper-large-v3         1.80s  "24-75"        <- unparseable
+    #   rate spoken   whisper-large-v3-turbo   1.27s  "2475"         <- chosen
+    #   MC number     whisper-large-v3         1.05s  "611-349-6113" <- hallucinated
+    #   MC number     whisper-large-v3-turbo   1.98s  "6-1-1-3-4-9"
+    #
+    # turbo is chosen on ACCURACY as much as speed, and the rate line is why: a
+    # rate the transcriber mangles is a rate the negotiator never sees, which is
+    # exactly how a live call on load 2513446 ended at a human. large-v3 also
+    # padded a six-digit MC into a ten-digit phone number on one run, which
+    # `heard_digits` then cannot match to any carrier; turbo's spelled-out form
+    # strips cleanly to 611349.
+    #
+    # THE COST IS REAL: turbo is ~25x more per minute of audio on this gateway,
+    # and audio minutes are the whole bill for STT. Set STT_MODEL back to
+    # `openai/whisper-large-v3` if that outweighs the mis-heard rates for you —
+    # `parsing.extract_money` now reads "24-75" and "24/75" either way, so this is
+    # a margin-of-safety choice rather than a broken-vs-working one.
+    #
+    # Both numbers move a lot run to run; re-measure before trusting either.
+    stt_model: str = Field(default="openai/whisper-large-v3-turbo",
+                           validation_alias="STT_MODEL")
     # Left empty on purpose — see `resolved_llm_model`. Set it to pin a model.
     llm_model: str = Field(default="", validation_alias="LLM_MODEL")
     # THE AGENT MUST SOUND LIKE ONE PERSON, and it must not leave the carrier in

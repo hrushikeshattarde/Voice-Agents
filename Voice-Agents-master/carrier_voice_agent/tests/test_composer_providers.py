@@ -72,11 +72,11 @@ class _Recorder:
 # Model ids — the naming differs per provider and a carried-over id 404s
 # --------------------------------------------------------------------------- #
 def test_each_provider_has_its_own_default_model():
-    """Both defaults are Claude Haiku 4.5, and neither provider accepts the
+    """Both defaults are Claude Sonnet 5, and neither provider accepts the
     other's spelling — so a single shared default would 404 on the first turn."""
     assert (_settings(llm_provider="openrouter").resolved_llm_model
-            == "anthropic/claude-haiku-4.5")
-    assert _settings(llm_provider="anthropic").resolved_llm_model == "claude-haiku-4-5"
+            == "anthropic/claude-sonnet-5")
+    assert _settings(llm_provider="anthropic").resolved_llm_model == "claude-sonnet-5"
 
 
 def test_openrouter_is_the_default_provider():
@@ -89,22 +89,22 @@ def test_openrouter_is_the_default_provider():
     assert Settings.model_fields["llm_provider"].default == "openrouter"
 
 
-def test_haiku_ids_differ_between_the_gateway_and_the_first_party_api():
-    """OpenRouter namespaces by vendor with a dotted version; Anthropic uses a
-    hyphenated id and no date suffix. Neither accepts the other's spelling."""
+def test_model_ids_differ_between_the_gateway_and_the_first_party_api():
+    """OpenRouter namespaces by vendor; Anthropic uses a bare id. Neither accepts
+    the other's spelling."""
     gateway = _settings(llm_provider="openrouter").resolved_llm_model
     direct = _settings(llm_provider="anthropic").resolved_llm_model
-    assert gateway == "anthropic/claude-haiku-4.5"
-    assert direct == "claude-haiku-4-5"
+    assert gateway == "anthropic/claude-sonnet-5"
+    assert direct == "claude-sonnet-5"
     assert gateway != direct
 
 
 def test_an_explicit_llm_model_overrides_the_provider_default():
     assert _settings(llm_provider="anthropic",
-                     llm_model="claude-sonnet-5").resolved_llm_model == "claude-sonnet-5"
+                     llm_model="claude-haiku-4-5").resolved_llm_model == "claude-haiku-4-5"
     # Whitespace-only is treated as unset, not as a model named " ".
     assert (_settings(llm_provider="anthropic", llm_model="   ").resolved_llm_model
-            == "claude-haiku-4-5")
+            == "claude-sonnet-5")
 
 
 def test_the_key_and_its_env_var_name_follow_the_provider():
@@ -136,7 +136,7 @@ def test_openrouter_posts_chat_completions_to_the_gateway():
     assert "openrouter.ai" in str(request.url)
     assert str(request.url).endswith("/chat/completions")
     assert request.headers["authorization"] == "Bearer sk-or-test"
-    assert rec.body["model"] == "anthropic/claude-haiku-4.5"
+    assert rec.body["model"] == "anthropic/claude-sonnet-5"
     assert [m["role"] for m in rec.body["messages"]] == ["system", "user"]
 
 
@@ -153,29 +153,52 @@ def test_anthropic_posts_messages_to_the_first_party_api():
     assert "api.anthropic.com" in str(request.url)
     assert str(request.url).endswith("/v1/messages")
     assert request.headers["x-api-key"] == "sk-ant-test"
-    assert rec.body["model"] == "claude-haiku-4-5"
+    assert rec.body["model"] == "claude-sonnet-5"
     # The system prompt is a top-level field here, not a message role.
     assert isinstance(rec.body["system"], str)
     assert [m["role"] for m in rec.body["messages"]] == ["user"]
 
 
-def test_haiku_still_accepts_temperature():
-    """Sampling parameters were removed on Opus 4.7 and later, but Haiku 4.5
-    predates that change — so the desk's LLM_TEMPERATURE carries over rather than
-    returning a 400."""
+def _recorded_body(model: str, **overrides):
     rec = _Recorder("messages")
     composer = AnthropicComposer(_settings(
-        llm_provider="anthropic", anthropic_api_key="k", llm_temperature=0.5))
+        llm_provider="anthropic", anthropic_api_key="k", llm_model=model,
+        **overrides))
     composer._client = composer._client.with_options(
         http_client=httpx.Client(transport=rec.transport()))
     composer.compose(DIRECTIVE)
-    assert rec.body["temperature"] == 0.5
+    return rec.body
+
+
+def test_temperature_is_withheld_from_models_that_reject_it():
+    """Sampling parameters were REMOVED with Opus 4.7 and are gone from every
+    model after it: a non-default `temperature` is a 400 on Sonnet 5, the default
+    composer model. Omitting it is accepted everywhere, so it is omitted.
+
+    The gateway is no protection — OpenRouter drops the parameter today, so
+    sending it would break only on LLM_PROVIDER=anthropic, which is exactly the
+    path a desk switches to for lower latency.
+    """
+    for model in ("claude-sonnet-5", "claude-opus-5", "claude-opus-4-7",
+                  "claude-fable-5", "anthropic/claude-sonnet-5"):
+        body = _recorded_body(model, llm_temperature=0.5)
+        assert "temperature" not in body, f"{model} must not be sent a temperature"
+
+
+def test_temperature_still_reaches_the_models_that_take_one():
+    """Haiku 4.5 and its generation predate the removal, so a desk that pins one
+    of them to save money keeps its configured LLM_TEMPERATURE."""
+    for model in ("claude-haiku-4-5", "anthropic/claude-haiku-4.5",
+                  "claude-sonnet-4-5", "claude-opus-4-6"):
+        body = _recorded_body(model, llm_temperature=0.5)
+        assert body["temperature"] == 0.5, f"{model} should keep its temperature"
 
 
 def test_no_thinking_or_effort_is_sent():
     """This composes one short sentence while a carrier waits on the line, so
-    latency is the whole budget. `effort` would also be rejected outright on
-    Haiku 4.5 — it arrived with the Opus 4.5 generation."""
+    latency is the whole budget. Sonnet 5 supports both `thinking` and `effort` —
+    leaving them off is a choice, and turning either on would spend exactly the
+    time the caller is sitting in silence."""
     rec = _Recorder("messages")
     composer = AnthropicComposer(_settings(
         llm_provider="anthropic", anthropic_api_key="k"))

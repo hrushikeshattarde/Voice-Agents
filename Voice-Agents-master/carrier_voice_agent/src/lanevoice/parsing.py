@@ -128,7 +128,14 @@ _FILLER_WORDS = {"and", "a"}
 # that a number was meant.
 _PRONOUN_NUMBERS = {"one", "oh"}
 
-_WORD_RE = re.compile(r"[a-z]+")
+# Words AND bare digit runs, because the forms that actually come back are MIXED:
+# Whisper renders "twenty-six hundred" as "26 hundred", and Haiku 4.5 writes its
+# own rates as "24 fifty". Scanning letters here and digits in `_NUMBER_RE` meant
+# neither half saw the whole number — "26 hundred" read as {26, 100} and never as
+# 2600 — so the money guardrail rejected correct turns and the carrier's own ask
+# went unparsed. Measured with `tools/measure_latency.py`: 0 of 8 Haiku turns
+# passed the guardrail before this, and every rejection costs a round trip.
+_WORD_RE = re.compile(r"[a-z]+|\d+")
 
 
 def _chunk(tokens: list[str]) -> list[int]:
@@ -143,7 +150,11 @@ def _chunk(tokens: list[str]) -> list[int]:
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in _TENS_WORDS:
+        if token.isdigit():
+            # "24 fifty" -> chunks [24, 50], which the pair rule below reads as
+            # 2450, exactly as it already read "twenty four fifty".
+            values.append(int(token))
+        elif token in _TENS_WORDS:
             value = _TENS_WORDS[token]
             if index + 1 < len(tokens) and tokens[index + 1] in _NUMBER_WORDS \
                     and _NUMBER_WORDS[tokens[index + 1]] < 10:
@@ -160,6 +171,13 @@ def _run_value(tokens: list[str]) -> int | None:
     """One run of number words -> the number a person meant by it."""
     words = [w for w in tokens if w not in _FILLER_WORDS]
     if not words:
+        return None
+    # A run of nothing but digits is not this function's business: "42,000 lbs"
+    # and "819 miles" are already read correctly by `_NUMBER_RE`, and pairing
+    # their digits here would invent figures ("42" + "000" -> 4200) that the
+    # money guardrail would then reject as leaks. At least one WORD is required,
+    # which is what makes "26 hundred" mixed rather than bare.
+    if not any(w.isalpha() for w in words):
         return None
     if len(words) == 1 and words[0] in _PRONOUN_NUMBERS:
         return None
@@ -192,6 +210,8 @@ def _run_value(tokens: list[str]) -> int | None:
             current += _TENS_WORDS[word]
         elif word in _NUMBER_WORDS:
             current += _NUMBER_WORDS[word]
+        elif word.isdigit():
+            current += int(word)      # "26 hundred" -> 26 * 100
     return (total + current) or None
 
 
@@ -206,7 +226,8 @@ def spoken_numbers(text: str) -> set[int]:
     found: set[int] = set()
     run: list[str] = []
     for token in tokens:
-        if token in _NUMBER_WORDS or token in _TENS_WORDS or token in _SCALE_WORDS:
+        if (token.isdigit() or token in _NUMBER_WORDS or token in _TENS_WORDS
+                or token in _SCALE_WORDS):
             run.append(token)
             continue
         # A filler only stays inside a run that has already started.
@@ -219,6 +240,34 @@ def spoken_numbers(text: str) -> set[int]:
     if (value := _run_value(run)) is not None:
         found.add(value)
     return found
+
+# A number written half in digits and half in words — "26 hundred", "24 fifty",
+# "2 thousand". The head must be a scale or a tens word so that ordinary
+# quantities are left alone: "24 pieces", "819 miles" and "12 p.m." do not match.
+_MIXED_HEAD = "|".join(list(_SCALE_WORDS) + list(_TENS_WORDS))
+_MIXED_TAIL = "|".join(list(_SCALE_WORDS) + list(_TENS_WORDS) + list(_NUMBER_WORDS))
+_MIXED_NUMBER_RE = re.compile(
+    rf"\b\d{{1,3}}\s+(?:{_MIXED_HEAD})\b(?:\s+(?:{_MIXED_TAIL})\b)*",
+    re.IGNORECASE,
+)
+
+
+def fold_mixed_numbers(text: str) -> str:
+    """Rewrite half-digit half-word numbers as plain digits: "24 fifty" -> "2450".
+
+    Applied BEFORE any digit scan, and that ordering is the whole point. Reading
+    the same text with a digit scanner and a word scanner gives one number three
+    readings: "I'm holding at 24 fifty" yielded {24, 50} before the word scanner
+    understood mixed forms, and {24, 2450} after — the leading fragment survives
+    either way, and the money guardrail rejects the turn over the fragment. Fold
+    first and there is exactly one reading of each figure.
+    """
+    def replace(match: re.Match) -> str:
+        value = _run_value(_WORD_RE.findall(match.group().lower()))
+        return str(value) if value is not None else match.group()
+
+    return _MIXED_NUMBER_RE.sub(replace, text)
+
 
 def heard_digits(text: str) -> str:
     """Every digit in an utterance, in order, with everything else dropped.
@@ -502,25 +551,33 @@ _MIN_RATE = 300
 # $2475, was rejected three times for naming money it wasn't given, and the call
 # was handed to a rep. Observed live on load 2513446.
 #
-# Both halves must be exactly two digits, which keeps "2.50 a mile" and single-
-# digit dates ("8/17") out. A two-by-two date ("12/25") would still read as
-# $1225 — accepted deliberately: it is far rarer on a rate turn than the form
+# The separator is whatever the transcriber felt like: the live call gave "24/75"
+# and the same line re-measured through `tools/measure_latency.py` gave "24-75".
+# Accept the whole dash family, or the fix only covers the one that happened to
+# be observed first.
+#
+# Both halves must be exactly two digits, which keeps "2.50 a mile", phone
+# numbers ("555-111-2222" — no two-digit group sits against a separator) and
+# single-digit dates ("8/17") out. A two-by-two date ("12/25") would still read
+# as $1225 — accepted deliberately: it is far rarer on a rate turn than the form
 # this exists for, and it fails safe, since a rate that far off the board rate
 # goes to review rather than into a booking.
-_SLASHED_RATE_RE = re.compile(r"\b(\d{2})\s*/\s*(\d{2})\b")
+_SPLIT_RATE_RE = re.compile(r"\b(\d{2})\s*[/\-–—]\s*(\d{2})\b")
 
 
 def extract_money(text: str) -> float | None:
     """Extract a dollar amount: '$2,100', '2100', '2.1k', 'twenty-four fifty'."""
-    lowered = text.lower().replace(",", "")
+    # "26 hundred" -> "2600" first, so the digit pattern below sees the whole
+    # figure instead of the "26" in front of a word it doesn't read.
+    lowered = fold_mixed_numbers(text.lower()).replace(",", "")
     match = re.search(r"\$?\s*(\d{3,6})(?:\s*(?:dollars|bucks))?", lowered)
     if match:
         return float(match.group(1))
     kilo = re.search(r"(\d+(?:\.\d+)?)\s*k", lowered)
     if kilo:
         return float(kilo.group(1)) * 1000
-    if slashed := _SLASHED_RATE_RE.search(lowered):
-        return float(f"{slashed.group(1)}{slashed.group(2)}")
+    if split := _SPLIT_RATE_RE.search(lowered):
+        return float(f"{split.group(1)}{split.group(2)}")
     # Said in words. `spoken_numbers` already knows the rate idiom — "twenty-four
     # fifty" is 2450, not 74 — and it is the same reader the money guardrail uses
     # on the agent's own replies, so both sides of the call read a spoken rate the

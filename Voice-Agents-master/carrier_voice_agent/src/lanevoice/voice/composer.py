@@ -67,6 +67,14 @@ _SYSTEM = (
     "keep the call moving. Do not guess, do not fill the gap with something "
     "plausible, and do not promise anything that is not in FACTS.\n\n"
 
+    "SAY A RATE IN FULL\n"
+    "Write every rate the whole way out, exactly as SPEAKABLE gives it: $2450 is "
+    "\"$2450\", never \"24 50\", \"24-50\", \"2450\" split across words, or \"24\". "
+    "NEVER shorten a rate to its leading digits — \"26\" is not $2600, it is "
+    "twenty-six dollars, and that is what the carrier will hear. Same for \"I'm at "
+    "24\" and \"can you do 25\". If you would say it aloud as \"twenty-four fifty\", "
+    "write it as $2450.\n\n"
+
     "MONEY IS NOT YOURS TO INVENT\n"
     "You may speak ONLY the dollar figures listed in SPEAKABLE. Never invent a "
     "rate, never split the difference, never propose a number 'between' theirs "
@@ -118,6 +126,15 @@ _READ_SYSTEM = (
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# Models that still accept a `temperature`. Matched against the resolved model id,
+# so it covers both spellings ("anthropic/claude-haiku-4.5" and "claude-haiku-4-5")
+# — hence the loose separator. Anything not listed gets no sampling parameter at
+# all, which every model accepts. See `_ChatComposer._temperature`.
+_TAKES_TEMPERATURE = re.compile(
+    r"haiku-4[.-]5|sonnet-4[.-]5|opus-4[.-][0156]\b|claude-[23][.-]",
+    re.IGNORECASE,
+)
+
 
 @runtime_checkable
 class TurnComposer(Protocol):
@@ -142,9 +159,30 @@ class _ChatComposer:
         self._settings = settings or get_settings()
         self._model = self._settings.resolved_llm_model
 
+    @property
+    def _temperature(self) -> float | None:
+        """`LLM_TEMPERATURE`, or None when this model refuses to be told.
+
+        Sampling parameters were REMOVED with Opus 4.7 and are gone from every
+        model after it: a non-default `temperature` is a 400 on Sonnet 5, Opus 5
+        and Fable 5, while OMITTING it is accepted on all of them and on every
+        older model too. So this is an allowlist of the models that still take
+        one, and the default is to send nothing.
+
+        The direction matters. Omitting costs a slightly different sampling
+        temperature on a one-sentence spoken turn, which nobody can hear. Sending
+        it to a model that has dropped it costs every call on that model, and the
+        gateway is no protection — OpenRouter happens to drop the parameter today,
+        so the failure would surface only on `LLM_PROVIDER=anthropic`, which is
+        the path a desk switches to for lower latency.
+        """
+        if _TAKES_TEMPERATURE.search(self._model):
+            return self._settings.llm_temperature
+        return None
+
     # -- the one provider-specific method ---------------------------------- #
     def _chat(self, system: str, user: str, *, max_tokens: int,
-              temperature: float, json_mode: bool = False) -> tuple[str, bool]:
+              temperature: float | None, json_mode: bool = False) -> tuple[str, bool]:
         """`(text, truncated)`. `truncated` is True when the model ran out of
         tokens mid-sentence rather than finishing its reply.
 
@@ -179,7 +217,7 @@ class _ChatComposer:
         text, truncated = self._chat(
             _SYSTEM, prompt,
             max_tokens=self._settings.llm_max_tokens,
-            temperature=self._settings.llm_temperature,
+            temperature=self._temperature,
         )
         if truncated:
             # Retried HERE rather than left to `_say`, because the fix is known and
@@ -261,12 +299,13 @@ class OpenRouterComposer(_ChatComposer):
     def _chat(self, system: str, user: str, *, max_tokens: int,
               temperature: float, json_mode: bool = False) -> tuple[str, bool]:
         kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         resp = self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             max_tokens=max_tokens,
-            temperature=temperature,
             **kwargs,
         )
         # OpenRouter reports upstream failures as a body field on a 200 rather
@@ -286,8 +325,12 @@ class AnthropicComposer(_ChatComposer):
 
     Deliberately plain: no `thinking` and no `effort`. This composes one short
     spoken sentence while a carrier waits on the line, so latency is the budget
-    and there is nothing here worth reasoning about. (`effort` would in any case
-    be rejected on Haiku 4.5 — it arrived with the Opus 4.5 generation.)
+    and there is nothing here worth reasoning about. Sonnet 5 does support both —
+    this is a choice, not a limitation, and turning either on would spend the
+    budget the caller is waiting through.
+
+    `temperature` is sent only when the model still accepts one; see
+    `_ChatComposer._temperature` for why omitting is the safe default.
     """
 
     def __init__(self, settings: Settings | None = None):
@@ -308,9 +351,9 @@ class AnthropicComposer(_ChatComposer):
         message = self._client.messages.create(
             model=self._model,
             max_tokens=max_tokens,
-            temperature=temperature,
             system=system,
             messages=[{"role": "user", "content": user}],
+            **({} if temperature is None else {"temperature": temperature}),
         )
         # Safety classifiers can decline with HTTP 200 and an empty `content`,
         # so check `stop_reason` before reading blocks. An empty string is the

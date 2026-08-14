@@ -159,3 +159,44 @@ def test_l_prefixed_mode_is_unaffected():
     disambiguating there — so the guard must not touch it."""
     assert parsing.extract_load_id("about L1001") == "L1001"
     assert parsing.extract_load_id("MC 123456") == "L123456"
+
+
+def test_a_rate_written_half_in_digits_half_in_words():
+    """"26 hundred" and "24 fifty" are what BOTH sides of the call actually
+    produce — Whisper renders "twenty-six hundred" that way, and the composer
+    writes its own rates that way.
+
+    Before this, a digit scanner and a word scanner read the same figure
+    separately: "26 hundred" came out as {26, 100}, never 2600. That broke the
+    money guardrail on correct turns (measured: 0 of 8 composed turns passed) and
+    left the carrier's own ask unparsed.
+    """
+    assert parsing.extract_money("26 hundred") == 2600
+    assert parsing.extract_money("24 fifty") == 2450
+    assert parsing.extract_money("I can do 2 thousand") == 2000
+    assert parsing.fold_mixed_numbers("holding at 24 fifty") == "holding at 2450"
+    assert parsing.fold_mixed_numbers("can't get to 26 hundred") == "can't get to 2600"
+
+
+def test_folding_leaves_ordinary_quantities_alone():
+    """The fold runs over every agent reply before the money guardrail reads it,
+    so a figure invented here is a correct turn rejected as a rate leak."""
+    for text in ("it's 42,000 lbs", "819 miles", "load 2513446", "24 pieces",
+                 "picking up at 12 p.m.", "40,000 pounds on 24 pallets"):
+        assert parsing.fold_mixed_numbers(text) == text, text
+    # And the plain readings still come through unchanged.
+    assert parsing.extract_money("it's 42,000 lbs") == 42000
+    assert parsing.extract_money("819 miles") == 819
+
+
+def test_one_figure_gets_exactly_one_reading():
+    """The fold exists so the two scanners cannot disagree. "24 fifty" must read
+    as 2450 and NOT also leave a bare 24 behind — the leading fragment is what
+    the guardrail used to reject."""
+    from lanevoice.conversation.agent import _numbers
+
+    assert _numbers("I'm holding at 24 fifty") == {2450}
+    assert _numbers("can't get to 26 hundred, holding at 24 fifty") == {2600, 2450}
+    # A genuine bare abbreviation is still caught: "the 26" is not $2600, and the
+    # voice would say "twenty-six".
+    assert 26 in _numbers("what's driving the 26 on this one?")
