@@ -198,3 +198,96 @@ def test_an_empty_body_is_reported_as_no_audio():
     rec = _Recorder(b"", "audio/pcm;rate=24000;channels=1")
     with pytest.raises(RuntimeError, match="produced no audio"):
         _tts(rec)
+
+
+# --------------------------------------------------------------------------- #
+# Streaming the response body
+#
+# The caller used to hear nothing until the last byte of the utterance had
+# landed. PCM has no header, so any prefix is playable and each block can go
+# straight out — measured on the gateway, that is 0.64s of silence removed from a
+# full load pitch. The risk this trades for is byte alignment: a 16-bit sample
+# split across two network chunks and reassembled wrong does not glitch, it turns
+# the rest of the turn into white noise, and the transcript still reads perfectly.
+# --------------------------------------------------------------------------- #
+class _ChunkedRecorder(_Recorder):
+    """Delivers the body in fixed-size network chunks, so sample boundaries fall
+    INSIDE chunks the way they do on a real connection. 3 bytes is deliberately
+    coprime with the 2-byte sample so every boundary lands mid-sample."""
+
+    def __init__(self, content, content_type, chunk=3, status=200):
+        super().__init__(content, content_type, status)
+        self.chunk = chunk
+
+    def _handle(self, request):
+        import httpx
+        self.requests.append(request)
+        body, size = self.content, self.chunk
+
+        def blocks():
+            for i in range(0, len(body), size):
+                yield body[i:i + size]
+
+        return httpx.Response(self.status, content=blocks(),
+                              headers={"content-type": self.content_type})
+
+
+def test_samples_survive_chunk_boundaries():
+    """The whole point: reassembly must be byte-exact even when every network
+    chunk ends mid-sample."""
+    samples = list(range(-3000, 3000, 7))
+    rec = _ChunkedRecorder(_pcm(samples), "audio/pcm;rate=24000;channels=1", chunk=3)
+    audio = _tts(rec).synthesize("anything")
+    assert len(audio) == len(samples)
+    assert np.allclose(audio, np.array(samples, dtype=np.float32) / 32768.0)
+
+
+def test_audio_arrives_in_more_than_one_block():
+    """If it all came out in one block there would be nothing streamed and the
+    caller would wait exactly as long as before."""
+    rec = _ChunkedRecorder(_pcm(list(range(5000))),
+                           "audio/pcm;rate=24000;channels=1", chunk=3)
+    blocks = list(_tts(rec).stream_pcm("a long turn"))
+    assert len(blocks) > 1
+    assert all(len(b) % 2 == 0 for b in blocks)      # never a split sample
+    assert sum(len(b) for b in blocks) == 5000 * 2   # and nothing dropped
+
+
+def test_an_abandoned_turn_stops_pulling_audio():
+    """A caller who interrupts must not leave a thread draining the rest of the
+    utterance into a queue nobody reads."""
+    rec = _ChunkedRecorder(_pcm(list(range(20000))),
+                           "audio/pcm;rate=24000;channels=1", chunk=64)
+    tts = _tts(rec)
+    seen = []
+    for block in tts.stream_pcm("a very long turn", stop=lambda: len(seen) >= 1):
+        seen.append(block)
+    assert len(seen) == 1                            # stopped after the first
+    assert sum(len(b) for b in seen) < 20000 * 2     # well short of the whole
+
+
+def test_a_stereo_stream_is_still_downmixed_across_chunks():
+    """Reading a stereo stream as mono is the voice at half speed."""
+    left_right = [1000, 3000, -2000, -4000, 500, 1500]
+    rec = _ChunkedRecorder(_pcm(left_right), "audio/pcm;rate=24000;channels=2",
+                           chunk=3)
+    audio = _tts(rec).synthesize("anything")
+    assert len(audio) == 3
+    assert np.allclose(audio, np.array([2000, -3000, 1000],
+                                       dtype=np.float32) / 32768.0, atol=1e-4)
+
+
+def test_a_container_response_is_still_buffered_and_decoded():
+    """A WAV header cannot be streamed — it has to be read before any sample
+    means anything — so that path buffers, and must keep working."""
+    pytest.importorskip("soundfile")
+    import io as _io
+
+    import soundfile as sf
+    buffer = _io.BytesIO()
+    sf.write(buffer, np.array(_SAMPLES, dtype=np.int16), 16000, format="WAV")
+    rec = _ChunkedRecorder(buffer.getvalue(), "audio/wav", chunk=7)
+    tts = _tts(rec)
+    audio = tts.synthesize("anything")
+    assert tts.sample_rate == 16000
+    assert len(audio) == len(_SAMPLES)

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections.abc import Callable, Iterator
 
 import httpx
 import numpy as np
@@ -83,6 +84,23 @@ def speechify(text: str) -> str:
     return text
 
 
+# How much audio to hand downstream at a time. Raw PCM has no framing so the size
+# is ours to pick: small enough that the first block leaves as soon as it exists,
+# large enough that a 22-second utterance is ~30 pushes rather than the ~190
+# network chunks it arrives in. 80ms is inaudible as granularity.
+_BLOCK_SECONDS = 0.08
+
+
+def _downmix(pcm: bytes, channels: int) -> bytes:
+    """Frame-aligned 16-bit PCM -> mono. A no-op on the mono path, which is every
+    model configured here; present because a stereo stream read as mono is not a
+    subtle bug, it is the voice at half speed."""
+    if channels <= 1:
+        return pcm
+    samples = np.frombuffer(pcm, dtype="<i2").reshape(-1, channels)
+    return np.clip(samples.mean(axis=1), -32768, 32767).astype("<i2").tobytes()
+
+
 # `rate=` and `channels=` off an `audio/pcm;rate=24000;channels=1` Content-Type.
 _CT_PARAM_RE = re.compile(r";\s*(rate|channels)\s*=\s*(\d+)", re.IGNORECASE)
 
@@ -139,63 +157,125 @@ class OpenRouterTTS:
     def close(self) -> None:
         self._client.close()
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def _request_body(self, text: str) -> dict:
         body = {
             "model": self._model,
             # Say "$1400" as "fourteen hundred dollars", spell out load numbers.
             "input": speechify(text),
             # PCM skips a decode on both ends: no container to write, no MP3
             # frames to parse, and no dependence on the host's libsndfile being
-            # new enough to read MP3 at all.
+            # new enough to read MP3 at all. It is ALSO what makes streaming
+            # possible — see `stream_pcm`.
             "response_format": "pcm",
         }
         # Omitted entirely when unset — an empty `voice` is a 400, and Fish Audio
         # has a default voice of its own to fall back on.
         if self._voice:
             body["voice"] = self._voice
+        return body
 
-        response = self._client.post("/audio/speech", json=body)
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"OpenRouter /audio/speech -> HTTP {response.status_code} for model "
-                f"{self._model!r}"
-                + (f", voice {self._voice!r}" if self._voice else " (no voice sent)")
-                + f": {response.text[:300]}"
-            )
-        data = response.content
+    def _http_error(self, status: int, detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"OpenRouter /audio/speech -> HTTP {status} for model {self._model!r}"
+            + (f", voice {self._voice!r}" if self._voice else " (no voice sent)")
+            + f": {detail[:300]}"
+        )
+
+    def stream_pcm(self, text: str,
+                   stop: Callable[[], bool] | None = None) -> Iterator[bytes]:
+        """Yield 16-bit mono PCM as it arrives, instead of after it all has.
+
+        WHY THIS IS POSSIBLE AT ALL: raw PCM has no header and no framing, so any
+        prefix of the byte stream is already playable audio. A container could not
+        be streamed this way — its header has to be read before a single sample
+        means anything — which is why the non-PCM branch below still buffers.
+
+        WHAT IT ACTUALLY BUYS. A request splits into the provider GENERATING (no
+        bytes yet) and then the body TRANSFERRING. Streaming removes the second
+        part from the caller's wait — playback starts on the first block instead of
+        the last. Two runs, hours apart, on the same gateway:
+
+            utterance     audio   generation   transfer      utterance    audio  gen   xfer
+            long pitch    22.2s        2.14s      0.64s      pitch        17.9s  1.09s  0.33s
+            short turn     5.1s        2.03s      0.11s      short turn    6.4s  0.97s  0.20s
+
+        The absolute numbers move about twofold with gateway load, so re-measure
+        (`tools/measure_latency.py --tts`) rather than trusting either column. What
+        held across both runs is the SHAPE, and it is what justifies this design:
+
+          * generation barely depends on utterance length (2.14 vs 2.03; 1.09 vs
+            0.97) — it is close to a fixed floor per REQUEST;
+          * transfer scales with length, and is the streamable part.
+
+        So the honest saving here is 0.1-0.65s, biggest on the long load pitch.
+        It also means SPLITTING THE TEXT INTO SENTENCES WOULD BE A MISTAKE: each
+        chunk would pay the generation floor again, so three chunks would pay it
+        three times to save one transfer. The win is streaming the body, not
+        cutting up the input. (It also means the 0.12x-of-real-time figure in
+        `settings.py` only holds for long utterances — a short turn pays the same
+        floor as a long one.)
+
+        `stop` is polled between blocks so an interrupted turn closes the
+        connection instead of streaming into a queue nobody is reading.
+        """
+        with self._client.stream(
+                "POST", "/audio/speech", json=self._request_body(text)) as response:
+            if response.status_code >= 400:
+                response.read()
+                raise self._http_error(response.status_code, response.text)
+
+            content_type = response.headers.get("content-type", "")
+            if "pcm" not in content_type.lower():
+                # The model ignored `response_format` and sent a container.
+                # Reading a WAV/MP3 header as samples is a burst of noise down the
+                # phone, so decode it properly — buffered, necessarily.
+                audio = self._decode_container(response.read(), content_type)
+                if len(audio):
+                    yield (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+                return
+
+            rate, channels = _pcm_params(content_type)
+            if rate is None:
+                logger.warning(
+                    "OpenRouter returned PCM with no rate in its Content-Type (%r); "
+                    "falling back to TTS_SAMPLE_RATE=%d. If the voice sounds too "
+                    "fast or too slow, that is this.", content_type, self.sample_rate)
+            else:
+                self.sample_rate = rate
+
+            # One sample is 2 bytes per channel, and a network chunk can end
+            # mid-sample — so whole frames are emitted and the remainder carried.
+            # Getting this wrong shifts every later sample by a byte, which is
+            # not a glitch but white noise for the rest of the turn.
+            frame = 2 * max(1, channels)
+            block = max(frame, int(self.sample_rate * _BLOCK_SECONDS) * frame)
+            pending = bytearray()
+            for raw in response.iter_bytes():
+                if stop is not None and stop():
+                    return
+                pending += raw
+                while len(pending) >= block:
+                    usable = (len(pending) // frame) * frame
+                    chunk, pending = bytes(pending[:usable]), bytearray(pending[usable:])
+                    yield _downmix(chunk, channels)
+            usable = (len(pending) // frame) * frame
+            if usable:
+                yield _downmix(bytes(pending[:usable]), channels)
+
+    def synthesize(self, text: str) -> np.ndarray:
+        """The whole utterance as float32 mono — for the warmup, the tests and the
+        audition tool. Built on `stream_pcm` so there is only ever one request
+        shape and one decode to get wrong."""
+        data = b"".join(self.stream_pcm(text))
         if not data:
             return np.zeros(1, dtype=np.float32)
-
-        content_type = response.headers.get("content-type", "")
-        if "pcm" not in content_type.lower():
-            # The model ignored `response_format` and sent a container. Reading a
-            # WAV/MP3 header as samples is a burst of noise down the phone, so
-            # decode it properly instead.
-            return self._decode_container(data, content_type)
-        return self._decode_pcm(data, content_type)
+        return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
 
     # -- decoding ----------------------------------------------------------- #
-    def _decode_pcm(self, data: bytes, content_type: str) -> np.ndarray:
-        """Signed 16-bit little-endian PCM -> float32 mono in [-1, 1]."""
-        rate, channels = _pcm_params(content_type)
-        if rate is None:
-            logger.warning(
-                "OpenRouter returned PCM with no rate in its Content-Type (%r); "
-                "falling back to TTS_SAMPLE_RATE=%d. If the voice sounds too fast "
-                "or too slow, that is this.", content_type, self.sample_rate)
-        else:
-            self.sample_rate = rate
-
-        # An odd byte count means a truncated final sample; dropping it is right,
-        # while letting frombuffer raise would drop the whole turn.
-        usable = len(data) - (len(data) % (2 * channels))
-        if usable <= 0:
-            return np.zeros(1, dtype=np.float32)
-        audio = np.frombuffer(data[:usable], dtype="<i2").astype(np.float32) / 32768.0
-        if channels > 1:
-            audio = audio.reshape(-1, channels).mean(axis=1)
-        return audio
-
+    # There is deliberately no `_decode_pcm` any more: the PCM path is decoded
+    # once, inside `stream_pcm`, and `synthesize` joins its output. Two copies of
+    # "interpret these bytes as audio" is precisely the bug this module's
+    # docstring is about — the transcript looks perfect either way.
     def _decode_container(self, data: bytes, content_type: str) -> np.ndarray:
         import soundfile as sf
 

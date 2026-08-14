@@ -15,8 +15,8 @@ Run:  lanevoice-worker dev      (local)
 from __future__ import annotations
 
 import asyncio
+import threading
 
-import numpy as np
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -72,19 +72,67 @@ class OpenRouterTTSPlugin(lk_tts.TTS):
 
 
 class _TTSStream(lk_tts.ChunkedStream):
+    """Pushes audio to the caller as it arrives, not after all of it has.
+
+    The whole utterance used to be synthesised, decoded and only then handed over,
+    so the caller heard nothing until the last byte had landed. Raw PCM carries no
+    header, so any prefix of it is already playable — `OpenRouterTTS.stream_pcm`
+    yields ~80ms blocks off the wire and each one goes straight out, which takes
+    the body-transfer time out of the silence the caller sits through (measured
+    0.1-0.65s, biggest on a full load pitch).
+
+    It does NOT remove the time the provider spends generating before any byte
+    exists, which is the larger half and is a per-REQUEST floor rather than a
+    per-second one. `stream_pcm` has the measurements, and the reason that floor
+    is why splitting the text into sentences would make this worse, not better.
+
+    `stream_pcm` is a SYNC generator over a sync httpx stream — deliberately, so
+    the warmup, the tests and `tools/audition_voices.py` keep working unchanged —
+    so it is pumped on a worker thread and the blocks come back through a queue
+    the event loop can await.
+    """
+
     def __init__(self, tts, text, model, *, conn_options=DEFAULT_API_CONNECT_OPTIONS):
         super().__init__(tts=tts, input_text=text, conn_options=conn_options)
         self._model = model
 
     async def _run(self, output_emitter):
-        wav = await asyncio.to_thread(self._model.synthesize, self.input_text)
-        pcm16 = (np.clip(wav, -1, 1) * 32767).astype(np.int16).tobytes()
         output_emitter.initialize(
             request_id="tts", sample_rate=self._model.sample_rate,
             num_channels=1, mime_type="audio/pcm",
         )
-        output_emitter.push(pcm16)
-        output_emitter.flush()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        # Set when this turn is abandoned — a caller interrupting, or the line
+        # dropping. Polled between blocks so the HTTP response is closed instead
+        # of a thread going on filling a queue nobody will read.
+        stop = threading.Event()
+        _DONE = object()
+
+        def pump() -> None:
+            try:
+                for block in self._model.stream_pcm(self.input_text, stop=stop.is_set):
+                    loop.call_soon_threadsafe(queue.put_nowait, block)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the loop below
+                loop.call_soon_threadsafe(queue.put_nowait, exc)
+            else:
+                loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+
+        pumping = loop.run_in_executor(None, pump)
+        try:
+            while True:
+                item = await queue.get()
+                if item is _DONE:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                output_emitter.push(item)
+            output_emitter.flush()
+        finally:
+            # On the happy path the thread has already returned and this is a
+            # no-op; on cancellation it is what actually ends the request.
+            stop.set()
+            await asyncio.shield(pumping)
 
 
 # --------------------------------------------------------------------------- #

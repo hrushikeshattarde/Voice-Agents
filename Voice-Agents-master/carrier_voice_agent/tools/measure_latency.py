@@ -66,6 +66,13 @@ LLM_CANDIDATES = [
     "anthropic/claude-sonnet-5",
 ]
 
+# The longest thing the agent says, for the voice measurement — a full load
+# rundown is where streaming has the most silence to remove.
+PITCH = ("Alright, so that load's a full van of paper, forty thousand pounds, "
+         "picking up Monday in Marion, Ohio and delivering Wednesday in Sioux "
+         "Falls, South Dakota. It's 819 miles. I've got it at $2450 on this one. "
+         "Does that work for you?")
+
 RUNS = 3       # medians, because a single sample over a gateway is mostly noise.
 # Composition needs more samples than timing does: the figure that decides the
 # model is a PASS RATE against the money guardrail, and 3 runs cannot tell 60%
@@ -206,6 +213,43 @@ def measure_llm(settings) -> None:
             print(f"      [{'PASS' if ok else 'FAIL'}] {text[:118]}")
 
 
+def measure_tts(settings) -> None:
+    """What the caller gains from streaming the voice, and what is left over.
+
+    `audition_voices.py` measures a whole utterance, which is the right number for
+    choosing a voice. This is the number that matters once one is chosen: how long
+    the caller sits in silence before the FIRST audio arrives.
+
+    The gap between the two columns is what streaming removed. What it cannot
+    remove is the provider's generation time, which is close to a fixed cost here
+    rather than proportional to length — so a short turn pays nearly as much as a
+    long one, and splitting the text into sentences would pay it per sentence.
+    """
+    from lanevoice.voice import OpenRouterTTS
+
+    print("\n" + "=" * 78)
+    print("VOICE — first audio vs. complete. The gap is what streaming removed;")
+    print("the 'first' column is the provider generating, which it cannot remove.")
+    print("=" * 78)
+    tts = OpenRouterTTS(settings)
+    try:
+        for label, line in (("short turn", LINES[0][1]), ("full load pitch", PITCH)):
+            started = time.monotonic()
+            first, total = None, 0
+            for block in tts.stream_pcm(line):
+                if first is None:
+                    first = time.monotonic() - started
+                total += len(block)
+            complete = time.monotonic() - started
+            seconds = total / 2 / max(1, tts.sample_rate)
+            print(f"\n  {label} ({seconds:.1f}s of audio)")
+            print(f"    first audio  {first:>6.2f}s   <- what the caller waits")
+            print(f"    complete     {complete:>6.2f}s")
+            print(f"    streaming saved {complete - first:>5.2f}s of silence")
+    finally:
+        tts.close()
+
+
 def main() -> None:
     load_env()
     settings = get_settings()
@@ -214,6 +258,8 @@ def main() -> None:
     args = sys.argv[1:]
     if not args or "--stt" in args:
         measure_stt(settings)
+    if not args or "--tts" in args:
+        measure_tts(settings)
     if not args or "--llm" in args:
         measure_llm(settings)
     print("\nPut the winners in .env:  STT_MODEL=<model>   LLM_MODEL=<model>")
