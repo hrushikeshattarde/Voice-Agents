@@ -1,0 +1,16 @@
+# Account managers a rep can send their practice report to.
+#
+# Add one [[managers]] block per manager and restart the dashboard. The `id`
+# is what the browser sends back, the `email` is where the report goes. All
+# three fields are required; a malformed entry stops the dashboard at boot
+# with this file named — better than a quarter of reports mailed to a typo.
+#
+# [[managers]]
+# id = "asmith"
+# name = "Alex Smith"
+# email = "alex.smith@circledelivers.com"
+#
+# [[managers]]
+# id = "jdoe"
+# name = "Jordan Doe"
+# email = "jordan.doe@circledelivers.com"

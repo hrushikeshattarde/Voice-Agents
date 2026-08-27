@@ -595,10 +595,28 @@ class CarrierSalesAgent:
         self._levers_used += 1
         return lever
 
+    def _sync_transcript(self) -> None:
+        """Persist the transcript-so-far after each turn.
+
+        Two reasons. A live view (the dashboard's Runs page) can read the call
+        while it is still happening; and a worker crash mid-call loses nothing.
+        It also picks up the agent's FINAL line on concluded calls: `_finish`
+        writes the record before the goodbye is composed, so without this last
+        sync the stored transcript would always be one line short.
+
+        Best-effort by design — a failed bookkeeping write must never end a
+        call that is otherwise going fine.
+        """
+        try:
+            self._repo.update_transcript(self.call_id, self.transcript)
+        except Exception:  # noqa: BLE001 - never let bookkeeping end a call
+            logger.warning("could not sync live transcript for %s",
+                           self.call_id, exc_info=True)
+
     # -- entry points ------------------------------------------------------- #
     def greeting(self) -> str:
         self.state = CallState.IDENTIFY_LOAD
-        return self._say(
+        spoken = self._say(
             "Answer the inbound call. Name the company, give your first name, and ask "
             "what you can help with — that's it. Real desks answer short; do not "
             "deliver a speech, do not list what you do, and do not ask for a load "
@@ -606,6 +624,8 @@ class CarrierSalesAgent:
             facts=f"Your name: {REP_NAME}. Brokerage: Circle Logistics.",
             amounts=set(),
         )
+        self._sync_transcript()
+        return spoken
 
     def handle(self, user_text: str) -> str:
         self._log_user(user_text)
@@ -626,6 +646,9 @@ class CarrierSalesAgent:
             # The board, the carrier file or the contact list is unreachable. Not
             # recoverable by asking the caller anything, so stop asking.
             return self._backend_failure(exc)
+        finally:
+            # Every exit path — including a handler that just finished the call.
+            self._sync_transcript()
 
     # -- Step 2: identify load --------------------------------------------- #
     def _identify_load(self, text: str) -> str:
@@ -1716,6 +1739,32 @@ class CarrierSalesAgent:
         )
         if rep_id and outcome == CallOutcome.TRANSFERRED:
             self._repo.log_transfer(self.call_id, rep_id, "connected")
+
+    def note_playback_cut(self, spoken_line: str) -> None:
+        """The caller spoke over this line and its audio stopped mid-play.
+
+        The transcript records what was COMPOSED; barge-in means the caller may
+        have heard none of it. Observed live: a caller filling dead air with
+        "hello?" cut off the very answer they were waiting for, and the record
+        showed a line they never heard. The note keeps the audit honest without
+        polluting the dialogue the composer reads.
+        """
+        self._repo.log_note(
+            self.call_id,
+            f'Caller spoke over this line — its audio was cut off mid-play, so '
+            f'they may not have heard it: "{spoken_line}"')
+
+    def abandon(self) -> None:
+        """The line dropped before the call concluded — finalize the record.
+
+        The transcript is only persisted at `end_call`, so a caller hanging up
+        mid-call would otherwise leave an open row and LOSE everything said —
+        and hangups are precisely the calls a desk wants to read back. Called by
+        the telephony worker on disconnect (and safe to call twice: a call that
+        already finished keeps its real outcome).
+        """
+        if self.state != CallState.DONE:
+            self._finish(CallOutcome.ABANDONED)
 
     def summary(self) -> dict:
         return {

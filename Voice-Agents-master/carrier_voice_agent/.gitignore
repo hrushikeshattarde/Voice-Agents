@@ -8,6 +8,11 @@ carrier_agent.db-journal
 # Audio written by tools/audition_voices.py when comparing TTS voices.
 voice-samples/
 
+# Runtime audio: practice-session clips/recordings and phone-call recordings.
+# These are recordings of real people — local data, never repository content.
+practice_audio/
+call_recordings/
+
 # build / packaging
 build/
 dist/

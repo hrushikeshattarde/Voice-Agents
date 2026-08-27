@@ -266,6 +266,129 @@ class Settings(BaseSettings):
     min_endpointing_delay: float = Field(default=1.3, validation_alias="MIN_ENDPOINTING_DELAY")
     max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
 
+    # Dead-air filler: when a reply takes longer than this to compose, the agent
+    # immediately speaks a short pre-synthesized acknowledgment ("Alright, one
+    # sec.") while the real reply is written. Composition measures ~3.4s on the
+    # shipped model, and a caller sitting in that silence says "hello?" — which
+    # used to cut off the very reply they were waiting for. The clips are made
+    # once at worker start with the configured voice, carry no facts and no
+    # numbers, and are deliberately NOT part of the transcript record. 0 turns
+    # the feature off.
+    filler_delay: float = Field(default=0.8, validation_alias="FILLER_DELAY")
+
+    # Barge-in: how much CONTINUOUS caller speech cancels the agent's audio
+    # mid-play. The library default (0.5s) meant a caller's "hello?" — spoken to
+    # fill the dead air while the reply was still being synthesized — cut off
+    # the very answer they were waiting for, twice in a row on one observed
+    # call. 0.9s lets a short line-check pass over the top without killing
+    # playback, while a caller genuinely talking over the agent still
+    # interrupts in under a second.
+    min_interruption_duration: float = Field(
+        default=0.9, validation_alias="MIN_INTERRUPTION_DURATION")
+    # An "interruption" that never produces a transcript (a cough, a passing
+    # horn) resumes the cut line after this long instead of leaving dead air.
+    resume_false_interruption: bool = Field(
+        default=True, validation_alias="RESUME_FALSE_INTERRUPTION")
+    false_interruption_timeout: float = Field(
+        default=2.0, validation_alias="FALSE_INTERRUPTION_TIMEOUT")
+
+    # VAD: how confidently (threshold) and how long (seconds) someone must speak
+    # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are
+    # too twitchy for a phone line — background noise reads as turns. But the
+    # first hand tuning (0.6 / 0.2s) proved too deaf the other way: on a live
+    # call a soft one-syllable "Sure." never triggered the VAD at all, so the
+    # agent sat silent on an answer it had asked for. These defaults sit between.
+    # If the agent starts replying to line noise, raise them toward 0.6 / 0.2;
+    # if it misses short answers ("yes", "sure"), lower them toward the Silero
+    # defaults.
+    vad_activation_threshold: float = Field(
+        default=0.55, validation_alias="VAD_ACTIVATION_THRESHOLD")
+    vad_min_speech_duration: float = Field(
+        default=0.10, validation_alias="VAD_MIN_SPEECH_DURATION")
+
+    # --- Practice mode (dashboard pitch trainer) ------------------------------ #
+    # The customer a rep practices against is played by the same configured
+    # composer model — no separate key, no separate provider. These knobs only
+    # bound a session; the mood itself lives in the profile TOML files under
+    # `practice/data/profiles/`.
+    #
+    # Hard cap on REP turns in one session. Past forty exchanges it isn't
+    # practice anymore — and every turn is a paid model call, so this is also
+    # the cost ceiling on a tab somebody forgot to close.
+    practice_max_turns: int = Field(default=40, validation_alias="PRACTICE_MAX_TURNS")
+    # Token budget for one customer line. Same order as LLM_MAX_TOKENS and for
+    # the same reason: a person on a phone speaks in sentences, and a budget
+    # this size simply cannot fit a monologue.
+    practice_reply_max_tokens: int = Field(
+        default=220, validation_alias="PRACTICE_REPLY_MAX_TOKENS")
+    # The judge writes a full scorecard — eight scored dimensions with quotes,
+    # strengths, improvements, a summary — in one JSON reply. Unlike a spoken
+    # turn nobody is waiting on the line for it, so the budget and the timeout
+    # are sized for completeness, not latency. A truncated verdict is retried
+    # once with a brevity instruction (truncated JSON never parses).
+    #
+    # 4000, measured: the first live scorecard ran ~2100 tokens and was cut off
+    # at a 2000 budget — TWICE, because even the brevity retry couldn't fit.
+    # Don't shave this to save pennies; a judge that can't finish its sentence
+    # scores nothing at all.
+    practice_judge_max_tokens: int = Field(
+        default=4000, validation_alias="PRACTICE_JUDGE_MAX_TOKENS")
+    practice_judge_timeout: float = Field(
+        default=60.0, validation_alias="PRACTICE_JUDGE_TIMEOUT")
+    # The VOCAL-delivery judge — tone, clarity, energy, pace, warmth — needs a
+    # model that accepts audio input, which no Claude model does, so this is the
+    # one place practice reaches past the composer's provider. Chosen by probe
+    # (2026-08-18): of 38 audio-input models on the gateway, gemini-3.7-flash
+    # returned accurate, prosody-specific verdicts at flash-class pricing
+    # (~$0.002/session). Same OpenRouter key as everything else. Set EMPTY to
+    # turn vocal judging off; the conversational scorecard is unaffected.
+    practice_delivery_model: str = Field(
+        default="google/gemini-3.7-flash", validation_alias="PRACTICE_DELIVERY_MODEL")
+    # Practice voice turns are RECORDINGS OF YOUR REPS. By default each clip
+    # lives only until its session is scored, then is deleted. Set true to keep
+    # them on disk (under practice_audio/ next to the DB) — a deliberate choice
+    # a desk should make consciously, not inherit.
+    practice_keep_audio: bool = Field(
+        default=False, validation_alias="PRACTICE_KEEP_AUDIO")
+
+    # --- Call recording -------------------------------------------------------#
+    # Record real phone calls, both sides time-aligned, using livekit-agents'
+    # built-in session recorder — no custom code touches the live audio path.
+    # Each finished call lands as `call_recordings/<call_id>.ogg` next to the
+    # DB and plays in the dashboard's Runs drawer.
+    #
+    # OFF BY DEFAULT, deliberately, for two reasons a desk must weigh before
+    # flipping it:
+    #  * CONSENT. Several US states require ALL parties to consent to a
+    #    recording. Add a "this call may be recorded" line to the greeting
+    #    before enabling — that wording is a business decision, not a default.
+    #  * RETENTION. On LiveKit Cloud the SDK also uploads the recording to
+    #    LiveKit's session observability at call end (their dashboard shows
+    #    it). LiveKit already carries the raw call audio either way, but a
+    #    stored copy there is a retention decision to make knowingly.
+    record_calls: bool = Field(default=False, validation_alias="RECORD_CALLS")
+
+    # --- Practice report email ----------------------------------------------- #
+    # The scored report goes to the rep's account manager (picked at session
+    # start, from practice/data/managers.toml). This is the codebase's FIRST
+    # outbound email — everything email-shaped before it was address parsing —
+    # and it is gated the way every integration is: unset SMTP_HOST/SMTP_FROM
+    # and reports are still scored, stored and shown, just never mailed (the
+    # skip is recorded on the report, not silent). Sending uses the stdlib;
+    # there is no mail-provider dependency to configure beyond these.
+    smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
+    smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
+    smtp_username: str = Field(default="", validation_alias="SMTP_USERNAME")
+    smtp_password: str = Field(default="", validation_alias="SMTP_PASSWORD")
+    smtp_from: str = Field(default="", validation_alias="SMTP_FROM")
+    # STARTTLS on the standard submission port is the overwhelming default;
+    # turn off only for a trusted internal relay (or a local test sink).
+    smtp_starttls: bool = Field(default=True, validation_alias="SMTP_STARTTLS")
+
+    @property
+    def uses_practice_email(self) -> bool:
+        return bool(self.smtp_host.strip() and self.smtp_from.strip())
+
     # --- Deadhead ------------------------------------------------------------ #
     # Driving miles over straight-line miles. The agent estimates how far a
     # caller's empty truck is from the pickup with a great-circle distance and

@@ -19,7 +19,7 @@ import asyncio
 
 import pytest
 
-from lanevoice.telephony.worker import _TTSStream
+from lanevoice.telephony.worker import FILLER_LINES, _pcm_frames, _TTSStream
 
 
 class _FakeEmitter:
@@ -148,3 +148,35 @@ def test_an_empty_utterance_still_completes():
     _run(_stream(_FakeModel([])), emitter)
     assert emitter.pushes == []
     assert emitter.flushed == 1
+
+
+# --------------------------------------------------------------------------- #
+# Dead-air filler clips
+# --------------------------------------------------------------------------- #
+def test_filler_pcm_is_framed_losslessly():
+    """The cached clip must reach the caller byte-for-byte, in 20ms frames.
+
+    A frame that drops or duplicates samples is an audible click on every
+    single filler, and an odd trailing byte would build a corrupt AudioFrame.
+    """
+    sample_rate = 24000
+    pcm = bytes(range(256)) * 400 + b"\x01\x02"   # not a multiple of the frame size
+
+    async def collect():
+        return [f async for f in _pcm_frames(pcm, sample_rate)]
+
+    frames = asyncio.run(collect())
+    step = int(sample_rate * 0.02) * 2
+    assert all(len(bytes(f.data)) <= step for f in frames)
+    assert all(f.sample_rate == sample_rate and f.num_channels == 1 for f in frames)
+    rebuilt = b"".join(bytes(f.data) for f in frames)
+    assert rebuilt == pcm[: len(rebuilt)]
+    assert len(pcm) - len(rebuilt) < 2            # at most the odd half-sample
+
+
+def test_filler_lines_carry_no_facts():
+    """Fillers play in ANY call state, so they must never contain a number, a
+    dollar sign, or anything that could collide with the money guardrail."""
+    for line in FILLER_LINES:
+        assert not any(ch.isdigit() for ch in line), line
+        assert "$" not in line, line

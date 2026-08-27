@@ -23,6 +23,12 @@ _BEHAVIOUR_SWITCHING_ENV = (
     "TRANSPORT_PRO_OFFICE_TERMINAL_CODE",
     "TRANSPORT_PRO_OFFICE_TERMINAL_IDS",
     "TRANSPORT_PRO_EXTRA_TERMINAL_IDS",
+    # SMTP_HOST + SMTP_FROM switch practice reports from "stored only" to
+    # "stored and MAILED" — a filled-in .env must never make a test send email.
+    "SMTP_HOST",
+    "SMTP_FROM",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD",
 )
 
 

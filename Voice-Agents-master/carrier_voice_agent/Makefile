@@ -1,4 +1,4 @@
-.PHONY: install demo chat live tpcheck test lint fmt worker initdb docker
+.PHONY: install demo chat live tpcheck test lint fmt worker initdb docker dashboard
 
 install:            ## install deps (incl. dev) into the uv venv
 	uv sync --extra dev
@@ -26,6 +26,9 @@ fmt:                ## auto-format / fix
 
 worker:             ## run the LiveKit worker (dev mode)
 	uv run lanevoice-worker dev
+
+dashboard:          ## web dashboard: runs, transcripts, playground (no keys needed)
+	uv run lanevoice-dashboard
 
 initdb:             ## create + seed the SQLite database
 	uv run lanevoice-initdb

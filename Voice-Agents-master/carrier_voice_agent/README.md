@@ -32,6 +32,11 @@ src/lanevoice/
 ├── datasource.py          # picks the backend from DATA_SOURCE
 ├── voice/                 # OpenRouterTTS + the composer (writes every spoken turn)
 ├── telephony/             # LiveKit worker (STT plugin + TTS adapter + lifecycle)
+├── dashboard/             # web UI: runs + transcripts + negotiation ladders,
+│                          #   analytics, browser playground (stdlib HTTP, no keys)
+├── practice/              # sales-pitch trainer: customer personas (TOML data),
+│                          #   voice loop, two judges (rubric + vocal delivery),
+│                          #   call recordings, manager report email
 └── demo.py                # text-mode simulation (no keys)
 tests/                     # pytest: parsing, negotiation, verification, conversation,
                            #   Transport Pro client / mappers / repository / full calls
@@ -53,8 +58,10 @@ tests in `tests/`.
 
 ```bash
 make install          # uv sync --extra dev
-make test             # 483 unit tests, no keys needed
+make test             # unit tests, no keys needed
 make demo             # text simulation of every scenario
+make dashboard        # web UI at http://127.0.0.1:8710 — runs, transcripts,
+                      #   analytics, and a browser playground (no keys needed)
 ```
 
 To take real calls, add credentials then run the worker:
@@ -91,13 +98,29 @@ allowed to speak. Drop `--live` to run the same thing on seed data.
 ```bash
 make test
 ```
-483 tests, offline. Includes the two real production load payloads and the
-real Highway assessment shape.
+713 tests, offline. Includes the two real production load payloads, the real
+Highway assessment shape, and the whole practice trainer (personas, judges,
+speech legs, mailer — all against fakes that speak the real wire formats).
 SIP wiring: [docs/LIVE_SETUP.md](docs/LIVE_SETUP.md) ·
 call scripts: [docs/TEST_CALL_SCRIPTS.md](docs/TEST_CALL_SCRIPTS.md).
 
 Console entry points (installed by `uv sync`):
-`lanevoice-worker` · `lanevoice-demo` · `lanevoice-initdb` · `lanevoice-tpcheck`.
+`lanevoice-worker` · `lanevoice-demo` · `lanevoice-initdb` · `lanevoice-tpcheck`
+· `lanevoice-dashboard`.
+
+### Watching it work
+
+`lanevoice-dashboard` serves the operations UI over the local audit database:
+every run with its transcript and negotiation ladder, booking-rate analytics,
+the board, and a **playground** that drives the real `CarrierSalesAgent` by
+text in the browser — the same repository and negotiation engine the phone
+worker uses, writing the same audit trail. Playground runs are labelled apart
+from phone runs. Stdlib HTTP only (no new dependencies), binds to 127.0.0.1,
+and never sends a secret to the browser. It does not answer the phone —
+`lanevoice-worker` does — and both run happily side by side.
+
+The **Practice** tab is the same machinery pointed at training the humans —
+see [Practice mode](#practice-mode) below.
 
 **Full run guide (every command + every case):** [docs/USAGE.md](docs/USAGE.md).
 
@@ -125,7 +148,7 @@ via `.env`:
 | Highway timeout (s) | `HIGHWAY_TIMEOUT` | `8.0` |
 | Prefer Highway's company name | `HIGHWAY_PREFER_COMPANY_NAME` | `true` |
 | Booking-link endpoint *(optional)* | `HAPPYROBOT_URL` / `HAPPYROBOT_TOKEN` | — (offers log without a link) |
-| STT model | `STT_MODEL` | `openai/whisper-large-v3` |
+| STT model | `STT_MODEL` | `openai/whisper-large-v3-turbo` (chosen on accuracy for spoken rates — see settings.py) |
 | **LLM provider** | `LLM_PROVIDER` | `openrouter` (or `anthropic`) |
 | LLM model | `LLM_MODEL` | unset = per provider: `anthropic/claude-haiku-4.5` (openrouter) or `claude-haiku-4-5` (anthropic) |
 | LLM timeout (s) | `LLM_TIMEOUT` | `20.0` |
@@ -134,7 +157,12 @@ via `.env`:
 | TTS timeout (s) | `TTS_TIMEOUT` | `15.0` |
 | Deadhead road factor | `DEADHEAD_ROAD_FACTOR` | `1.2` (driving / straight-line) |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
-| Turn buffer (s) | `MIN_ENDPOINTING_DELAY` | `0.8` |
+| Turn buffer (s) | `MIN_ENDPOINTING_DELAY` | `1.3` |
+| VAD: speech confidence to count as a turn | `VAD_ACTIVATION_THRESHOLD` | `0.55` |
+| VAD: minimum speech length (s) | `VAD_MIN_SPEECH_DURATION` | `0.10` |
+| Barge-in: speech needed to cut the agent off (s) | `MIN_INTERRUPTION_DURATION` | `0.9` |
+| Resume a line cut by noise (no transcript)? | `RESUME_FALSE_INTERRUPTION` | `true` |
+| Speak a filler when a reply takes longer (s, 0=off) | `FILLER_DELAY` | `0.8` |
 | Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `8` |
 | Reserve below Max Buy | `NEGOTIATION_BUFFER` | `0` (may reach Max Buy) |
 | Share of their move we return | `NEGOTIATION_RECIPROCITY` | `0.5` (lower = firmer) |
@@ -143,6 +171,15 @@ via `.env`:
 | Gap that triggers the split close | `NEGOTIATION_SPLIT_GAP_RATE` | `0.30` |
 | Best-and-final if they never moved | `NEGOTIATION_STONEWALL_FINAL_RATE` | `0.5` |
 | Pushes before best-and-final | `NEGOTIATION_MAX_HOLDS` | `2` |
+| **Record phone calls?** | `RECORD_CALLS` | `false` — see the consent + retention notes in settings.py before enabling. On: each call saves to `call_recordings/<call_id>.ogg` and plays in the Runs drawer |
+| **Practice:** rep turns per session | `PRACTICE_MAX_TURNS` | `40` (also the cost ceiling on a forgotten tab) |
+| Practice: customer line budget | `PRACTICE_REPLY_MAX_TOKENS` | `220` |
+| Practice: judge budget / timeout | `PRACTICE_JUDGE_MAX_TOKENS` / `PRACTICE_JUDGE_TIMEOUT` | `4000` / `60.0` — 2000 truncated a real verdict, twice |
+| Practice: vocal-delivery judge | `PRACTICE_DELIVERY_MODEL` | `google/gemini-3.7-flash` (probe-chosen; empty = vocal judging off) |
+| Practice: keep raw voice clips? | `PRACTICE_KEEP_AUDIO` | `false` — turn clips die at scoring; the stitched call recording is kept |
+| Practice report email | `SMTP_HOST` / `SMTP_PORT` / `SMTP_FROM` | — / `587` / — (unset = reports stored, never mailed) |
+| SMTP login (if the relay wants one) | `SMTP_USERNAME` / `SMTP_PASSWORD` | — |
+| STARTTLS on the SMTP session | `SMTP_STARTTLS` | `true` |
 
 Change a model = change one line (or one env var). Nothing else hard-codes it.
 
@@ -248,6 +285,57 @@ both directions, because Transport Pro's list has been observed wrong each way �
 and falls back to Transport Pro's own list otherwise. An unmet requirement is a
 warm transfer, never a decline: it is a fact about the freight, not a judgement on
 the carrier. Without a Highway token the checks are skipped, loudly.
+
+## Practice mode
+
+The dashboard's **Practice** tab flips the table: the model plays a CUSTOMER in
+one of eight moods a freight desk actually meets — the Brush-off, the Rate
+Shopper, the Burned Shipper, the Busy Operator, the Chatty Non-committer, the
+Skeptical Negotiator, the Gatekeeper, the Loyal Incumbent — and the human rep
+makes the pitch, by voice (hold-to-talk in the browser) or by text.
+
+Personas are **data, not code**: one TOML each under
+[practice/data/profiles/](src/lanevoice/practice/data/profiles/), carrying the
+mood, the speech style, the hidden facts a good discovery question earns, what
+warms the customer up and what makes them hang up, and the session's win
+condition. A malformed file stops the dashboard at boot with the field named.
+The browser gets the picker card only — the hidden material never leaves the
+server, so a rep can't read the answer key with devtools.
+
+Every finished session is **scored twice and measured once**:
+
+* **Conversation** — a fixed eight-dimension rubric (opening, discovery,
+  listening, objection handling, value, composure, closing, plus a per-persona
+  focus), judged by the composer model with a verbatim quote behind every score
+  and a concrete better line behind every improvement, and a strict verdict on
+  whether the rep actually achieved the goal.
+* **Vocal delivery** (voice sessions) — confidence, clarity, energy, pace and
+  warmth, judged by an audio-input model that hears the rep's actual clips
+  (`PRACTICE_DELIVERY_MODEL`; no Claude model accepts audio, so this is the one
+  place practice reaches past the composer's provider).
+* **Metrics** — deterministic arithmetic no model can fudge: talk ratio,
+  questions asked, fillers per minute, words per minute, pause ratio, leading
+  hesitation. Week-over-week progress you can trust.
+
+Both sides of a voice call are stitched into a **replayable recording** served
+in the report view; the raw per-turn clips are deleted the moment scoring
+finishes unless `PRACTICE_KEEP_AUDIO=true` — they are recordings of your reps,
+so keeping them is a decision, not a default. Pick an **account manager** at
+session start (roster:
+[practice/data/managers.toml](src/lanevoice/practice/data/managers.toml)) and
+the scored report is emailed to them — stdlib SMTP, gated on
+`SMTP_HOST`/`SMTP_FROM`, and non-fatal by design: a dead mail server is
+recorded on the report row, never a lost scorecard. Judge failures degrade the
+same way. The transcript is always safe first.
+
+Practice needs a real model (`OPENROUTER_API_KEY`); it refuses the offline stub
+by naming the setting, because a customer with no model can't hold a
+conversation worth practicing against. Sessions cost roughly a cent each —
+persona turns, two judge calls, and speech for voice mode.
+
+**Scripts to exercise every persona and every path:**
+[docs/PRACTICE_SCRIPTS.md](docs/PRACTICE_SCRIPTS.md) — worked strong/weak plays
+per customer mood, plus the system checks (recordings, retention, email states).
 
 ## Out of scope (v1)
 Outbound calling, multi-load calls, production fraud scoring beyond the

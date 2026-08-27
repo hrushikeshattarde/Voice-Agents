@@ -35,6 +35,7 @@ lanevoice-worker = "lanevoice.telephony.worker:main"
 lanevoice-demo = "lanevoice.demo:main"
 lanevoice-initdb = "lanevoice.db.database:main"
 lanevoice-tpcheck = "lanevoice.integrations.transportpro.check:main"
+lanevoice-dashboard = "lanevoice.dashboard.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -47,7 +48,17 @@ packages = ["src/lanevoice"]
 # geocoding call. Named explicitly so a packaging change can't silently drop it —
 # the symptom would be the agent quietly never mentioning distance again, with no
 # error anywhere. `tests/test_geo.py` asserts it loads.
-artifacts = ["src/lanevoice/data/*.csv.gz"]
+# The dashboard's static assets ride along for the same reason: without them
+# `lanevoice-dashboard` serves 404s for its own UI.
+# The practice-mode customer profiles are data files too — dropped from the
+# wheel, the symptom would be the dashboard refusing to boot with "No practice
+# profiles found". `tests/test_practice_profiles.py` asserts the set loads.
+artifacts = [
+    "src/lanevoice/data/*.csv.gz",
+    "src/lanevoice/dashboard/static/*",
+    "src/lanevoice/practice/data/*.toml",
+    "src/lanevoice/practice/data/profiles/*.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

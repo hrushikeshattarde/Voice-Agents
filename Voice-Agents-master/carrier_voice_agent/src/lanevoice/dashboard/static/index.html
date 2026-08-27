@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LaneVoice — Carrier Sales AI</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234a3aa7'/%3E%3Cpath d='M10 8v12h9' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='22' cy='23' r='2.4' fill='white'/%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">LV</div>
+        <div>
+          <div class="brand-name">LaneVoice</div>
+          <div class="brand-sub">Circle Logistics</div>
+        </div>
+      </div>
+      <nav class="nav-section" id="nav-main" aria-label="Main">
+        <div class="nav-label">Workspace</div>
+      </nav>
+      <nav class="nav-section" id="nav-system" aria-label="System">
+        <div class="nav-label">System</div>
+      </nav>
+      <div class="side-foot">
+        <div class="source-pill" id="source-pill" title="Data source">
+          <span class="dot"></span><span id="source-label">connecting…</span>
+        </div>
+        <button class="theme-btn" id="theme-toggle" type="button">◐&nbsp; Toggle theme</button>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <div>
+          <div class="page-title" id="page-title"></div>
+          <div class="page-sub" id="page-sub"></div>
+        </div>
+        <div id="page-actions"></div>
+      </div>
+      <div id="page"></div>
+    </main>
+  </div>
+
+  <div class="drawer-veil" id="drawer-veil"></div>
+  <aside class="drawer" id="drawer" aria-label="Call detail"></aside>
+  <div id="tooltip" role="tooltip"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

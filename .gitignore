@@ -1,3 +1,11 @@
+# Secrets — NEVER commit these. THIS file is the repo root, so this rule is
+# the one that actually protects the .env sitting next to it (the LiveKit
+# secret, the OpenRouter key, the Transport Pro production password).
+# carrier_voice_agent/.gitignore only covers a .env inside that directory.
+.env
+.env.*
+!.env.example
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -8,3 +16,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local databases — the call audit trail holds real transcripts and rates.
+*.db
+*.sqlite
+*.sqlite3

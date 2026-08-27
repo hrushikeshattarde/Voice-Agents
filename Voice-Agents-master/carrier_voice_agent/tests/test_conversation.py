@@ -328,6 +328,26 @@ def test_a_location_only_answer_is_followed_up_for_the_timing(repo):
     assert a._load_revealed
 
 
+def test_a_greeting_is_not_a_place(repo):
+    """Observed live: dead air made the caller say "Hello." — and the agent
+    answered "Alright, Hello, got it" with the truck now empty in a town called
+    Hello. A greeting, a line-check ("you there?") or a bare "right" is never a
+    location; the agent keeps asking instead."""
+    from lanevoice import parsing
+    for line in ("Hello.", "hello", "hey", "hi", "you there?", "anybody there",
+                 "can you hear me", "right", "alright"):
+        assert parsing.extract_empty_location(line) is None, \
+            f"{line!r} was read as a location"
+    # And through the agent: the first greeting turn stays in ask_empty.
+    a = _agent(repo)
+    a.greeting()
+    a.handle("L1001")
+    a.handle("MC 123456")
+    a.handle("Hello.")
+    assert a._empty_location is None
+    assert a.state.value == "ask_empty"
+
+
 def test_a_timing_only_answer_is_followed_up_for_the_place(repo):
     a = _agent(repo)
     a.greeting()

@@ -98,6 +98,56 @@ CREATE TABLE IF NOT EXISTS call_notes (
     note      TEXT,
     timestamp TEXT
 );
+
+-- Practice mode: a rep pitching a simulated customer from the dashboard.
+-- One row per session, written turn by turn like `calls` — a browser tab
+-- closed mid-session loses nothing but the turn in flight. Deliberately NOT
+-- a row in `calls`: these are training runs about the rep, not audit trail
+-- about a carrier, and nothing downstream should ever mistake one for a call.
+CREATE TABLE IF NOT EXISTS practice_sessions (
+    session_id   TEXT PRIMARY KEY,
+    rep_name     TEXT NOT NULL,
+    manager_name  TEXT,                       -- account manager the report mails to
+    manager_email TEXT,                       -- (null: rep chose not to send)
+    profile_id   TEXT NOT NULL,               -- e.g. 'burned_shipper'
+    profile_name TEXT NOT NULL,               -- denormalized: survives profile edits
+    started_at   TEXT NOT NULL,
+    ended_at     TEXT,
+    turns        INTEGER NOT NULL DEFAULT 0,  -- rep turns, the billing unit
+    transcript   TEXT,                        -- JSON [["rep"|"customer", line], ...]
+    status       TEXT NOT NULL DEFAULT 'active',   -- active | done
+    end_reason   TEXT,                        -- ended | hangup | turn_limit | abandoned
+    mode         TEXT NOT NULL DEFAULT 'text',     -- text | voice
+    -- Talk-time totals for the scoring metrics: rep seconds measured by the
+    -- browser's push-to-talk timer, customer seconds exact from synthesis.
+    -- Zero on text sessions, where word counts stand in.
+    rep_audio_secs      REAL NOT NULL DEFAULT 0,
+    customer_audio_secs REAL NOT NULL DEFAULT 0
+);
+
+-- One scorecard per finished practice session, written right after the judge
+-- runs. session_id is the PRIMARY KEY on purpose: re-scoring a session (a
+-- failed judge re-run, a rubric fix) REPLACES the report, it never stacks a
+-- second verdict for a manager to pick between.
+CREATE TABLE IF NOT EXISTS practice_reports (
+    session_id        TEXT PRIMARY KEY,
+    overall           REAL,             -- mean of the scored dimensions, code-computed
+    win_condition_met INTEGER,
+    scores_json       TEXT,             -- {dimension: {score, quote, comment}}
+    strengths_json    TEXT,
+    improvements_json TEXT,             -- [{what, why, quote, better_line}]
+    metrics_json      TEXT,             -- deterministic: talk ratio, WPM, fillers…
+    summary           TEXT,
+    judge_error       TEXT,             -- set when the judge failed; row still lands
+    judge_model       TEXT,
+    created_at        TEXT,
+    delivery_json     TEXT,             -- vocal-delivery verdict (voice sessions)
+    -- The manager email, as it actually went: exactly one of emailed_to or
+    -- email_error is set when a manager was chosen; both null when not.
+    emailed_to        TEXT,
+    emailed_at        TEXT,
+    email_error       TEXT
+);
 """
 
 
@@ -148,6 +198,29 @@ class Database:
         ):
             if name not in load_columns:
                 conn.execute(f"ALTER TABLE loads ADD COLUMN {name} {ddl}")
+
+        # `practice_sessions` shipped text-only; the voice columns arrived with
+        # the push-to-talk loop and have to be patched onto databases created in
+        # between (defaults match a text session, which is what those rows were).
+        practice_columns = {r["name"] for r in
+                            conn.execute("PRAGMA table_info(practice_sessions)").fetchall()}
+        for name, ddl in (
+            ("mode", "TEXT NOT NULL DEFAULT 'text'"),
+            ("rep_audio_secs", "REAL NOT NULL DEFAULT 0"),
+            ("customer_audio_secs", "REAL NOT NULL DEFAULT 0"),
+            ("manager_name", "TEXT"),
+            ("manager_email", "TEXT"),
+        ):
+            if name not in practice_columns:
+                conn.execute(f"ALTER TABLE practice_sessions ADD COLUMN {name} {ddl}")
+
+        # `practice_reports` shipped before the vocal-delivery judge and the
+        # manager email existed.
+        report_columns = {r["name"] for r in
+                          conn.execute("PRAGMA table_info(practice_reports)").fetchall()}
+        for name in ("delivery_json", "emailed_to", "emailed_at", "email_error"):
+            if report_columns and name not in report_columns:
+                conn.execute(f"ALTER TABLE practice_reports ADD COLUMN {name} TEXT")
 
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}

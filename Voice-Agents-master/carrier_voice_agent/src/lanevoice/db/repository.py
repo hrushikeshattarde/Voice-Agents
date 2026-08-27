@@ -247,6 +247,17 @@ class Repository:
         )
         return True
 
+    def update_transcript(self, call_id: str, transcript: list | str) -> None:
+        """Persist the transcript-so-far on the open call row.
+
+        Called after every turn, so a live view (the dashboard) can read the
+        call as it happens and a worker crash mid-call loses nothing. `end_call`
+        still writes the final word along with the outcome.
+        """
+        payload = transcript if isinstance(transcript, str) else json.dumps(transcript)
+        self._execute(
+            "UPDATE calls SET transcript=? WHERE call_id=?", (payload, call_id))
+
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
                  outcome: str, transcript: list | str) -> None:
         payload = transcript if isinstance(transcript, str) else json.dumps(transcript)

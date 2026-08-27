@@ -461,13 +461,18 @@ dont know yet sure idea not no nope maybe think guess ok okay hmm
 # A bare answer ("Chicago.") is a place, but a question back at us is not.
 _NOT_AN_ANSWER = re.compile(r"\b(?:what|where|when|how|why|who|which|paying|pays|rate)\b")
 
-# Agreement, refusal and stalling — none of it is a place. Only consulted by the
-# bare-answer fallback, where guessing wrong is worse than asking again.
+# Agreement, refusal, stalling and line-checking — none of it is a place. Only
+# consulted by the bare-answer fallback, where guessing wrong is worse than
+# asking again. The greeting row exists because of a live call: the caller,
+# hearing dead air, said "Hello." — and the agent answered "Alright, Hello, got
+# it" and treated Hello as the town their truck frees up in.
 _NOT_A_PLACE_RE = re.compile(
     r"\b(?:yes|yeah|yep|yup|no|nope|nah|ok|okay|sure|fine|works?|working|sounds?|"
     r"good|great|perfect|thanks|thank|deal|cover|covered|can|cannot|will|would|"
     r"should|maybe|dunno|know|think|guess|let|hang|hold|sec|second|minute|moment|"
-    r"driver|truck|trailer|load|email)\b"
+    r"driver|truck|trailer|load|email|"
+    r"hello|hi|hey|howdy|goodbye|bye|alright|right|there|anybody|anyone|"
+    r"hear|hearing|listen|listening|speak|speaking)\b"
     r"|n't\b"
 )
 

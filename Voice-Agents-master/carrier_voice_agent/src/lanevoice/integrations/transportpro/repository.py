@@ -884,6 +884,9 @@ class TransportProRepository:
                  outcome: str, transcript: list | str) -> None:
         self._audit.end_call(call_id, load_id, carrier_dot, outcome, transcript)
 
+    def update_transcript(self, call_id: str, transcript: list | str) -> None:
+        self._audit.update_transcript(call_id, transcript)
+
 
 def _match(records: list[dict], load_id: str) -> dict | None:
     """The record for exactly this load.
