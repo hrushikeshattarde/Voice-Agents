@@ -147,6 +147,23 @@ def test_the_load_number_wins_when_both_are_said_in_one_breath():
         "MC 556949, calling on load 2520571", numeric=True) == "2520571"
 
 
+def test_digit_groups_the_transcriber_split_are_glued_into_one_id():
+    """Whisper hands a spoken seven-digit id back in pieces — '255 6951',
+    'H2-566951' — and no run of five digits exists in either, so the agent
+    asked for the number a caller had just given. Observed live, twice on one
+    call. Groups glue only across spaces and hyphens: the fragments of ONE
+    spoken number sit adjacent, and anything comma-grouped is money or weight."""
+    assert parsing.extract_load_id("255 6951", numeric=True) == "2556951"
+    assert parsing.extract_load_id("it's 255 6951.", numeric=True) == "2556951"
+    assert parsing.extract_load_id("H2-566951.", numeric=True) == "2566951"
+    assert parsing.extract_load_id("25 56 951", numeric=True) == "2556951"
+    # Comma grouping stays money/weight, never a load id.
+    assert parsing.extract_load_id("it's 42,000 lbs", numeric=True) is None
+    assert parsing.extract_load_id("I need $2,150", numeric=True) is None
+    # A split MC is still an MC.
+    assert parsing.extract_load_id("MC 774 976", numeric=True) is None
+
+
 def test_the_guard_does_not_change_how_an_mc_itself_is_read():
     """`extract_mc_dot` is the other half of the pair and must be untouched."""
     assert parsing.extract_mc_dot("MC 556949") == ("MC", "556949")

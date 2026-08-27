@@ -78,6 +78,20 @@ def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
         # Keep the spacing: the MC/USDOT label has to stay adjacent to its digits
         # for the guard below, and stripping spaces glues "MC" onto the number.
         spaced = glue_spoken_digits(text).upper()
+        # Digit GROUPS the transcriber split — "255 6951", "2-566951" — glue to
+        # one id when they sit adjacent with nothing but spaces or hyphens
+        # between them. Tried FIRST, because the fragments of one spoken number
+        # beat any single fragment: "2-566951" contains a six-digit run that
+        # would match below, but the caller said seven digits. Comma-grouped
+        # figures deliberately stay apart — "42,000 lbs" is a weight, and gluing
+        # it would invent a five-digit load. Observed live: "255 6951" extracted
+        # as nothing at all, and the agent asked for the number a caller had
+        # just given, twice.
+        for match in re.finditer(r"\d+(?:[ -]+\d+)+", spaced):
+            digits = re.sub(r"\D", "", match.group())
+            if 5 <= len(digits) <= 9 and not _labelled_as_carrier_id(
+                    spaced, match.start()):
+                return digits
         for match in re.finditer(r"\d{5,9}", spaced):
             if not _labelled_as_carrier_id(spaced, match.start()):
                 return match.group()
