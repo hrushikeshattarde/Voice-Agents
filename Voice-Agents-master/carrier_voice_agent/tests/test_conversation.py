@@ -653,6 +653,43 @@ def test_load_requirements_declined_no_deal(repo):
     assert a.summary()["outcome"] == "no_deal"
 
 
+class _ScopedRepo:
+    """The seeded repo, but every load belongs to some other office — the shape a
+    Fort Wayne deployment sees when a caller reads out Chicago's load number."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_load(self, load_id):
+        from lanevoice.domain.errors import LoadOutOfScope
+        raise LoadOutOfScope(f"load {load_id} belongs to Tinley Park Office, "
+                             "outside this desk's scope")
+
+
+def test_another_offices_load_ends_the_call_warmly_on_the_first_hit(repo):
+    """Out-of-scope is decided, not misheard: no second number can change whose
+    desk the freight is, so the call must NOT enter the try-another-number loop.
+    Observed live before this existed — the caller was sent hunting through
+    their posting for a number that could never have worked."""
+    a = _agent(_ScopedRepo(repo))
+    a.greeting()
+    a.handle("about L1001")
+    assert a.state.value == "done"
+    assert a.summary()["outcome"] == "no_deal"
+    d = _directives(a)
+    assert "different circle desk" in d
+    assert "thank them for reaching out" in d
+    # It closed on the FIRST hit — never asked for another number...
+    assert "another number" not in d
+    # ...and the audit trail says why, since "no such load" about a load the
+    # company plainly has is confusing to debug. (_ScopedRepo delegates
+    # log_note to the real repo, so the note lands in its DB.)
+    assert "another office" in _notes(repo).lower()
+
+
 # --------------------------------------------------------------------------- #
 # The operational close
 # --------------------------------------------------------------------------- #

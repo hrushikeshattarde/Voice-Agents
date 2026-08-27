@@ -673,6 +673,26 @@ class CarrierSalesAgent:
         #
         # So every unsellable branch says the truth about the load they asked for
         # and nothing more. `_unsellable` handles the follow-up and the cap.
+        if result.out_of_scope:
+            # Another office's freight is DECIDED, not misheard — no retry can
+            # change whose desk it is, so unlike a plain miss this ends the call
+            # on the first hit, with the same warm close a covered load gets.
+            # Observed live: collapsed into "not on the board", it sent a caller
+            # hunting through their posting for a number that could never work.
+            self._note(
+                f"Load {load_id} belongs to another office — outside this desk's "
+                "scope. Thanked the caller and closed without offering alternatives."
+            )
+            self._finish(CallOutcome.NO_DEAL)
+            return self._say(
+                f"Load {load_id} is real but it's handled by a different Circle "
+                f"desk, not this one, so you can't book it or transfer them to it. "
+                f"Tell them that plainly, thank them for reaching out, and close "
+                f"warmly. Do NOT offer another load, do NOT read out any other "
+                f"load number, and do not ask what else they are looking for — "
+                f"this call is finished. Two short sentences.",
+                amounts=set(),
+            )
         if not result.found:
             return self._unsellable(f"You have no load {load_id} on the board.")
         if not result.posted:

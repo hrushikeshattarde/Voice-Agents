@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from lanevoice.db.repository import Repository
+from lanevoice.domain.errors import LoadOutOfScope
 from lanevoice.domain.models import Load
 
 
@@ -14,6 +15,10 @@ class LoadLookup:
     posted: bool
     available: bool   # open status
     load: Load | None
+    # The load exists but is another office's freight (scoped deployments only).
+    # Distinct from not-found on purpose: a miss invites another number, this
+    # ends the call warmly — see domain.errors.LoadOutOfScope.
+    out_of_scope: bool = False
 
 
 class LoadService:
@@ -21,7 +26,11 @@ class LoadService:
         self._repo = repo
 
     def lookup(self, load_id: str) -> LoadLookup:
-        load = self._repo.get_load(load_id)
+        try:
+            load = self._repo.get_load(load_id)
+        except LoadOutOfScope:
+            return LoadLookup(found=False, posted=False, available=False,
+                              load=None, out_of_scope=True)
         if load is None:
             return LoadLookup(found=False, posted=False, available=False, load=None)
         return LoadLookup(

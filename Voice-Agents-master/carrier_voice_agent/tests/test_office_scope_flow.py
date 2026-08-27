@@ -17,6 +17,7 @@ reject it — and an ignored filter here means the agent offers freight it can't
 import httpx
 import pytest
 
+from lanevoice.domain.errors import LoadOutOfScope
 from tests.transportpro_fake import FakeTransportPro, repository
 from tests.transportpro_payloads import record_for
 
@@ -103,16 +104,20 @@ def test_a_load_on_a_dormant_pod_is_still_sellable(fake, repo):
     assert _repo(fake, repo).get_load("1303369") is not None
 
 
-def test_another_offices_load_reads_as_not_on_the_board(fake, repo):
-    """Dropped to None — the same answer as a load that doesn't exist — so the
-    agent says it hasn't got that one and offers its own instead."""
+def test_another_offices_load_raises_out_of_scope(fake, repo):
+    """A typed refusal, NOT None: another office's load is decided, so the agent
+    thanks the caller and ends the call instead of asking for another number.
+    Observed live — collapsed into not-found, it sent a caller re-reading their
+    posting for a number that could never have worked on this desk."""
     _board(fake, _load(1303369, OTHER))
-    assert _repo(fake, repo).get_load("1303369") is None
+    with pytest.raises(LoadOutOfScope):
+        _repo(fake, repo).get_load("1303369")
 
 
-def test_an_unreadable_terminal_is_out_of_scope_by_default(fake, repo):
-    """The requirement is this office's loads only, so a load we cannot attribute
-    must not be assumed ours."""
+def test_an_unreadable_terminal_is_plain_not_found(fake, repo):
+    """Out of scope by default — but as None, never as LoadOutOfScope: 'a
+    different desk handles that one' is a claim, and it must not be made about
+    freight we cannot attribute."""
     _board(fake, _load(1303369, None))
     assert _repo(fake, repo).get_load("1303369") is None
 
@@ -215,7 +220,8 @@ def test_a_pinned_id_list_skips_the_tree_walk_entirely(fake, repo):
                     transport_pro_office_terminal_ids="1078, 1003")
 
     assert tp.get_load("1303369") is not None
-    assert tp.get_load("1303370") is None
+    with pytest.raises(LoadOutOfScope):      # decided, not misheard — same as a tree scope
+        tp.get_load("1303370")
     assert fake.calls("/terminal/search") == []
 
 

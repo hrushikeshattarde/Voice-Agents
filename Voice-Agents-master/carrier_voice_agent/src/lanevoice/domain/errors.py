@@ -14,3 +14,16 @@ class SourceUnavailable(RuntimeError):
     The conversation layer catches this and hands the call to a rep, which is the
     honest outcome when we cannot see our own board.
     """
+
+
+class LoadOutOfScope(RuntimeError):
+    """The load exists, but it is another office's freight — not this desk's.
+
+    Raised by a scoped repository instead of returning "not found", because the
+    two deserve different calls. A number that finds nothing is usually a
+    mishear or a stale posting, so the agent asks for another number (up to a
+    cap). Another office's load is DECIDED: no retry can change whose desk it
+    is, so the agent thanks the caller and ends the call on the first hit —
+    observed live, the collapse into "not found" sent a caller hunting through
+    their posting for a different number that could never have worked.
+    """

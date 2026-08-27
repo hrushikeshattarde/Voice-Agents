@@ -37,7 +37,7 @@ import time
 from typing import Any
 
 from lanevoice.db.repository import Repository
-from lanevoice.domain.errors import SourceUnavailable
+from lanevoice.domain.errors import LoadOutOfScope, SourceUnavailable
 from lanevoice.domain.models import Carrier, Load, OfferParty, Rep
 from lanevoice.integrations.highway import mappers as highway_mappers
 from lanevoice.integrations.highway.client import HighwayClient, HighwayError
@@ -260,19 +260,29 @@ class TransportProRepository:
             else:
                 load = self._map(record, posted=False)
 
-        # Another office's freight is not ours to sell. Dropped to None — the same
-        # answer as a load that doesn't exist — because from this desk's point of
-        # view it isn't on their board, and the agent then offers its own loads
-        # instead. The log says what really happened, since "we don't have that
-        # load" about a load the company plainly does have is confusing to debug.
+        # Another office's freight is not ours to sell — and it is NOT the same
+        # answer as a load that doesn't exist. A miss invites the caller to try
+        # another number; another office's load is decided, and the agent should
+        # thank them and wrap up. Raised as a typed error so the conversation
+        # layer can say the right thing (observed live: the old collapse into
+        # "not on the board" sent a caller re-reading a posting for a number
+        # that could never have worked on this desk).
+        #
+        # Only a KNOWN foreign terminal raises. A load whose terminal cannot be
+        # read stays plain not-found: "a different desk handles that one" is a
+        # claim, and it must not be made about freight we cannot attribute.
         if load is not None:
             scope = self._scope()
             if not self._in_scope(load, scope):
-                logger.info(
-                    "Load %s belongs to %s, which is outside this deployment's "
-                    "office scope (%s). Treating it as not on the board.",
-                    load.load_id, scope.title(load.terminal_id),
-                    scope.title(scope.root_id))
+                if load.terminal_id is not None:
+                    logger.info(
+                        "Load %s belongs to %s, which is outside this deployment's "
+                        "office scope (%s). Closing rather than retrying.",
+                        load.load_id, scope.title(load.terminal_id),
+                        scope.title(scope.root_id))
+                    raise LoadOutOfScope(
+                        f"load {load.load_id} belongs to "
+                        f"{scope.title(load.terminal_id)}, outside this desk's scope")
                 load = None
 
         if load is not None and not load.is_bookable:
