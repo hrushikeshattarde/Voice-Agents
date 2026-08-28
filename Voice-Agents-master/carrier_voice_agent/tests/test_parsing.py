@@ -164,6 +164,22 @@ def test_digit_groups_the_transcriber_split_are_glued_into_one_id():
     assert parsing.extract_load_id("MC 774 976", numeric=True) is None
 
 
+def test_a_misheard_to_in_front_of_a_digit_run_reads_as_two():
+    """Whisper renders a leading spoken "two" as the word "to" — observed twice
+    live ("Hello to 557062", "follow up to five six zero six six two"), each
+    time losing the caller's first digit and sending the agent after a
+    DIFFERENT, real load. Only a run of five or more digits flips it, so
+    ordinary English stays English."""
+    assert parsing.extract_load_id(
+        "and follow up to  five six zero six six two", numeric=True) == "2560662"
+    assert parsing.extract_load_id("Hello to 557062.", numeric=True) == "2557062"
+    assert parsing.extract_load_id("too 555948", numeric=True) == "2555948"
+    # Not enough digits after "to": ordinary sentences are untouched.
+    assert parsing.extract_load_id("going to five stops tomorrow",
+                                   numeric=True) is None
+    assert parsing.extract_load_id("can we get to 3800", numeric=True) is None
+
+
 def test_the_guard_does_not_change_how_an_mc_itself_is_read():
     """`extract_mc_dot` is the other half of the pair and must be untouched."""
     assert parsing.extract_mc_dot("MC 556949") == ("MC", "556949")

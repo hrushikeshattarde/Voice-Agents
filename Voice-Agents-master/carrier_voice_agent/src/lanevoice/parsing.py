@@ -57,6 +57,28 @@ def _labelled_as_carrier_id(upper_text: str, at: int) -> bool:
     return bool(_CARRIER_ID_LABEL_RE.search(upper_text[max(0, at - 25):at]))
 
 
+# "to"/"too" immediately in front of a digit run is a spoken "two" the
+# transcriber mis-heard — observed twice on live calls ("Hello to 557062",
+# "follow up to five six zero six six two"), each time costing the caller's
+# leading digit and sending the agent after a DIFFERENT, real load. Only fixed
+# when at least five digits follow, so "going to five stops" and "get to 3800"
+# stay ordinary English — and only inside load-id extraction, never in the
+# money or MC paths.
+_DIGITISH_RUN = (r"((?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine"
+                 r"|\d+)[\s,.\-]*)+)")
+
+
+def _restore_leading_two(text: str) -> str:
+    def fix(match: re.Match) -> str:
+        digits = re.sub(r"\D", "", glue_spoken_digits(match.group(1)))
+        if len(digits) >= 5:
+            return "two " + match.group(1)
+        return match.group(0)
+
+    return re.sub(r"\b(?:to|too)\s+" + _DIGITISH_RUN, fix, text,
+                  flags=re.IGNORECASE)
+
+
 def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
     """The load number in what the caller just said, or None.
 
@@ -77,7 +99,7 @@ def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
     if numeric:
         # Keep the spacing: the MC/USDOT label has to stay adjacent to its digits
         # for the guard below, and stripping spaces glues "MC" onto the number.
-        spaced = glue_spoken_digits(text).upper()
+        spaced = glue_spoken_digits(_restore_leading_two(text)).upper()
         # Digit GROUPS the transcriber split — "255 6951", "2-566951" — glue to
         # one id when they sit adjacent with nothing but spaces or hyphens
         # between them. Tried FIRST, because the fragments of one spoken number
