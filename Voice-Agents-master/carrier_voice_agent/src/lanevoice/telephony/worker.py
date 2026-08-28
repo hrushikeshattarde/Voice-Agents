@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover
     from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
 from lanevoice import parsing
-from lanevoice.conversation import CarrierSalesAgent
+from lanevoice.conversation import CarrierSalesAgent, is_closing_turn
 from lanevoice.datasource import build_repository
 from lanevoice.db import Repository
 from lanevoice.env import load_env
@@ -334,7 +334,12 @@ class CarrierAgent(Agent):
             raise StopResponse()
         logger.info("CALLER said → %s", user_text)
         reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
-        await self._acknowledge_if_slow(reply_task)
+        # Every filler promises work is coming ("Alright, let me check that."),
+        # and in front of a goodbye that promise is nonsense — observed live, a
+        # caller's "No. Thank you." was answered with a filler and THEN the
+        # close. A beat of silence before a goodbye is fine; skip the filler.
+        if not is_closing_turn(user_text):
+            await self._acknowledge_if_slow(reply_task)
         reply = await reply_task
         logger.info("AGENT reply → %s", reply)
         try:

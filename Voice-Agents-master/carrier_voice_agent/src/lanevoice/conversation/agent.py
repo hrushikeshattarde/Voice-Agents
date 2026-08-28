@@ -216,6 +216,18 @@ _CALLER_DONE_RE = re.compile(
 )
 
 
+def is_closing_turn(text: str) -> bool:
+    """Whether a caller's turn reads as bowing out ("no thanks", "that's okay").
+
+    Public because the WORKER needs it too: the dead-air fillers all promise
+    work is coming ("Alright, let me check that."), and spoken in front of a
+    goodbye that promise is nonsense — observed live, a caller's "No. Thank
+    you." was answered with a filler and THEN the close. The worker skips the
+    filler on turns this matches; the agent uses the same test to end the call.
+    """
+    return bool(_CALLER_DONE_RE.match(text))
+
+
 # Rejections with no new number — the carrier is holding, so we make our next move.
 _REJECT_WORDS = (
     "no", "nope", "nah", "can't", "cannot", "too low", "not enough",
@@ -672,7 +684,7 @@ class CarrierSalesAgent:
         numeric = self._settings.numeric_load_ids
         load_id = parsing.extract_load_id(text, numeric=numeric)
         if not load_id:
-            if _CALLER_DONE_RE.match(text):
+            if is_closing_turn(text):
                 # "No, that's okay" is an ANSWER, not a missing number. The
                 # caller has declined to go on — usually right after being told
                 # a load can't be sold — and re-asking for a number they just

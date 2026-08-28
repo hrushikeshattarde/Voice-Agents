@@ -697,6 +697,21 @@ def test_a_bare_acknowledgment_is_not_a_goodbye(repo):
     assert a.state.value != "done"           # still waiting on their number
 
 
+def test_is_closing_turn_is_the_workers_filler_gate():
+    """The worker uses this to skip the dead-air filler in front of a goodbye —
+    "Alright, let me check that." spoken before "thanks for calling" was heard
+    live and reads as nonsense. Closers gate it; working turns don't."""
+    from lanevoice.conversation import is_closing_turn
+
+    for closer in ("No.  Thank you.", "no, that's okay", "And that's okay.",
+                   "nah I'm good", "that's all, thanks", "nope", "goodbye"):
+        assert is_closing_turn(closer), closer
+    for working in ("about load 2520571", "okay hang on, let me find the posting",
+                    "yeah that works", "no, I can't run it that cold",
+                    "it's two five five five nine four eight"):
+        assert not is_closing_turn(working), working
+
+
 def test_another_offices_load_ends_the_call_warmly_on_the_first_hit(repo):
     """Out-of-scope is decided, not misheard: no second number can change whose
     desk the freight is, so the call must NOT enter the try-another-number loop.
