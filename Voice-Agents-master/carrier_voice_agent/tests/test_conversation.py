@@ -669,6 +669,34 @@ class _ScopedRepo:
                              "outside this desk's scope")
 
 
+def test_a_caller_who_declines_more_numbers_gets_a_warm_close(repo):
+    """"No, that's okay" is an ANSWER. Observed live: told a load wasn't posted,
+    the caller bowed out politely and the agent asked for another number — the
+    very thing they had just declined — so they hung up and the call recorded
+    as abandoned instead of a clean no-deal."""
+    a = _agent(repo)
+    a.greeting()
+    a.handle("about L9999")                  # not on the board -> asks for another
+    assert a.state.value != "done"
+    a.handle("And that's okay.")
+    assert a.state.value == "done"
+    assert a.summary()["outcome"] == "no_deal"
+    last = a._composer.turns[-1]["directive"].lower()
+    assert "thank them for calling" in last
+    assert "number" not in last              # it stopped asking
+    assert "declined to continue" in _notes(repo)
+
+
+def test_a_bare_acknowledgment_is_not_a_goodbye(repo):
+    """"Okay" mid-thought must not hang up on a caller who is still talking —
+    the closer has to be the whole turn."""
+    a = _agent(repo)
+    a.greeting()
+    a.handle("about L9999")
+    a.handle("okay hang on, let me find the posting")
+    assert a.state.value != "done"           # still waiting on their number
+
+
 def test_another_offices_load_ends_the_call_warmly_on_the_first_hit(repo):
     """Out-of-scope is decided, not misheard: no second number can change whose
     desk the freight is, so the call must NOT enter the try-another-number loop.

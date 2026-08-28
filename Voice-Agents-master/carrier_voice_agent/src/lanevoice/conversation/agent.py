@@ -199,6 +199,23 @@ _DENIES_RE = re.compile(
 )
 
 
+# A caller bowing out at the load-lookup step — "no, that's okay", "no thanks",
+# "I'm good, bye". Deliberately narrow: the phrase has to BE the whole turn, so
+# "that's okay, but can you check 2520571" (carries a number, never reaches this
+# test) and a bare mid-thought "okay" both stay in the conversation. Observed
+# live: told a load wasn't posted, the caller said "And that's okay." and the
+# agent asked for another number — the very thing they had just declined.
+_CALLER_DONE_RE = re.compile(
+    r"^[\s,.!]*(?:and\s+|no[,\s]+|nah[,\s]+|nope[,\s]+)?"
+    r"(?:no|nope|nah|that'?s?\s+(?:okay|ok|alright|all\s+right|fine|all|it)|"
+    r"i'?m\s+(?:good|all\s+set|fine)|we'?re\s+(?:good|all\s+set)|"
+    r"no\s+thanks?|no\s+thank\s+you|nothing(?:\s+else)?|never\s?mind|"
+    r"all\s+set|forget\s+it|goodbye|bye|have\s+a\s+good\s+(?:one|day)|take\s+care)"
+    r"[\s,.!]*(?:thanks?|thank\s+you|though|man|buddy|sir|bye|goodbye)?[\s,.!]*$",
+    re.IGNORECASE,
+)
+
+
 # Rejections with no new number — the carrier is holding, so we make our next move.
 _REJECT_WORDS = (
     "no", "nope", "nah", "can't", "cannot", "too low", "not enough",
@@ -655,6 +672,21 @@ class CarrierSalesAgent:
         numeric = self._settings.numeric_load_ids
         load_id = parsing.extract_load_id(text, numeric=numeric)
         if not load_id:
+            if _CALLER_DONE_RE.match(text):
+                # "No, that's okay" is an ANSWER, not a missing number. The
+                # caller has declined to go on — usually right after being told
+                # a load can't be sold — and re-asking for a number they just
+                # declined to give is how a polite caller ends up hanging up on
+                # us (observed live). Thank them and end it.
+                self._note("Caller declined to continue at load lookup — "
+                           "thanked them and closed the call.")
+                self._finish(CallOutcome.NO_DEAL)
+                return self._say(
+                    "They're all set — nothing else they want looked up. Thank "
+                    "them for calling and close the call warmly. One short "
+                    "sentence, no questions.",
+                    amounts=set(),
+                )
             return self._say(
                 "You didn't catch a load or reference number in what they just said. Ask "
                 "for it — if they described a lane or a posting instead of a number, ask "
