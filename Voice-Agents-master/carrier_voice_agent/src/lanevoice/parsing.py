@@ -305,14 +305,39 @@ def fold_mixed_numbers(text: str) -> str:
     return _MIXED_NUMBER_RE.sub(replace, text)
 
 
+# A number the caller hung a unit on is a quantity, not part of their number.
+# Observed live: an MC came back from the transcriber as "It's been six...  45
+# minutes.", the digit scan read that as 645, and the agent reported it as
+# progress — "I've got 6 4 5 so far, what comes after that?" — so the caller had
+# to recite a number they had already given. Nobody measures anything in the
+# middle of reading out an identifier, so a number with a unit behind it is
+# never identifier digits. Plurals are spelled out per alternative: a trailing
+# `s?` would let "minute" match inside "minutes" and leave the "s" stranded.
+_QUANTITY_UNITS = (
+    r"minutes?|mins?|hours?|hrs?|seconds?|secs?|days?|weeks?|months?|years?"
+    r"|o'?clock|a\.?m\.?|p\.?m\.?|miles?|pounds?|lbs?|kilos?|tons?"
+    r"|dollars?|bucks?|percent|cents?|stops?|trucks?|trailers?|pallets?"
+    r"|pieces?|cases?|gallons?|feet|foot|inches|inch"
+)
+# `\d[\d,]*` and not `\d+`: without the comma the pattern eats "000 lbs" out of
+# "42,000 lbs" and leaves a stray 42 behind, which is the same bug one digit
+# smaller.
+_QUANTITY_RE = re.compile(rf"\b\d[\d,]*\s*(?:{_QUANTITY_UNITS})\b",
+                          re.IGNORECASE)
+
+
 def heard_digits(text: str) -> str:
     """Every digit in an utterance, in order, with everything else dropped.
 
     Deliberately blunt: at the point we're trying to hear an identifier, "it's
     six five four" and "654" and "6-5-4" are the same thing, and we would rather
     hold three digits we can build on than nothing at all.
+
+    Quantities are the one exception — see `_QUANTITY_RE`. A caller who says
+    "I've been holding 45 minutes" has given us no digits at all.
     """
-    return re.sub(r"\D", "", glue_spoken_digits(text))
+    spoken = _QUANTITY_RE.sub(" ", glue_spoken_digits(text))
+    return re.sub(r"\D", "", spoken)
 
 
 def digit_readings(held: str, heard: str) -> list[str]:

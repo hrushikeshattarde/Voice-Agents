@@ -108,6 +108,27 @@ def test_quantities_are_never_glued_into_one_number():
     assert parsing.extract_money("it's 42,000 lbs") == 42000
 
 
+def test_a_quantity_is_not_heard_as_identifier_digits():
+    """Live call: the caller read out MC 862354 and the transcriber returned
+    "It's been six...  45 minutes." The digit scan made that 645, which the agent
+    read back as progress — "I've got 6 4 5 so far, what comes after that?" — and
+    the caller had to say the whole number over again. A number with a unit
+    behind it is a quantity, never part of an MC."""
+    assert parsing.heard_digits("It's been six...  45 minutes.") == "6"
+    assert parsing.heard_digits("I've been holding 45 minutes") == ""
+    assert parsing.heard_digits("we're 20 minutes out, 3 stops today") == ""
+    assert parsing.heard_digits("it's 42,000 lbs over 925 miles") == ""
+
+
+def test_the_number_itself_still_comes_through_beside_a_quantity():
+    """The guard drops the quantity, not the turn: a caller who gives their MC
+    and complains about the hold in one breath has still given us their MC."""
+    assert parsing.heard_digits("my MC is 862354, held 45 minutes") == "862354"
+    assert parsing.heard_digits("eight six two three five four") == "862354"
+    assert parsing.heard_digits("862354") == "862354"
+    assert parsing.heard_digits("six five four") == "654"
+
+
 # --------------------------------------------------------------------------- #
 # Numeric load ids vs MC numbers
 #

@@ -860,6 +860,15 @@ class CarrierSalesAgent:
         """
         heard = parsing.heard_digits(text)
 
+        # One digit, from a turn we are holding nothing for, is noise rather than
+        # the start of a number: the live call that produced "It's been six...
+        # 45 minutes." still left a 6 behind once the quantity came out, and
+        # holding it would have the agent report a single digit as progress. Once
+        # we DO hold digits a lone digit is an ordinary answer to "what comes
+        # after that?", so this only applies to the first thing we hear.
+        if len(heard) == 1 and not self._mc_digits:
+            heard = ""
+
         # We narrowed to one carrier and asked "is this you?". Their answer is the
         # confirmation a rep actually works from — no point making someone recite
         # digits down a bad line when the name already settled it.

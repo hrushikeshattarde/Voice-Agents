@@ -188,6 +188,29 @@ def test_digits_are_remembered_across_turns(repo):
     assert a.state.value == "ask_empty"
 
 
+def test_a_garbled_turn_is_not_reported_back_as_progress(repo):
+    """The live failure: MC 862354 came back as "It's been six...  45 minutes.",
+    and the agent answered "I've got 6 4 5 so far, what comes after that?" Held
+    nothing, we hold nothing — and the number still lands on the next turn."""
+    a = _to_mc(repo)
+    a.handle("It's been six...  45 minutes.")
+    assert a._mc_digits == ""                    # no phantom partial
+    assert "6 4 5" not in _directives(a)
+    a.handle("six five four three two one")
+    assert a.carrier.legal_name == "Roadrunner Freight Inc"
+
+
+def test_a_single_digit_still_counts_once_we_hold_some(repo):
+    """The lone-digit guard is only for the first thing we hear. A caller
+    answering "what comes after that?" with one digit is finishing their
+    number, not making noise."""
+    a = _to_mc(repo)
+    a.handle("six five four three two")
+    assert a._mc_digits == "65432"
+    a.handle("one")
+    assert a.carrier.legal_name == "Roadrunner Freight Inc"
+
+
 def test_a_caller_who_backs_up_and_repeats_is_not_double_counted(repo):
     """"six five four" ... "five four three two one" is 654321, not 654654321.
     The carrier file decides which reading was real."""
