@@ -62,7 +62,7 @@ from lanevoice.conversation.agent import compose_greeting
 from lanevoice.datasource import build_repository
 from lanevoice.db import Repository
 from lanevoice.env import load_env
-from lanevoice.logging_config import get_logger, setup_logging
+from lanevoice.logging_config import TRACE_LEVEL, get_logger, setup_logging
 from lanevoice.settings import Settings, get_settings
 from lanevoice.voice import OpenRouterTTS, StubComposer, build_composer
 from lanevoice.voice.tts import speechify
@@ -171,7 +171,9 @@ class _TTSStream(lk_tts.ChunkedStream):
 # digit string here would do nothing useful and a sentence would be a
 # hallucination waiting to happen on a quiet turn. STT_KEYTERMS in .env appends.
 STT_KEYTERMS = (
-    "MC", "MC number", "USDOT", "DOT number", "load number", "rate con",
+    # "load" on its own as well as "load number": on the first live calls the
+    # bare word came back as "Follow" and "node" in front of a correct load id.
+    "load", "MC", "MC number", "USDOT", "DOT number", "load number", "rate con",
     "rate confirmation", "dry van", "reefer", "flatbed", "step deck", "power only",
     "deadhead", "lumper", "detention", "layover", "TONU", "book it", "all in",
     "per mile", "pickup", "delivery", "appointment", "dispatch", "broker",
@@ -208,11 +210,22 @@ def _stt_extra_kwargs(model: str) -> dict[str, Any]:
                                                      nine" is held as the digits 639
 
     `filler_words` off on Deepgram: "um" and "uh" are noise to the parser.
+
+    AssemblyAI's end-of-turn eagerness matters as much as its formatting. At its
+    defaults it finalised "Looking for load" the instant a caller paused for the
+    number, the hosted turn detector took that sentence as complete, and the
+    number arrived as a second transcript after the turn had been committed — so
+    the agent asked for a number it was being given. The confidence threshold and
+    the minimum silence make it hold a final through a short mid-sentence pause;
+    its own silence backstop (`max_turn_silence`, 2.4s by default) still ends a
+    turn the model is unsure about.
     """
     if model.startswith("deepgram/nova"):
         return {"numerals": True, "filler_words": False}
     if model.startswith("assemblyai/"):
-        return {"format_turns": True}
+        return {"format_turns": True,
+                "end_of_turn_confidence_threshold": 0.5,
+                "min_end_of_turn_silence_when_confident": 400}
     return {}
 
 
@@ -282,6 +295,15 @@ FILLER_LINES = (
     "Alright, let me check that.",
     "Hang on one moment for me.",
 )
+
+# Spoken when the caller was heard talking but nothing was transcribed — see
+# `CarrierAgent.on_user_state_changed`. Phatic like the fillers: no facts, safe in
+# any state, kept out of the dialogue record.
+REASK_LINE = "Sorry, I didn't catch that — say that one more time for me?"
+# How many times per call before the agent stops asking. A recogniser that
+# returns nothing three times in a row is not going to start; the rep handoff
+# paths in the conversation layer are the right end for that call.
+_MAX_REASKS = 3
 
 # (text, 16-bit mono PCM, sample rate). The rate travels with the clip: it is
 # whatever the voice answered with, not a setting.
@@ -428,6 +450,13 @@ def prewarm(proc):
     # worker process and shared by every call it handles — the repository caches
     # reads briefly and handles its own concurrency.
     proc.userdata["repo"] = build_repository(_settings)
+    if _settings.log_level.upper() == "TRACE":
+        # The CLI's dev mode sets the framework's loggers to DEBUG after our
+        # logging is configured; the trace level has to be re-applied here,
+        # inside the worker, to survive that.
+        import logging
+        logging.getLogger("livekit.agents").setLevel(TRACE_LEVEL)
+        logger.info("livekit.agents at TRACE: transcript hold/flush decisions will be logged")
     # VAD sensitivity is a real tradeoff (noise-immune vs. hearing a short
     # "sure"), so it lives in settings — see the comment there for which way to
     # turn it and why. Still needed with a streaming STT: it is what anchors the
@@ -476,6 +505,8 @@ def prewarm(proc):
         texts.append(greeting_text)
     if _settings.filler_delay > 0:
         texts.extend(FILLER_LINES)
+    if _settings.unheard_reask_delay > 0:
+        texts.append(REASK_LINE)
     clips = {text: (pcm, rate) for text, pcm, rate in
              prerender_clips(_settings, texts, proc.userdata["tts"])} if texts else {}
     proc.userdata["greeting"] = (
@@ -483,6 +514,8 @@ def prewarm(proc):
         if greeting_text and greeting_text in clips else None)
     proc.userdata["fillers"] = [
         (text, *clips[text]) for text in FILLER_LINES if text in clips]
+    proc.userdata["reask"] = (
+        (REASK_LINE, *clips[REASK_LINE]) if REASK_LINE in clips else None)
     if proc.userdata["greeting"]:
         logger.info("greeting rendered: %.1fs of audio, ready before the phone rings",
                     len(proc.userdata["greeting"][1]) / 2 / proc.userdata["greeting"][2])
@@ -505,13 +538,98 @@ def prewarm(proc):
 class CarrierAgent(Agent):
     def __init__(self, repo: Repository, composer, tts: lk_tts.TTS,
                  fillers: list[Clip] | None = None,
-                 greeting: Clip | None = None):
+                 greeting: Clip | None = None,
+                 reask: Clip | None = None):
         super().__init__(instructions="Carrier sales agent (logic in conversation layer).")
         self.brain = CarrierSalesAgent(repo, composer, _settings)
         self._tts = tts
         self._fillers = list(fillers or [])
         self._greeting = greeting
+        self._reask = reask
         self._last_filler: int | None = None
+        # The unheard-speech watchdog — see `on_user_state_changed`.
+        self._turn_seq = 0                 # bumps on every committed caller turn
+        self._turn_in_flight = False       # a reply is being composed or spoken
+        self._caller_spoke_while_idle = False
+        self._unheard_task: asyncio.Task | None = None
+        self._reasks = 0
+        self._last_stt: str | None = None  # last text the recogniser produced this turn
+
+    # -- what the recogniser produced, before any filtering ------------------ #
+    def on_user_input_transcribed(self, ev) -> None:
+        """Every interim and final the recogniser produced, before any filtering —
+        the trail for the words that go missing between the caller's mouth and
+        `CALLER said`. Observed live: 299953 reached the brain as "93", and six
+        caller utterances on one call produced no committed turn at all. Finals
+        are logged at INFO (one line per turn); interims at DEBUG."""
+        if ev.transcript:
+            self._last_stt = ev.transcript
+        if ev.is_final:
+            logger.info("STT final → %r", ev.transcript)
+        else:
+            logger.debug("STT interim → %r", ev.transcript)
+
+    # -- speech that never became a transcript ----------------------------- #
+    def on_user_state_changed(self, ev) -> None:
+        """Never leave a caller in silence after they have spoken.
+
+        The VAD hears the caller (user state "speaking" then "listening"), the
+        recogniser returns nothing — an empty final for a short, quiet "10 AM" is
+        what did it on the first live call — and so no turn is ever committed and
+        nothing in the pipeline says a word. Four times in a row, then the caller
+        hung up. So the end of caller speech arms a timer; if no turn has been
+        committed by the time it fires, the agent asks them to say it again.
+
+        Only speech the agent was NOT talking over arms it: a "yeah" under the
+        pitch is a backchannel by design, and words over a reply are an
+        interruption the framework already handles.
+        """
+        if ev.new_state == "speaking":
+            # The VAD's view of the caller, beside the recogniser's: a "started
+            # speaking" with no STT line after it is the caller going unheard.
+            logger.info("VAD → caller started speaking")
+        elif ev.new_state == "listening" and ev.old_state == "speaking":
+            logger.info("VAD → caller stopped speaking")
+        if _settings.unheard_reask_delay <= 0:
+            return
+        if ev.new_state == "speaking":
+            self._cancel_unheard_watch()
+            self._caller_spoke_while_idle = (
+                self.session.current_speech is None and not self._turn_in_flight)
+        elif ev.new_state == "listening" and ev.old_state == "speaking":
+            if self._caller_spoke_while_idle and self._reasks < _MAX_REASKS:
+                self._unheard_task = asyncio.create_task(
+                    self._reask_if_unheard(self._turn_seq))
+
+    def _cancel_unheard_watch(self) -> None:
+        if self._unheard_task is not None and not self._unheard_task.done():
+            self._unheard_task.cancel()
+        self._unheard_task = None
+
+    async def _reask_if_unheard(self, seq: int) -> None:
+        try:
+            await asyncio.sleep(_settings.unheard_reask_delay)
+        except asyncio.CancelledError:
+            return
+        if (self._turn_seq != seq or self._turn_in_flight
+                or self.session.current_speech is not None
+                or self.session.user_state == "speaking"):
+            return  # a turn landed, a reply is under way, or they are talking again
+        self._reasks += 1
+        logger.info("UNHEARD → the caller spoke but no turn arrived in %.1fs; the "
+                    "recogniser's last output since the previous turn was %r; asking "
+                    "them to repeat (%d of %d)", _settings.unheard_reask_delay,
+                    self._last_stt, self._reasks, _MAX_REASKS)
+        await asyncio.to_thread(self.brain.note_unheard)
+        try:
+            if self._reask is not None:
+                text, pcm, rate = self._reask
+                await self.session.say(text, audio=_pcm_frames(pcm, rate),
+                                       add_to_chat_ctx=False)
+            else:
+                await self.session.say(REASK_LINE, add_to_chat_ctx=False)
+        except RuntimeError:
+            pass                           # session closing
 
     def _next_filler(self) -> Clip:
         """A filler that isn't the one just used — the same 'one sec' twice in a
@@ -603,35 +721,45 @@ class CarrierAgent(Agent):
             logger.debug("Ignoring noise/empty transcript: %r", user_text)
             raise StopResponse()
         logger.info("CALLER said → %s", user_text)
-        reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
-        # Every filler promises work is coming ("Alright, let me check that."),
-        # and in front of a goodbye that promise is nonsense — observed live, a
-        # caller's "No. Thank you." was answered with a filler and THEN the
-        # close. A beat of silence before a goodbye is fine; skip the filler.
-        if not is_closing_turn(user_text):
-            await self._acknowledge_if_slow(reply_task)
-        reply = await reply_task
-        logger.info("AGENT reply → %s", reply)
-        timing = self.brain.last_turn_timing
-        if timing:
-            logger.info(
-                "TIMING brain → %.2fs (compose %.2fs over %d call%s; lookups and "
-                "bookkeeping %.2fs) in %s",
-                timing["total"], timing["compose"], timing["compose_calls"],
-                "" if timing["compose_calls"] == 1 else "s", timing["other"],
-                timing["state"])
+        _log_end_of_turn(new_message)
+        # A real turn landed: the watchdog for unheard speech stands down. (A
+        # phantom filtered above does not count — the caller still went unheard.)
+        self._turn_seq += 1
+        self._last_stt = None
+        self._cancel_unheard_watch()
+        self._turn_in_flight = True
         try:
-            speech = self.session.say(reply)
-            await speech
-            # Barge-in cuts our audio mid-word. The transcript records what was
-            # composed, so without this note the record shows a line the caller
-            # may never have heard — observed live when a caller's "hello?"
-            # (filling dead air) killed the very answer they were waiting on.
-            if getattr(speech, "interrupted", False):
-                logger.info("PLAYBACK CUT by caller → %s", reply)
-                await asyncio.to_thread(self.brain.note_playback_cut, reply)
-        except RuntimeError as e:  # e.g. caller hung up mid-turn
-            logger.info("Could not speak (session closing): %s", e)
+            reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
+            # Every filler promises work is coming ("Alright, let me check that."),
+            # and in front of a goodbye that promise is nonsense — observed live, a
+            # caller's "No. Thank you." was answered with a filler and THEN the
+            # close. A beat of silence before a goodbye is fine; skip the filler.
+            if not is_closing_turn(user_text):
+                await self._acknowledge_if_slow(reply_task)
+            reply = await reply_task
+            logger.info("AGENT reply → %s", reply)
+            timing = self.brain.last_turn_timing
+            if timing:
+                logger.info(
+                    "TIMING brain → %.2fs (compose %.2fs over %d call%s; lookups and "
+                    "bookkeeping %.2fs) in %s",
+                    timing["total"], timing["compose"], timing["compose_calls"],
+                    "" if timing["compose_calls"] == 1 else "s", timing["other"],
+                    timing["state"])
+            try:
+                speech = self.session.say(reply)
+                await speech
+                # Barge-in cuts our audio mid-word. The transcript records what was
+                # composed, so without this note the record shows a line the caller
+                # may never have heard — observed live when a caller's "hello?"
+                # (filling dead air) killed the very answer they were waiting on.
+                if getattr(speech, "interrupted", False):
+                    logger.info("PLAYBACK CUT by caller → %s", reply)
+                    await asyncio.to_thread(self.brain.note_playback_cut, reply)
+            except RuntimeError as e:  # e.g. caller hung up mid-turn
+                logger.info("Could not speak (session closing): %s", e)
+        finally:
+            self._turn_in_flight = False
         raise StopResponse()   # we answered this turn ourselves; skip the LLM node
 
 
@@ -688,6 +816,25 @@ def _log_metrics(ev) -> None:
                      metrics.duration, metrics.audio_duration)
 
 
+def _log_end_of_turn(new_message) -> None:
+    """The caller's side of the wait, off the user message the framework hands us.
+
+    `on_user_turn_completed` answers every turn itself and raises StopResponse,
+    and on that path the framework neither emits its end-of-turn metrics event
+    nor adds the user message to the conversation — but it has already attached
+    the numbers to that message before calling us. So they are read here: how
+    long after the caller stopped the transcript was in hand, and how long after
+    that the turn was declared over (the endpointing wait). Beside the brain and
+    voice lines, that is the whole gap the caller sat through.
+    """
+    metrics = getattr(new_message, "metrics", None) or {}
+    if "end_of_turn_delay" not in metrics:
+        return
+    logger.info("TIMING end-of-turn → transcript %.2fs after the caller stopped, turn "
+                "ended %.2fs after", metrics.get("transcription_delay", 0.0),
+                metrics["end_of_turn_delay"])
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
     ud = ctx.proc.userdata
@@ -706,7 +853,10 @@ async def entrypoint(ctx: JobContext):
     )
     session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
-                         fillers=ud.get("fillers"), greeting=ud.get("greeting"))
+                         fillers=ud.get("fillers"), greeting=ud.get("greeting"),
+                         reask=ud.get("reask"))
+    session.on("user_input_transcribed", agent.on_user_input_transcribed)
+    session.on("user_state_changed", agent.on_user_state_changed)
 
     async def finalize_on_disconnect() -> None:
         # The transcript is only written at end_call, and most calls end with

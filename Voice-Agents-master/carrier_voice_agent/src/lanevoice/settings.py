@@ -351,13 +351,20 @@ class Settings(BaseSettings):
     # transcript took 1.0-1.8s to come back after the caller stopped, the turn
     # could not end before it did, and so MIN was never the thing being waited on.
     # With STT_PROVIDER=inference the transcript is in hand when the caller stops
-    # and MIN became the largest single post-speech wait. 0.7 is the pause a
-    # person leaves before answering; the framework's own default is 0.5 (0.3 for
-    # a streaming turn detector), so there is room below this. MAX still applies
+    # and MIN became the largest single post-speech wait. The framework's own
+    # default is 0.5 (0.3 for a streaming turn detector). MAX still applies
     # whenever the hosted turn detector reads the caller as mid-thought — "my MC
     # is six one one..." — and that, not MIN, is what protects digit dictation.
-    # If callers start getting clipped, raise MIN first.
-    min_endpointing_delay: float = Field(default=0.7, validation_alias="MIN_ENDPOINTING_DELAY")
+    #
+    # 0.7 was tried first and clipped a caller on the third live call: "Looking
+    # for load" was finalised at their pause, the detector read it as a complete
+    # sentence, and the number arrived as a second transcript right after the
+    # commit — the framework logged "transcript arrives after turn has been
+    # committed, consider raising min_delay". 1.0 is the compromise; the STT's
+    # own end-of-turn eagerness is the other half of that fix (see
+    # `telephony.worker._stt_extra_kwargs`). If callers still get clipped, raise
+    # this first.
+    min_endpointing_delay: float = Field(default=1.0, validation_alias="MIN_ENDPOINTING_DELAY")
     max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
 
     # Dead-air filler: when a reply takes longer than this to compose, the agent
@@ -394,6 +401,17 @@ class Settings(BaseSettings):
     # "no wait", "hang on". 0 disables the check.
     min_interruption_words: int = Field(
         default=2, validation_alias="MIN_INTERRUPTION_WORDS")
+    # The caller spoke — the VAD heard them — but no transcript ever arrived, so
+    # no turn happened and the agent said nothing. Observed on the first live call
+    # of the streaming pipeline: four half-second, quiet "10 AM"s in a row, each
+    # returned by the recogniser as an EMPTY transcript, each met with silence,
+    # and the caller hung up. After this many seconds of nothing following the
+    # caller's speech the agent asks them to say it again (a pre-rendered line,
+    # not part of the dialogue). Must clear MAX_ENDPOINTING_DELAY plus the
+    # transcript delay, or a slow-but-successful turn would be talked over. 0
+    # disables.
+    unheard_reask_delay: float = Field(
+        default=4.5, validation_alias="UNHEARD_REASK_DELAY")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are

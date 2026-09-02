@@ -538,10 +538,22 @@ _NOT_A_PLACE_RE = re.compile(
 )
 
 
+# A clock time the way a formatting recogniser writes it: "10. A.m.", "2 p.m.",
+# "8:30 am". `_WHEN_RE` reads "10 am"; the dotted forms — observed live from the
+# streaming transcriber for a caller's "ten a.m." — it did not, so the agent asked
+# for the time it had just been given.
+_CLOCK_AMPM_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\.?\s*([ap])\.?m\b\.?")
+
+
 def extract_empty_when(text: str) -> str | None:
     """When the truck frees up — 'right now', 'tomorrow morning', '3 pm'."""
     match = _WHEN_RE.search(text.lower())
-    return match.group().strip() if match else None
+    if match:
+        return match.group().strip()
+    if clock := _CLOCK_AMPM_RE.search(text.lower()):
+        hour, minute, half = clock.groups()
+        return f"{hour}{':' + minute if minute else ''} {half}m"
+    return None
 
 
 def _state_label(raw: str) -> str:

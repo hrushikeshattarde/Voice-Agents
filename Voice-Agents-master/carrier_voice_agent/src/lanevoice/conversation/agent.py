@@ -1926,6 +1926,16 @@ class CarrierSalesAgent:
         if rep_id and outcome == CallOutcome.TRANSFERRED:
             self._repo.log_transfer(self.call_id, rep_id, "connected")
 
+    def note_unheard(self) -> None:
+        """The caller spoke and nothing was transcribed; the worker asked them to
+        say it again. Recorded so a reviewer reading a transcript with an odd
+        gap in it can see the line was dropped by the recogniser, not by the
+        caller — and so a call with several of these stands out."""
+        self._repo.log_note(
+            self.call_id,
+            "Caller spoke but nothing was transcribed (a short or quiet utterance "
+            "the recogniser returned empty) — asked them to say it again.")
+
     def note_playback_cut(self, spoken_line: str) -> None:
         """The caller spoke over this line and its audio stopped mid-play.
 
