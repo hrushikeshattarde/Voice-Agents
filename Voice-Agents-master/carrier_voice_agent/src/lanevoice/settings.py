@@ -125,11 +125,93 @@ class Settings(BaseSettings):
         return self._PROVIDER_MODELS.get(
             self.llm_provider.strip().lower(), self._PROVIDER_MODELS["openrouter"])
 
+    # --- Speech on the phone line: which service hears and speaks ------------- #
+    # inference  — LiveKit Inference, the default. Streams over a WebSocket using
+    #              the LiveKit credentials already required above: no extra key,
+    #              billed on the LiveKit account. Transcription runs WHILE the
+    #              caller talks and the voice starts playing on its first few
+    #              hundred milliseconds of audio. That overlap is the whole
+    #              difference between this path and the one below.
+    # openrouter — the original path: Whisper as one HTTP POST per utterance sent
+    #              only after the caller stops, and a voice that generates the
+    #              entire reply before its first byte. Kept as the fallback, and
+    #              still what practice mode uses (STT_MODEL / TTS_MODEL below).
+    #
+    # Measured on the live pipeline before the switch, per caller turn and none of
+    # it overlapping: 0.55s for the VAD to close, 1.0-1.8s for Whisper to answer,
+    # then 1.0-2.0s before the voice produced its first byte. On the four most
+    # recent recordings 35-48% of the call was silence. Streaming removes the
+    # first two waits almost entirely and cuts the third to a few hundred ms.
+    stt_provider: str = Field(default="inference", validation_alias="STT_PROVIDER")
+    # A LiveKit Inference model, "provider/model". Both candidates stream, emit
+    # interim results (what lets the turn detector and barge-in act on partial
+    # speech) and take a keyterm list that actually reaches the recogniser — the
+    # Whisper `prompt` never did through OpenRouter. AssemblyAI is the default
+    # because of how it WRITES NUMBERS: measured on ten phone-band lines with
+    # engine noise, its formatted output parsed 10/10 — "2450", "611349", and a
+    # load number read in groups ("twenty-five, thirteen, four forty-six") as
+    # 2513446 — where Deepgram's numerals mode wrote a rate as "24 50" (unparsed)
+    # and its smart format wrote "$24.75" for twenty-four seventy-five. It also
+    # produced 3-5x more interim transcripts per second. `deepgram/nova-3` is the
+    # alternative; `telephony.worker._stt_extra_kwargs` has the per-provider
+    # options and the measurements.
+    stt_inference_model: str = Field(default="assemblyai/universal-streaming",
+                                     validation_alias="STT_INFERENCE_MODEL")
+    # Extra vocabulary for the recogniser, comma-separated, ADDED to the built-in
+    # freight list in `telephony.worker.STT_KEYTERMS`. Words and short phrases —
+    # "Circle Logistics", "rate con" — not sentences and not digit strings.
+    stt_keyterms: str = Field(default="", validation_alias="STT_KEYTERMS")
+
+    tts_provider: str = Field(default="inference", validation_alias="TTS_PROVIDER")
+    # "provider/model" plus a voice that model offers. The voice is REQUIRED to be a
+    # fixed, named one for the same reason TTS_VOICE is below: the agent has to
+    # sound like one person for the whole call, and a provider-side default is not
+    # guaranteed stable. A wrong voice fails at worker start, in prewarm, not on a
+    # call. Measured through this project's gateway on a 7-12s load pitch, time
+    # to FIRST audio (the number the caller waits on, the rest plays while it
+    # streams) — all male voices by pitch, all verified to render:
+    #
+    #   cartesia/sonic-3   a167e0f3-df7e-4d52-a9c3-f949145efdab   0.38s   <- default
+    #   cartesia/sonic-3   820a3788-2b37-4d21-847a-b65d8a68c99a   0.41s
+    #   cartesia/sonic-3   729651dc-c6c3-4ee5-97fa-350da1f88600   0.55s
+    #   elevenlabs/eleven_flash_v2_5   pNInz6obpgDQGcFmaJgB       0.28s   fastest; dearer
+    #   deepgram/aura-2    aura-2-orion-en                        0.28s
+    #
+    # Against 1.0-2.0s before the first byte on the OpenRouter voice. Cartesia is
+    # the default on price; ElevenLabs Flash is the pick if the desk wants the
+    # last 100ms and accepts the per-character rate. Compare by ear with
+    # `tools/audition_voices.py --inference`.
+    tts_inference_model: str = Field(default="cartesia/sonic-3",
+                                     validation_alias="TTS_INFERENCE_MODEL")
+    tts_inference_voice: str = Field(default="a167e0f3-df7e-4d52-a9c3-f949145efdab",
+                                     validation_alias="TTS_INFERENCE_VOICE")
+
+    @property
+    def stt_on_inference(self) -> bool:
+        return self.stt_provider.strip().lower() == "inference"
+
+    @property
+    def tts_on_inference(self) -> bool:
+        return self.tts_provider.strip().lower() == "inference"
+
+    @property
+    def needs_openrouter(self) -> bool:
+        """True while any AI hop on the phone line still runs through OpenRouter.
+
+        With both speech legs on LiveKit Inference and LLM_PROVIDER=anthropic, a
+        deployment needs no OpenRouter key at all; the worker's startup check reads
+        this rather than demanding one unconditionally.
+        """
+        return (self.llm_provider.strip().lower() == "openrouter"
+                or not self.stt_on_inference or not self.tts_on_inference)
+
     # --- Models (swap to change models) ------------------------------------- #
-    # The speech models are OpenRouter slugs, so they are vendor-namespaced rather
-    # than the bare names a single-vendor API takes. STT_MODEL has to be a
+    # The speech models below are OpenRouter slugs, so they are vendor-namespaced
+    # rather than the bare names a single-vendor API takes. STT_MODEL has to be a
     # transcription model and TTS_MODEL a text-to-speech one — the two endpoints
-    # reject each other's models.
+    # reject each other's models. They drive PRACTICE MODE (one-shot HTTP legs from
+    # the dashboard) and the phone line only when STT_PROVIDER / TTS_PROVIDER is
+    # set back to `openrouter`.
     #
     # Measured with `tools/measure_latency.py` on synthesised clean audio, two
     # lines a carrier actually says. Latency is a median of 3; the transcript is
@@ -179,10 +261,11 @@ class Settings(BaseSettings):
     # NOT stable, so the speaker changed between turns of the same call. Heard on
     # a real call.
     #
-    # Synthesis is NOT streamed (see `telephony.worker`), so the whole utterance is
-    # generated before a single sample reaches the caller. That is why the multiple
-    # of real time matters more than it looks: at 0.64x a 12-second pitch is seven
-    # seconds of dead air, on top of the LLM and the endpointing delay.
+    # On this path the provider generates the WHOLE utterance before its first byte
+    # (the body is then streamed — see `voice.tts.stream_pcm`), so the multiple of
+    # real time matters more than it looks: at 0.64x a 12-second pitch is seven
+    # seconds of dead air, on top of the LLM and the endpointing delay. This is the
+    # 1-2s per-request floor that TTS_PROVIDER=inference exists to remove.
     tts_model: str = Field(default="microsoft/mai-voice-2-flash",
                            validation_alias="TTS_MODEL")
     # Voices are namespaced to the provider — "alloy" is an OpenAI name, meaningless
@@ -263,6 +346,12 @@ class Settings(BaseSettings):
     # pause by phone standards and cuts up to 5 seconds off roughly half the
     # turns. Raise it back toward 6-8 if callers start getting clipped
     # mid-sentence; that is the failure this number guards against.
+    #
+    # With STT_PROVIDER=inference the transcript is already in hand when the caller
+    # stops, so MIN is now the largest single post-speech wait rather than a delay
+    # hidden behind a Whisper round trip. The framework's own default is 0.5; the
+    # next tuning step is to walk this down toward 0.6-0.8 while watching for
+    # clipped callers.
     min_endpointing_delay: float = Field(default=1.3, validation_alias="MIN_ENDPOINTING_DELAY")
     max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
 

@@ -112,12 +112,29 @@ Watch the terminal for the live transcript; the call is logged to `carrier_agent
 - [ ] Dial the number → agent answers
 
 ## If the call connects but the agent is silent / errors
-- **Silent / TTS error:** the worker synthesises one warm-up phrase at startup,
-  so a bad `TTS_MODEL` or a `TTS_VOICE` the model doesn't offer fails there with
-  the HTTP status in the log rather than as silence on the call. Use the default
-  `microsoft/mai-voice-2-flash` with `TTS_VOICE=en-US-Ethan:MAI-Voice-2`.
-  Do NOT leave `TTS_VOICE` empty on a model that has no stable default — fish-audio
-  picks a different speaker per request, so the agent changes voice mid-call.
+- **Speech runs on LiveKit Inference by default** (`STT_PROVIDER` /
+  `TTS_PROVIDER=inference`): streaming transcription and a streaming voice on
+  the LiveKit credentials, no OpenRouter involved. At startup the worker
+  composes the greeting once and renders it and the filler clips in the
+  configured voice, so a wrong `TTS_INFERENCE_MODEL` or `TTS_INFERENCE_VOICE`
+  shows up in the prewarm log as `clip ... failed to synthesize` with the
+  gateway's error, and the worker carries on (greeting composed live, no
+  fillers) rather than dying. Look for `greeting rendered:` and `dead-air
+  fillers ready:` in the startup log — both present means the voice works. If
+  Inference is not enabled on the LiveKit project, set both providers to
+  `openrouter` to get the previous pipeline back.
+- **Silent / TTS error on `TTS_PROVIDER=openrouter`:** the worker synthesises
+  one warm-up phrase at startup, so a bad `TTS_MODEL` or a `TTS_VOICE` the model
+  doesn't offer fails there with the HTTP status in the log rather than as
+  silence on the call. Use the default `microsoft/mai-voice-2-flash` with
+  `TTS_VOICE=en-US-Ethan:MAI-Voice-2`. Do NOT leave `TTS_VOICE` empty on a model
+  that has no stable default — fish-audio picks a different speaker per request,
+  so the agent changes voice mid-call.
+- **Agent never hears the caller:** with `STT_PROVIDER=inference` the log shows
+  `stt: inference / assemblyai/universal-streaming` at startup and `CALLER said →`
+  lines as the caller talks. No caller lines at all points at the Inference STT connection
+  (check the LiveKit project has Inference enabled) or at the VAD thresholds in
+  `settings.py`.
 - **Dead air / no answer:** the worker isn't picking up the room — confirm it's
   running and that the dispatch rule was created (`lk sip dispatch list`).
 - **`Missing required env vars`:** fill `.env` (LiveKit + `OPENROUTER_API_KEY`).

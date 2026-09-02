@@ -1,16 +1,20 @@
 """
 Render one agent line across candidate voices, to pick by ear AND by latency.
 
-    uv run python tools/audition_voices.py                    # the shortlist
-    uv run python tools/audition_voices.py --deepgram-voices  # list Deepgram's 36
+    uv run python tools/audition_voices.py --inference        # LiveKit Inference shortlist
+    uv run python tools/audition_voices.py --inference cartesia/sonic-3:<voice-id>
+    uv run python tools/audition_voices.py                    # the OpenRouter shortlist
+    uv run python tools/audition_voices.py --deepgram-voices  # list Deepgram's 36 (OpenRouter)
     uv run python tools/audition_voices.py mai:en-US-Harper:MAI-Voice-2
 
 Writes `voice-samples/<model>__<voice>.wav` and prints latency beside each.
 
-BOTH columns matter. Synthesis is not streamed, so the whole utterance is built
-before the caller hears anything: at 0.64x real time a twelve-second load pitch is
-seven seconds of silence, on top of the LLM and the endpointing delay. A voice that
-sounds lovely at 0.6x is worse on the phone than a plain one at 0.12x.
+BOTH columns matter. On the OpenRouter path synthesis is not streamed, so the whole
+utterance is built before the caller hears anything: at 0.64x real time a
+twelve-second load pitch is seven seconds of silence, on top of the LLM and the
+endpointing delay. A voice that sounds lovely at 0.6x is worse on the phone than a
+plain one at 0.12x. On the Inference path the number that matters is the FIRST
+column — how long until the first audio — because the rest plays while it streams.
 
 Only Deepgram will tell you its voice names — an invalid one returns a 400 listing
 all 36. Every other provider answers an opaque "Provider returned 400", which is
@@ -19,6 +23,7 @@ why the candidates below are a hand-verified list rather than something discover
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import re
 import sys
@@ -49,7 +54,69 @@ SHORTLIST = [
     ("deepgram/flux-tts:free", "flux-drew-en"),
 ]
 
+# LiveKit Inference "provider/model" + voice, for TTS_PROVIDER=inference. Every one
+# verified to return audio through this project's gateway (see settings.py). Voices
+# are ids on Cartesia and ElevenLabs, names on Deepgram Aura-2.
+INFERENCE_SHORTLIST = [
+    ("cartesia/sonic-3", "a167e0f3-df7e-4d52-a9c3-f949145efdab"),
+    ("cartesia/sonic-3", "820a3788-2b37-4d21-847a-b65d8a68c99a"),
+    ("cartesia/sonic-3", "729651dc-c6c3-4ee5-97fa-350da1f88600"),
+    ("elevenlabs/eleven_flash_v2_5", "pNInz6obpgDQGcFmaJgB"),
+    ("deepgram/aura-2", "aura-2-orion-en"),
+]
+
 OUT_DIR = pathlib.Path("voice-samples")
+
+
+def audition_inference(settings, candidates: list[tuple[str, str]]) -> None:
+    """Render LINE on each Inference voice; print first-audio, complete, and length.
+
+    Runs outside a LiveKit job, so it binds its own HTTP session the way the
+    framework documents for scripts (`utils.http_context.open`).
+    """
+    from livekit.agents import inference, utils
+
+    async def run() -> None:
+        print(f"  {'model':<30} {'voice':<26} {'first':>7} {'done':>7} {'audio':>7}")
+        print("  " + "-" * 82)
+        async with utils.http_context.open():
+            for model, voice in candidates:
+                tts = inference.TTS(model, voice=voice, language="en",
+                                    api_key=settings.livekit_api_key,
+                                    api_secret=settings.livekit_api_secret)
+                started = time.monotonic()
+                first = None
+                pcm = bytearray()
+                rate = None
+                try:
+                    async with tts.synthesize(LINE) as stream:
+                        async for audio in stream:
+                            if first is None:
+                                first = time.monotonic() - started
+                            pcm += audio.frame.data.tobytes()
+                            rate = audio.frame.sample_rate
+                except Exception as exc:  # noqa: BLE001 - report and keep going
+                    print(f"  {model:<30} {voice[:26]:<26} FAILED: {str(exc)[:34]}")
+                    continue
+                finally:
+                    await tts.aclose()
+                complete = time.monotonic() - started
+                if not pcm or not rate:
+                    print(f"  {model:<30} {voice[:26]:<26} FAILED: no audio")
+                    continue
+                stem = f"{model.replace('/', '_')}__{voice}"
+                with wave.open(str(OUT_DIR / f"{stem}.wav"), "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(rate)
+                    handle.writeframes(bytes(pcm))
+                seconds = len(pcm) / 2 / rate
+                print(f"  {model:<30} {voice[:26]:<26} {first:>6.2f}s {complete:>6.2f}s "
+                      f"{seconds:>6.1f}s")
+
+    asyncio.run(run())
+    print(f"\nSamples in {OUT_DIR}/. Put the winner in .env:")
+    print("  TTS_INFERENCE_MODEL=<model>\n  TTS_INFERENCE_VOICE=<voice>")
 
 
 def deepgram_voices(settings) -> list[str]:
@@ -77,6 +144,22 @@ def main() -> None:
 
     # `model:voice` pairs, or the shortlist.
     picked = [a for a in args if not a.startswith("-")]
+
+    if "--inference" in args:
+        settings.require("livekit_api_key", "livekit_api_secret")
+        candidates = INFERENCE_SHORTLIST
+        if picked:
+            candidates = []
+            for arg in picked:
+                model, _, voice = arg.partition(":")
+                if not voice:
+                    raise SystemExit(f"expected provider/model:voice, got {arg!r}")
+                candidates.append((model, voice))
+        OUT_DIR.mkdir(exist_ok=True)
+        print(f"line: {LINE[:64]}...\n")
+        audition_inference(settings, candidates)
+        return
+
     if picked:
         candidates = []
         for arg in picked:

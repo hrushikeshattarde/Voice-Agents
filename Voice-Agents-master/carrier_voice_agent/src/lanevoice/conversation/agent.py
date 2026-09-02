@@ -106,6 +106,57 @@ _UNRETRYABLE = re.compile(
 # like one consistent human rep.
 REP_NAME = "Alex"
 
+# The opening line. It is the same on every call by design — the company, the
+# name, "what can I help you with" — and that constancy is what lets the worker
+# compose it ONCE at process start and render it to audio before any phone rings,
+# so a caller hears a voice the moment the line connects instead of after an LLM
+# round trip and a synthesis. `CarrierSalesAgent.greeting` composes this same
+# directive live (the demo and the tests); `greet_with` records a pre-composed one.
+GREETING_DIRECTIVE = (
+    "Answer the inbound call. Name the company, give your first name, and ask "
+    "what you can help with — that's it. Real desks answer short; do not "
+    "deliver a speech, do not list what you do, and do not ask for a load "
+    "number yet. One sentence."
+)
+GREETING_FACTS = f"Your name: {REP_NAME}. Brokerage: Circle Logistics."
+
+
+def compose_greeting(composer: TurnComposer,
+                     settings: Settings | None = None) -> str | None:
+    """The greeting as the composer would speak it on a call, or None.
+
+    Same directive, same facts and the same money guardrail as
+    `CarrierSalesAgent.greeting`, minus the call record: this runs at worker start
+    with nobody on the line, so there is no transcript to append to and no rep to
+    hand anything to when it fails. None means "compose it live on each call
+    instead" — which is what the worker did before, and still does on a None.
+    """
+    settings = settings or get_settings()
+    speakable = _speakable(set())
+    source = f"{GREETING_DIRECTIVE} {GREETING_FACTS}"
+    correction = ""
+    for attempt in range(1, max(1, settings.llm_attempts) + 1):
+        try:
+            spoken = composer.compose(
+                directive=GREETING_DIRECTIVE, facts=GREETING_FACTS, dialogue="",
+                speakable=speakable, correction=correction,
+            )
+        except Exception as exc:  # noqa: BLE001 - a model that is down costs the prerender, never the worker
+            logger.warning("could not pre-compose the greeting (attempt %d): %s",
+                           attempt, exc)
+            if _UNRETRYABLE.search(str(exc)) or _UNRETRYABLE.search(type(exc).__name__):
+                return None
+            continue
+        if not spoken.strip():
+            correction = "You returned nothing at all. Say your turn out loud."
+            continue
+        breach = _breach(spoken, set(), None, source, speakable)
+        if breach is None:
+            return spoken.strip()
+        logger.warning("rejected pre-composed greeting — %s", breach)
+        correction = breach
+    return None
+
 # What a load pitch actually has to contain, shared by the two turns that give one
 # out (with the rate, and without).
 #
@@ -644,15 +695,25 @@ class CarrierSalesAgent:
 
     # -- entry points ------------------------------------------------------- #
     def greeting(self) -> str:
+        """Compose and speak the opening line live — the demo's and the tests' path.
+
+        The phone worker prefers `greet_with`: the line is constant, so it composes
+        it once at process start and has the audio ready before the phone rings.
+        """
         self.state = CallState.IDENTIFY_LOAD
-        spoken = self._say(
-            "Answer the inbound call. Name the company, give your first name, and ask "
-            "what you can help with — that's it. Real desks answer short; do not "
-            "deliver a speech, do not list what you do, and do not ask for a load "
-            "number yet. One sentence.",
-            facts=f"Your name: {REP_NAME}. Brokerage: Circle Logistics.",
-            amounts=set(),
-        )
+        spoken = self._say(GREETING_DIRECTIVE, facts=GREETING_FACTS, amounts=set())
+        self._sync_transcript()
+        return spoken
+
+    def greet_with(self, spoken: str) -> str:
+        """Open the call with a greeting that was composed before it rang.
+
+        Same state change and the same transcript entry as `greeting()`, so every
+        later turn is composed against a dialogue that includes the opening line —
+        only the composing has already happened. See `compose_greeting`.
+        """
+        self.state = CallState.IDENTIFY_LOAD
+        self.transcript.append(("agent", spoken))
         self._sync_transcript()
         return spoken
 
