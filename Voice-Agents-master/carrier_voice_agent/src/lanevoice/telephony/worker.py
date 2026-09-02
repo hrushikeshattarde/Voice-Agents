@@ -37,6 +37,7 @@ from livekit.agents import (
     JobContext,
     ModelSettings,
     RoomInputOptions,
+    TurnHandlingOptions,
     WorkerOptions,
     cli,
     inference,
@@ -611,6 +612,14 @@ class CarrierAgent(Agent):
             await self._acknowledge_if_slow(reply_task)
         reply = await reply_task
         logger.info("AGENT reply → %s", reply)
+        timing = self.brain.last_turn_timing
+        if timing:
+            logger.info(
+                "TIMING brain → %.2fs (compose %.2fs over %d call%s; lookups and "
+                "bookkeeping %.2fs) in %s",
+                timing["total"], timing["compose"], timing["compose_calls"],
+                "" if timing["compose_calls"] == 1 else "s", timing["other"],
+                timing["state"])
         try:
             speech = self.session.say(reply)
             await speech
@@ -626,6 +635,59 @@ class CarrierAgent(Agent):
         raise StopResponse()   # we answered this turn ourselves; skip the LLM node
 
 
+def turn_handling(settings: Settings) -> TurnHandlingOptions:
+    """The session's turn-taking rules, from settings.
+
+    Endpointing: MIN applies when the hosted turn detector reads the caller as
+    finished, MAX when it reads them as mid-thought. Interruption: how much
+    continuous speech — and, now that the STT streams interim words, how many of
+    them — it takes to cut the agent off, and what happens when an "interruption"
+    never turns into words (a cough, a horn: the cut line resumes). Short
+    line-checks ("hello?") must not cut the agent's audio; a caller genuinely
+    talking over it still should. See the settings comments for each number.
+    """
+    return {
+        "endpointing": {
+            "min_delay": settings.min_endpointing_delay,
+            "max_delay": settings.max_endpointing_delay,
+        },
+        "interruption": {
+            "enabled": settings.allow_interruptions,
+            "min_duration": settings.min_interruption_duration,
+            "min_words": settings.min_interruption_words,
+            "resume_false_interruption": settings.resume_false_interruption,
+            "false_interruption_timeout": settings.false_interruption_timeout,
+        },
+    }
+
+
+def _log_metrics(ev) -> None:
+    """One log line per framework measurement, so a call's latency can be read
+    off the log turn by turn.
+
+    end-of-turn: how long after the caller stopped the transcript was in hand, and
+    how long after that the turn was declared over (the endpointing wait). voice:
+    how long the caller waited for the first audio of a reply. The brain's own
+    split (compose vs. lookups) is logged by `CarrierAgent` beside these, so the
+    four numbers together are the whole gap the caller sat through.
+    """
+    metrics = ev.metrics
+    kind = getattr(metrics, "type", "")
+    if kind == "eou_metrics":
+        logger.info("TIMING end-of-turn → transcript %.2fs after the caller stopped, "
+                    "turn ended %.2fs after",
+                    metrics.transcription_delay, metrics.end_of_utterance_delay)
+    elif kind == "tts_metrics":
+        logger.info("TIMING voice → first audio %.2fs; %.1fs of speech for %d chars%s",
+                    metrics.ttfb, metrics.audio_duration, metrics.characters_count,
+                    " (cut off by the caller)" if metrics.cancelled else "")
+    elif kind == "eot_inference_metrics":
+        logger.debug("TIMING turn detector → %.2fs", metrics.total_duration)
+    elif kind == "stt_metrics":
+        logger.debug("TIMING stt → %.2fs for %.1fs of audio",
+                     metrics.duration, metrics.audio_duration)
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
     ud = ctx.proc.userdata
@@ -639,16 +701,10 @@ async def entrypoint(ctx: JobContext):
         vad=ud["vad"],
         stt=ud["stt"],
         tts=ud["tts"],
-        allow_interruptions=_settings.allow_interruptions,
-        min_endpointing_delay=_settings.min_endpointing_delay,
-        max_endpointing_delay=_settings.max_endpointing_delay,
-        # Short line-checks ("hello?") must not cut the agent's audio; a caller
-        # genuinely talking over it still should. See the settings comments.
-        min_interruption_duration=_settings.min_interruption_duration,
-        resume_false_interruption=_settings.resume_false_interruption,
-        false_interruption_timeout=_settings.false_interruption_timeout,
+        turn_handling=turn_handling(_settings),
         **session_kwargs,
     )
+    session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
                          fillers=ud.get("fillers"), greeting=ud.get("greeting"))
 

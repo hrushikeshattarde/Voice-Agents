@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Protocol, runtime_checkable
 
 from lanevoice.logging_config import get_logger
@@ -158,6 +159,40 @@ class _ChatComposer:
     def __init__(self, settings: Settings | None = None):
         self._settings = settings or get_settings()
         self._model = self._settings.resolved_llm_model
+        # (prompt tokens, completion tokens) of the last `_chat`, when the provider
+        # reported them. Set by the subclass; read by `_timed_chat` for the log.
+        self._last_usage: tuple[int, int] | None = None
+
+    def _timed_chat(self, what: str, *args, **kwargs) -> tuple[str, bool]:
+        """`_chat`, with one log line per call: how long, and how many tokens.
+
+        Per-call latency and token counts are the two numbers every tuning
+        decision on this desk rests on — model choice, prompt length, the cost
+        model's per-turn estimates — and until now neither was recorded from a
+        live call. The usage is whatever the provider reported; nothing here
+        counts tokens itself.
+        """
+        self._last_usage = None
+        started = time.monotonic()
+        try:
+            return self._chat(*args, **kwargs)
+        finally:
+            elapsed = time.monotonic() - started
+            if self._last_usage is not None:
+                logger.info("TIMING %s → %.2fs on %s; %s in / %s out tokens", what,
+                            elapsed, self._model, f"{self._last_usage[0]:,}",
+                            f"{self._last_usage[1]:,}")
+            else:
+                logger.info("TIMING %s → %.2fs on %s", what, elapsed, self._model)
+
+    @staticmethod
+    def _usage(prompt_tokens: object, completion_tokens: object) -> tuple[int, int] | None:
+        """The pair when both are real integers, else None — a provider (or a
+        test double) that reports nothing must not turn the log into a crash."""
+        if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int) \
+                and not isinstance(prompt_tokens, bool):
+            return prompt_tokens, completion_tokens
+        return None
 
     @property
     def _temperature(self) -> float | None:
@@ -214,8 +249,8 @@ class _ChatComposer:
         parts.append("Say your next turn out loud now. Speech only — no labels, "
                      "no quotation marks around it, no stage directions.")
         prompt = "\n\n".join(parts)
-        text, truncated = self._chat(
-            _SYSTEM, prompt,
+        text, truncated = self._timed_chat(
+            "compose", _SYSTEM, prompt,
             max_tokens=self._settings.llm_max_tokens,
             temperature=self._temperature,
         )
@@ -228,10 +263,10 @@ class _ChatComposer:
                 "Composed turn hit the %d-token limit and was cut off mid-sentence "
                 "(%d chars). Retrying with an explicit length instruction.",
                 self._settings.llm_max_tokens, len(text))
-            text, truncated = self._chat(
-                _SYSTEM, prompt + _TOO_LONG,
+            text, truncated = self._timed_chat(
+                "compose (shorter retry)", _SYSTEM, prompt + _TOO_LONG,
                 max_tokens=self._settings.llm_max_tokens,
-                temperature=self._settings.llm_temperature,
+                temperature=self._temperature,
             )
             if truncated:
                 # Still cut off. Returning "" makes `_say` re-prompt and then hand
@@ -248,8 +283,8 @@ class _ChatComposer:
     def read(self, dialogue: str, fields: dict[str, str]) -> dict:
         """Extract `fields` ({name: what to look for}) from the dialogue."""
         wanted = "\n".join(f"- {name}: {desc}" for name, desc in fields.items())
-        raw, truncated = self._chat(
-            _READ_SYSTEM,
+        raw, truncated = self._timed_chat(
+            "read", _READ_SYSTEM,
             f"CALL SO FAR:\n{dialogue}\n\nPull out these fields:\n{wanted}\n\n"
             f"Return JSON with exactly these keys: {', '.join(fields)}.",
             max_tokens=self._settings.llm_read_max_tokens,
@@ -316,6 +351,9 @@ class OpenRouterComposer(_ChatComposer):
             error = getattr(resp, "error", None)
             raise RuntimeError(f"OpenRouter returned no completion: {error or resp}")
         choice = resp.choices[0]
+        usage = getattr(resp, "usage", None)
+        self._last_usage = self._usage(getattr(usage, "prompt_tokens", None),
+                                       getattr(usage, "completion_tokens", None))
         return ((choice.message.content or "").strip(),
                 choice.finish_reason == "length")
 
@@ -359,6 +397,9 @@ class AnthropicComposer(_ChatComposer):
         # so check `stop_reason` before reading blocks. An empty string is the
         # right answer here — the conversation layer re-prompts, and hands the
         # call to a rep if it can't get a compliant turn.
+        usage = getattr(message, "usage", None)
+        self._last_usage = self._usage(getattr(usage, "input_tokens", None),
+                                       getattr(usage, "output_tokens", None))
         if message.stop_reason == "refusal":
             return "", False
         text = "".join(

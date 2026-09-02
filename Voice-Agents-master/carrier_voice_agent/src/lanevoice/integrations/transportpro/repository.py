@@ -34,6 +34,7 @@ import dataclasses
 import datetime
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from lanevoice.db.repository import Repository
@@ -131,6 +132,23 @@ class BookingAttempt:
         return bool(self.offer_id)
 
 
+# What an enrichment lookup returns when the call itself failed, as opposed to
+# succeeding with "no such carrier" (None). The two are handled differently:
+# a miss on the MC is followed by a try on the DOT, a failure is not.
+_LOOKUP_FAILED: Any = object()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Speculative:
+    """Enrichment lookups started on the number AS HEARD, before Transport Pro
+    has said whose number it is. Valid only if the record confirms that number is
+    the carrier's MC — see `TransportProRepository._enrich_carrier`."""
+
+    keyed_on: str
+    highway: Future | None
+    happyrobot: Future | None
+
+
 class TransportProRepository:
     """Loads and carriers from Transport Pro; call audit trail in SQLite.
 
@@ -163,6 +181,11 @@ class TransportProRepository:
         # usdot (as the rest of the system keys carriers) -> Transport Pro id,
         # so `carrier_emails` can reach `/contact/search` from a USDOT alone.
         self._carrier_ids: dict[str, str] = {}
+        # The Highway and HappyRobot reads that enrich a carrier run on these
+        # threads, in parallel with each other and with the Transport Pro probe
+        # itself — see `get_carrier`. Both clients are httpx.Clients, which are
+        # safe to share across threads. Sized for several concurrent calls.
+        self._lookups = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tp-enrich")
         # Which office's freight this deployment may sell. Resolved lazily on the
         # first load lookup and then held for an hour — it is org structure.
         self._terminals = TerminalScopeCache(
@@ -425,6 +448,24 @@ class TransportProRepository:
         if hit:
             return cached
 
+        # Start the enrichment lookups NOW, keyed on the number as heard, while
+        # Transport Pro answers. A carrier volunteers their MC, so when the MC
+        # probe hits these are the very lookups `_enrich_carrier` would make next
+        # — and they have been running the whole time. When the caller gave a DOT
+        # the record's MC will not match what was heard, the results are
+        # discarded and the lookups run again on the right identifiers: two
+        # wasted reads on the rare path against a whole round trip saved on the
+        # common one. Before this, Transport Pro, then Highway, then HappyRobot
+        # ran one after another, on the one turn where a caller has just read out
+        # their number and is waiting to hear whether it worked.
+        speculative = _Speculative(
+            keyed_on=number,
+            highway=(self._lookups.submit(self._highway_record, mc=number, dot=None)
+                     if self._highway is not None else None),
+            happyrobot=(self._lookups.submit(self._happyrobot_record, mc=number, dot=None)
+                        if self._happyrobot is not None else None),
+        )
+
         try:
             record = self._client.carrier_status(mc_number=number)
             if record is None:
@@ -440,7 +481,8 @@ class TransportProRepository:
             # FAIL, on the HappyRobot endpoint. Without this fallback that carrier
             # read as "we could not capture your number", got asked twice more and
             # was handed to a rep, when the honest answer was a decline.
-            looked_up = self._carrier_lookup_record(number)
+            looked_up = self._carrier_lookup_record(
+                number, mc_probe=speculative.happyrobot)
             record = looked_up
 
         carrier = None
@@ -454,7 +496,8 @@ class TransportProRepository:
             # carrier per TTL rather than once per call. `looked_up` is handed
             # through so the fallback's response is reused rather than fetched a
             # second time — the same call, on the critical path, twice.
-            carrier = self._enrich_carrier(carrier, number, looked_up=looked_up)
+            carrier = self._enrich_carrier(carrier, number, looked_up=looked_up,
+                                           speculative=speculative)
         if carrier is not None:
             if not carrier.authority_reported:
                 logger.error(
@@ -474,7 +517,8 @@ class TransportProRepository:
             self._carriers.put(number, None)
         return carrier
 
-    def _carrier_lookup_record(self, number: str) -> dict | None:
+    def _carrier_lookup_record(self, number: str, *,
+                               mc_probe: Future | None = None) -> dict | None:
         """The HappyRobot record for a carrier `/voiceai/carrier_status` lacks.
 
         Its rows carry the same fields `map_carrier` already reads — `status`,
@@ -482,19 +526,21 @@ class TransportProRepository:
         needed to map one. Crucially it carries a STATUS, including an explicit
         `FAIL`, which is what turns an unknown caller into a definite answer.
 
+        `mc_probe` is the lookup by MC that `get_carrier` started while Transport
+        Pro was still answering; it is the first half of this fallback, already in
+        flight, so it is collected rather than repeated.
+
         Never raises: this is a fallback, and a carrier we cannot look up at all
         must stay "not found" (a re-ask, then a rep) rather than becoming an error
         mid-call.
         """
         if self._happyrobot is None:
             return None
-        try:
-            record = self._happyrobot.carrier_lookup(mc=number)
-            if record is None:
-                record = self._happyrobot.carrier_lookup(dot=number)
-        except (HappyRobotError, ValueError) as exc:
-            logger.warning(
-                "HappyRobot carrier_lookup fallback failed for %s: %s", number, exc)
+        record = (mc_probe.result() if mc_probe is not None
+                  else self._happyrobot_record(mc=number, dot=None))
+        if record is None:
+            record = self._happyrobot_record(mc=None, dot=number)
+        if record is _LOOKUP_FAILED:
             return None
         if record is not None:
             logger.info(
@@ -503,8 +549,32 @@ class TransportProRepository:
                 number, record.get("status"))
         return record
 
+    def _highway_record(self, *, mc: str | None, dot: str | None) -> Any:
+        """Highway's record; None when Highway has no such carrier; `_LOOKUP_FAILED`
+        when the call itself failed. Never raises — this is enrichment, not the
+        gate — which is also what makes it safe to run on a worker thread."""
+        try:
+            return self._highway.carrier(mc=mc or None, dot=None if mc else dot)
+        except (HighwayError, ValueError) as exc:
+            logger.warning(
+                "Highway lookup failed for MC %s / DOT %s (%s) — vetting falls "
+                "back to Transport Pro's list.", mc or "-", dot or "-", exc)
+            return _LOOKUP_FAILED
+
+    def _happyrobot_record(self, *, mc: str | None, dot: str | None) -> Any:
+        """HappyRobot's `carrier_lookup` row, None, or `_LOOKUP_FAILED` — same
+        contract as `_highway_record`."""
+        try:
+            return self._happyrobot.carrier_lookup(mc=mc or None, dot=None if mc else dot)
+        except (HappyRobotError, ValueError) as exc:
+            logger.warning(
+                "HappyRobot carrier_lookup failed for MC %s / DOT %s (%s) — "
+                "Highway's verdicts stand alone.", mc or "-", dot or "-", exc)
+            return _LOOKUP_FAILED
+
     def _enrich_carrier(self, carrier: Carrier | None, heard: str, *,
-                        looked_up: dict | None = None) -> Carrier | None:
+                        looked_up: dict | None = None,
+                        speculative: _Speculative | None = None) -> Carrier | None:
         """Add what `/voiceai/carrier_status` doesn't carry: qualifications.
 
         That endpoint returns only {carrier_name, city, state, dot_number,
@@ -516,9 +586,13 @@ class TransportProRepository:
           HappyRobot `carrier_lookup`  the list Transport Pro holds, used only
                                        where Highway has no verdict
 
-        Costs up to two extra round trips, which is why it sits inside the cached
+        Two extra round trips, which is why they sit inside the cached
         `get_carrier` (once per carrier per `TRANSPORT_PRO_CARRIER_CACHE_SECONDS`)
-        and behind shorter timeouts than the Transport Pro calls themselves.
+        and behind shorter timeouts than the Transport Pro calls themselves — and
+        why they run in PARALLEL: with each other, and, via `speculative`, with
+        the Transport Pro probe that preceded this call. `speculative` holds the
+        lookups `get_carrier` started on the number as heard; they are used only
+        when the record confirms that number is the MC both APIs are keyed on.
 
         Never raises, and never turns a found carrier into None. Both sources are
         enrichment: unreachable, misconfigured, no record, or an unrecognised
@@ -536,14 +610,26 @@ class TransportProRepository:
         dot = _digits(carrier.usdot_number or "")
         updates: dict[str, object] = {}
 
+        # The lookups started on the heard number are the right ones exactly when
+        # the record says that number IS the MC. Otherwise start the correct pair
+        # now — still alongside each other rather than one after the other.
+        reuse = (speculative is not None and bool(mc)
+                 and mc.lstrip("0") == speculative.keyed_on.lstrip("0"))
+        by = {"mc": mc or None, "dot": None if mc else (dot or heard)}
+        highway_f: Future | None = None
         if self._highway is not None:
-            try:
-                record = self._highway.carrier(
-                    mc=mc or None, dot=None if mc else (dot or heard))
-            except (HighwayError, ValueError) as exc:
-                logger.warning(
-                    "Highway lookup failed for MC %s / DOT %s (%s) — vetting falls "
-                    "back to Transport Pro's list.", mc or "-", dot or "-", exc)
+            highway_f = (speculative.highway
+                         if reuse and speculative.highway is not None
+                         else self._lookups.submit(self._highway_record, **by))
+        hr_f: Future | None = None
+        if looked_up is None and self._happyrobot is not None:
+            hr_f = (speculative.happyrobot
+                    if reuse and speculative.happyrobot is not None
+                    else self._lookups.submit(self._happyrobot_record, **by))
+
+        if highway_f is not None:
+            record = highway_f.result()
+            if record is _LOOKUP_FAILED:
                 record = None
             if record is not None:
                 if assessment := highway_mappers.classifications(record):
@@ -573,13 +659,10 @@ class TransportProRepository:
         # Reuse the fallback's response when there is one: without this it would be
         # the same request twice, on the critical path of a live call.
         hr_record = looked_up
-        if hr_record is None and self._happyrobot is not None:
-            try:
-                hr_record = self._happyrobot.carrier_lookup(
-                    mc=mc or None, dot=None if mc else (dot or heard))
-            except (HappyRobotError, ValueError) as exc:
-                logger.warning("HappyRobot carrier_lookup failed for MC %s (%s) — "
-                               "Highway's verdicts stand alone.", mc or dot, exc)
+        if hr_record is None and hr_f is not None:
+            hr_record = hr_f.result()
+            if hr_record is _LOOKUP_FAILED:
+                hr_record = None
         if isinstance(hr_record, dict):
             listed = hr_record.get("classifications")
             if isinstance(listed, list):

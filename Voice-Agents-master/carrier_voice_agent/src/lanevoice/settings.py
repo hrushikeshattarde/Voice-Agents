@@ -347,12 +347,17 @@ class Settings(BaseSettings):
     # turns. Raise it back toward 6-8 if callers start getting clipped
     # mid-sentence; that is the failure this number guards against.
     #
-    # With STT_PROVIDER=inference the transcript is already in hand when the caller
-    # stops, so MIN is now the largest single post-speech wait rather than a delay
-    # hidden behind a Whisper round trip. The framework's own default is 0.5; the
-    # next tuning step is to walk this down toward 0.6-0.8 while watching for
-    # clipped callers.
-    min_endpointing_delay: float = Field(default=1.3, validation_alias="MIN_ENDPOINTING_DELAY")
+    # MIN was 1.3 for as long as Whisper ran as one request per utterance: the
+    # transcript took 1.0-1.8s to come back after the caller stopped, the turn
+    # could not end before it did, and so MIN was never the thing being waited on.
+    # With STT_PROVIDER=inference the transcript is in hand when the caller stops
+    # and MIN became the largest single post-speech wait. 0.7 is the pause a
+    # person leaves before answering; the framework's own default is 0.5 (0.3 for
+    # a streaming turn detector), so there is room below this. MAX still applies
+    # whenever the hosted turn detector reads the caller as mid-thought — "my MC
+    # is six one one..." — and that, not MIN, is what protects digit dictation.
+    # If callers start getting clipped, raise MIN first.
+    min_endpointing_delay: float = Field(default=0.7, validation_alias="MIN_ENDPOINTING_DELAY")
     max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
 
     # Dead-air filler: when a reply takes longer than this to compose, the agent
@@ -380,6 +385,15 @@ class Settings(BaseSettings):
         default=True, validation_alias="RESUME_FALSE_INTERRUPTION")
     false_interruption_timeout: float = Field(
         default=2.0, validation_alias="FALSE_INTERRUPTION_TIMEOUT")
+    # A one-word backchannel while the agent is talking — "yeah", "okay", "mm-hm"
+    # — is agreement, not an interruption, and it used to cut the pitch off. The
+    # streaming STT's interim transcript is what makes counting words possible:
+    # detected speech only counts as a barge-in once this many words have been
+    # heard, and a burst that never gets there is a false interruption (the cut
+    # line resumes). A caller who actually objects reaches two words at once —
+    # "no wait", "hang on". 0 disables the check.
+    min_interruption_words: int = Field(
+        default=2, validation_alias="MIN_INTERRUPTION_WORDS")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are

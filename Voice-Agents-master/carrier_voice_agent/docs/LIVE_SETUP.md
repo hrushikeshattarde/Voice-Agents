@@ -103,6 +103,21 @@ Watch the terminal for the live transcript; the call is logged to `carrier_agent
 
 ---
 
+### Reading a call's latency off the log
+Every turn logs four `TIMING` lines, and together they are the whole gap the
+caller sat through:
+- `TIMING end-of-turn →` how long after the caller stopped the transcript was
+  in hand, and how long after that the turn was declared over (the endpointing
+  wait, `MIN_ENDPOINTING_DELAY` when the turn detector is confident).
+- `TIMING compose →` each LLM call: seconds, model, and tokens in/out.
+- `TIMING brain →` the whole reply: compose time versus lookups and bookkeeping
+  (Transport Pro, Highway, the negotiation engine).
+- `TIMING voice →` how long until the first audio of the reply, and how much
+  speech it was.
+
+Twenty real calls' worth of these replaces every estimate in
+[COST_MODEL.md](COST_MODEL.md) with a measurement.
+
 ## Quick sanity checklist
 - [ ] `.env` filled with real LiveKit + Twilio values
 - [ ] SIP enabled on LiveKit; SIP URI copied

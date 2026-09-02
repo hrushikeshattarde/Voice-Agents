@@ -717,6 +717,9 @@ def test_a_booking_transport_pro_refuses_is_never_announced(fake, repo):
 def test_call_notes_are_mirrored_onto_the_load_in_transport_pro(fake, repo):
     agent = _to_email(fake, repo)
     agent.handle(f"send it to {ON_ACCOUNT}")
+    # The TMS writes happen off the caller's critical path; the call is over, so
+    # collect them the way the worker does at hangup.
+    agent.flush_notes()
     posted = " ".join(body["content"] for body in fake.bodies("add_note"))
     assert "Voice AI call" in posted
     assert "Booking 1303369" in posted

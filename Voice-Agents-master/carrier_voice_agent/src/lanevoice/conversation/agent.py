@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import enum
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from lanevoice import formatting, geo, parsing
 from lanevoice.db.repository import Repository
@@ -481,6 +483,16 @@ class CarrierSalesAgent:
         self._load_revealed = False               # gate: load facts reach the LLM only after this
         self.transcript: list[tuple[str, str]] = []
         self.outcome: CallOutcome | None = None
+        # Notes are mirrored onto the load in the TMS from a background thread —
+        # see `_note`. ONE worker, so they land in the order they were written;
+        # `flush_notes` waits for the queue once nobody is on the line.
+        self._tms_notes = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tms-notes")
+        self._pending_notes: list = []
+        # Where the last turn's time went — the worker logs it beside the
+        # framework's own end-of-turn and voice timings. See `handle`.
+        self.last_turn_timing: dict = {}
+        self._compose_seconds = 0.0
+        self._compose_calls = 0
         repo.start_call(self.call_id)
 
     # -- speaking ----------------------------------------------------------- #
@@ -570,6 +582,7 @@ class CarrierSalesAgent:
         attempts = max(1, self._settings.llm_attempts)
         why = "no attempt was made"
         for attempt in range(1, attempts + 1):
+            started = time.monotonic()
             try:
                 spoken = self._composer.compose(
                     directive=directive,
@@ -579,6 +592,8 @@ class CarrierSalesAgent:
                     correction=correction,
                 )
             except Exception as exc:  # noqa: BLE001 - a flaky API must not drop the call
+                self._compose_seconds += time.monotonic() - started
+                self._compose_calls += 1
                 # Never silent: an unreachable model and a model that keeps
                 # inventing rates both end in a handoff, and whoever reads the log
                 # needs to know which one they're looking at.
@@ -594,6 +609,8 @@ class CarrierSalesAgent:
                         self._settings.llm_key_name)
                     break
                 continue
+            self._compose_seconds += time.monotonic() - started
+            self._compose_calls += 1
             if not spoken.strip():
                 why = "the composer returned nothing"
                 correction = "You returned nothing at all. Say your turn out loud."
@@ -644,11 +661,33 @@ class CarrierSalesAgent:
         looking when the carrier rings back. The TMS write is best-effort — the
         repository swallows and logs its own failures — so a flaky API costs us a
         note, never the call.
+
+        The TMS write happens on a background thread. It is a Transport Pro POST,
+        bounded only by TRANSPORT_PRO_TIMEOUT, and it used to run BEFORE the
+        composer was even asked for the turn — on the verification turn, the
+        caller waited for it. Nothing about the note changes; only who waits.
+        `flush_notes` collects the queue at call end.
         """
         self._repo.log_note(self.call_id, note)
         if self.load is not None and self._settings.post_load_notes:
-            self._repo.post_load_note(
-                self.load.load_id, f"[Voice AI call {self.call_id}] {note}")
+            args = (self.load.load_id, f"[Voice AI call {self.call_id}] {note}")
+            try:
+                self._pending_notes.append(
+                    self._tms_notes.submit(self._repo.post_load_note, *args))
+            except RuntimeError:
+                # The executor is closed (a note after `abandon`) — post it here.
+                self._repo.post_load_note(*args)
+
+    def flush_notes(self, timeout: float = 10.0) -> None:
+        """Wait for the TMS notes still in flight — at call end, when the wait
+        costs nobody anything. Failures were already logged by the repository."""
+        deadline = time.monotonic() + timeout
+        for future in self._pending_notes:
+            try:
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:  # noqa: BLE001 - logged where it failed; a timeout just moves on
+                pass
+        self._pending_notes.clear()
 
     def _backend_failure(self, exc: Exception) -> str:
         """The system of record didn't answer. Hand over; don't guess.
@@ -718,6 +757,9 @@ class CarrierSalesAgent:
         return spoken
 
     def handle(self, user_text: str) -> str:
+        started = time.monotonic()
+        self._compose_seconds = 0.0
+        self._compose_calls = 0
         self._log_user(user_text)
         handler = {
             CallState.IDENTIFY_LOAD: self._identify_load,
@@ -739,6 +781,16 @@ class CarrierSalesAgent:
         finally:
             # Every exit path — including a handler that just finished the call.
             self._sync_transcript()
+            # Where this turn's time went: the composer, and everything else —
+            # board and carrier lookups, the negotiation engine, bookkeeping.
+            total = time.monotonic() - started
+            self.last_turn_timing = {
+                "total": total,
+                "compose": self._compose_seconds,
+                "compose_calls": self._compose_calls,
+                "other": max(0.0, total - self._compose_seconds),
+                "state": self.state.value,
+            }
 
     # -- Step 2: identify load --------------------------------------------- #
     def _identify_load(self, text: str) -> str:
@@ -1899,6 +1951,9 @@ class CarrierSalesAgent:
         """
         if self.state != CallState.DONE:
             self._finish(CallOutcome.ABANDONED)
+        # The line is down, so the TMS notes still in flight cost nobody a wait.
+        self.flush_notes()
+        self._tms_notes.shutdown(wait=False)
 
     def summary(self) -> dict:
         return {
