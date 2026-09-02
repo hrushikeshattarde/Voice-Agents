@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -391,7 +392,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LaneVoice operations dashboard")
     parser.add_argument("--host", default="127.0.0.1",
                         help="bind address (default 127.0.0.1 — local only)")
-    parser.add_argument("--port", type=int, default=8710)
+    # 8710 is the documented default, but a supervisor that hands us a port
+    # does it through $PORT — honour that so the dashboard comes up on the
+    # port it was actually given rather than one already in use.
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("PORT") or 8710))
     args = parser.parse_args()
 
     # Before the first get_settings(): that result is cached.
