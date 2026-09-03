@@ -39,7 +39,7 @@ from typing import Any
 
 from lanevoice.db.repository import Repository
 from lanevoice.domain.errors import LoadOutOfScope, SourceUnavailable
-from lanevoice.domain.models import Carrier, Load, OfferParty, Rep
+from lanevoice.domain.models import Carrier, Load, LoadStatus, OfferParty, Rep
 from lanevoice.integrations.highway import mappers as highway_mappers
 from lanevoice.integrations.highway.client import HighwayClient, HighwayError
 from lanevoice.integrations.transportpro.client import (
@@ -298,7 +298,19 @@ class TransportProRepository:
         # Only a KNOWN foreign terminal raises. A load whose terminal cannot be
         # read stays plain not-found: "a different desk handles that one" is a
         # claim, and it must not be made about freight we cannot attribute.
-        if load is not None:
+        rehearsal = load is not None and key in self._settings.test_load_ids
+        if rehearsal:
+            # A dummy load the desk uses to walk through the whole call. Whatever
+            # Transport Pro says about its terminal, posting or status, it is
+            # this desk's, posted and open; its rates and requirements are still
+            # its own. Loud on purpose — this must never be on for a real board.
+            logger.warning(
+                "TEST LOAD %s: treating it as this desk's, posted and open "
+                "(TEST_LOAD_IDS) — rehearsal only; Transport Pro has status=%s, "
+                "posted=%s, terminal=%s.", load.load_id, load.status.value,
+                load.is_posted, load.terminal_id)
+            load = dataclasses.replace(load, status=LoadStatus.OPEN, is_posted=True)
+        if load is not None and not rehearsal:
             scope = self._scope()
             if not self._in_scope(load, scope):
                 if load.terminal_id is not None:
@@ -993,6 +1005,12 @@ class TransportProRepository:
 
     def log_note(self, call_id: str, note: str) -> None:
         self._audit.log_note(call_id, note)
+
+    def set_caller_number(self, call_id: str, number: str) -> None:
+        self._audit.set_caller_number(call_id, number)
+
+    def offers_for_call(self, call_id: str) -> list[tuple[int, str, float]]:
+        return self._audit.offers_for_call(call_id)
 
     def log_transfer(self, call_id: str, rep_id: str, result: str) -> None:
         self._audit.log_transfer(call_id, rep_id, result)

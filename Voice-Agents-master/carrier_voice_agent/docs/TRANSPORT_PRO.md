@@ -347,6 +347,33 @@ endpoint, so `add_carrier_email` returns False and the agent never claims to hav
 saved one. New addresses are captured in the call note and in the posted offer,
 which is where a rep will look.
 
+### What a rep sees on the load
+
+Reps read the load's notes, not a dashboard, so every call that reached a load
+leaves **one summary note** on it when the call ends — whatever the outcome,
+including a hang-up:
+
+```
+[Voice AI call CALL-2ce0e73f] CALL SUMMARY
+When: 2026-09-03 09:55 (1 min 5 s) — Caller: +12602649808
+Carrier: Circle Transportation Inc (MC 299953, USDOT 1234567) — authority active
+Load: 2564336
+Got as far as: the empty-truck question (where and when) — Outcome: caller hung up
+Callback: +12602649808 — Circle Transportation Inc
+Conversation:
+  Alex: Circle Logistics, this is Alex, what can I help you with?
+  Caller: I'm looking to book a lot to 564336.
+  ...
+```
+
+The caller's number comes from the SIP leg, so it is there even when no MC was
+ever given ("Carrier: not identified"). Rates said on the call, the agreed rate,
+where the booking link went and the truck's empty location are added when they
+exist. The decision notes written *during* the call (covered load, failed
+verification, handoff, booking) still post at the moment they happen; the
+summary is the whole call in one place, capped at 4,000 characters with the
+full transcript always in the local call record.
+
 ### Booking is a link, not a write
 
 There **is** a booking step beyond `make_offer`, contrary to what this document

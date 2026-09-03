@@ -449,6 +449,7 @@ def test_an_inactive_mc_is_told_it_does_not_meet_the_requirements(fake, repo):
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 555444")
+    agent.handle("yes, that's us")              # the name read back is confirmed first
 
     assert agent.summary()["outcome"] == "rejected"
     assert agent.state.value == "done"
@@ -469,6 +470,7 @@ def test_a_suspended_mc_is_treated_the_same_way(fake, repo):
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 123456")
+    agent.handle("yes, that's us")
     assert agent.summary()["outcome"] == "rejected"
     assert "does not currently meet the requirements" in \
         _turns(agent)[-1]["directive"].lower()
@@ -483,6 +485,7 @@ def test_the_live_fail_verdict_is_told_it_does_not_meet_the_requirements(fake, r
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 23152")
+    agent.handle("yes, that's us")
 
     assert agent.summary()["outcome"] == "rejected"
     directive = _turns(agent)[-1]["directive"].lower()
@@ -500,6 +503,7 @@ def test_the_live_review_verdict_goes_to_onboarding_not_to_a_refusal(fake, repo)
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 277164")
+    agent.handle("yes, that's us")
 
     assert agent.summary()["outcome"] == "transferred"
     directive = _turns(agent)[-1]["directive"].lower()
@@ -530,6 +534,7 @@ def test_an_unreadable_status_goes_to_a_person_not_to_a_refusal(fake, repo):
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 313131")
+    agent.handle("yes, that's us")
 
     assert agent.summary()["outcome"] == "transferred"
     directive = _turns(agent)[-1]["directive"].lower()
@@ -543,6 +548,7 @@ def test_no_rate_is_ever_authorised_for_a_carrier_who_does_not_clear(fake, repo)
     agent.greeting()
     agent.handle(f"load {LOAD}")
     agent.handle("MC 555444")
+    agent.handle("yes, that's us")
     assert all(turn["speakable"] == "" for turn in _turns(agent))
     assert fake.calls("make_offer") == []
 

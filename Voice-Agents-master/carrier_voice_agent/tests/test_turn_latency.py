@@ -144,7 +144,10 @@ def test_abandon_collects_the_notes_still_in_flight(repo):
     agent._note("second")
     recording.release.set()
     agent.abandon()
-    assert [content.split("] ", 1)[1] for _, content in recording.posted] == ["first", "second"]
+    posted = [content.split("] ", 1)[1] for _, content in recording.posted]
+    assert posted[:2] == ["first", "second"]
+    # The per-call summary a rep reads on the load rides last, after the flush.
+    assert len(posted) == 3 and posted[2].startswith("CALL SUMMARY")
 
 
 def test_every_turn_records_where_its_time_went(repo):

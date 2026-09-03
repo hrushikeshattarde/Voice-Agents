@@ -422,6 +422,11 @@ class Settings(BaseSettings):
     # `telephony.worker.CarrierAgent.stt_node`.
     stt_comfort_noise_dbfs: float = Field(
         default=-55.0, validation_alias="STT_COMFORT_NOISE_DBFS")
+    # Diagnostic: write the exact audio the recogniser was handed, per call, to
+    # call_recordings/<call>.stt_feed.wav — so a transcript that lost words can be
+    # checked against what the recogniser actually received, offline. Off unless
+    # a hearing problem is being chased; it is a second recording of the caller.
+    stt_feed_dump: bool = Field(default=False, validation_alias="STT_FEED_DUMP")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are
@@ -699,6 +704,13 @@ class Settings(BaseSettings):
     # hired, so it is cached for far longer than a load.
     transport_pro_terminal_cache_seconds: float = Field(
         default=3600.0, validation_alias="TRANSPORT_PRO_TERMINAL_CACHE_SECONDS")
+    # Rehearsal loads. Each id listed here is treated as THIS desk's, posted and
+    # open, whatever Transport Pro says about its terminal, posting or status —
+    # so the whole call, the notes on the load included, can be walked through
+    # on a dummy load before a real one. The rates and requirements still come
+    # from Transport Pro. Logged as a WARNING at every lookup; leave it empty on
+    # a production desk.
+    transport_pro_test_load_ids: str = Field(default="", validation_alias="TEST_LOAD_IDS")
 
     @property
     def office_terminal_ids(self) -> frozenset[str]:
@@ -707,6 +719,14 @@ class Settings(BaseSettings):
             part.strip() for part in self.transport_pro_office_terminal_ids.split(",")
             if part.strip()
         )
+
+    @property
+    def test_load_ids(self) -> frozenset[str]:
+        """Rehearsal load ids (digits only), or empty."""
+        return frozenset(
+            "".join(ch for ch in part if ch.isdigit())
+            for part in self.transport_pro_test_load_ids.split(",")
+            if part.strip())
 
     @property
     def extra_terminal_ids(self) -> frozenset[str]:

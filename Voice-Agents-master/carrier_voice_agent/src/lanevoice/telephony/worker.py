@@ -231,6 +231,25 @@ def _stt_extra_kwargs(model: str) -> dict[str, Any]:
     return {}
 
 
+def _write_stt_feed_dump(call_id: str, pcm: bytes, sample_rate: int) -> None:
+    """The recogniser's exact input for one call, as a WAV beside the recording
+    (STT_FEED_DUMP). Best effort; a failure to write is logged, never raised."""
+    import wave
+    try:
+        dest_dir = Path(_settings.db_path).resolve().parent / "call_recordings"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path = dest_dir / f"{call_id}.stt_feed.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(pcm)
+        logger.info("STT feed dump written: %s (%.1fs)", path,
+                    len(pcm) / 2 / sample_rate)
+    except OSError as exc:
+        logger.warning("could not write the STT feed dump for %s: %s", call_id, exc)
+
+
 def with_comfort_noise(frame: rtc.AudioFrame, rng: np.random.Generator,
                        dbfs: float) -> rtc.AudioFrame:
     """The frame with white noise at `dbfs` (RMS) mixed in — see
@@ -730,27 +749,47 @@ class CarrierAgent(Agent):
             frames = zeros = 0
             peak = 0
             seconds = 0.0
-            async for frame in audio:
-                try:
-                    now_speaking = self.session.user_state == "speaking"
-                except RuntimeError:          # no session yet
-                    now_speaking = False
-                if now_speaking:
-                    if not speaking:
-                        speaking, frames, zeros, peak, seconds = True, 0, 0, 0, 0.0
+            # The second BEFORE the VAD flipped: the first syllable of an answer
+            # lands here (the VAD needs ~0.2s to decide), so a clipped leading
+            # word is judged by this window, not by the speaking stretch.
+            recent: list[tuple[float, int]] = []      # (duration, peak) per frame
+            dump = bytearray() if _settings.stt_feed_dump else None
+            dump_rate = 0
+            try:
+                async for frame in audio:
+                    try:
+                        now_speaking = self.session.user_state == "speaking"
+                    except RuntimeError:          # no session yet
+                        now_speaking = False
                     samples = np.frombuffer(frame.data, dtype=np.int16)
                     top = int(np.abs(samples).max()) if samples.size else 0
-                    frames += 1
-                    seconds += frame.duration
-                    zeros += top == 0
-                    peak = max(peak, top)
-                elif speaking:
-                    speaking = False
-                    logger.info("STT feed during caller speech → %.1fs of audio, peak %s, "
-                                "%d of %d frames digital zero", seconds,
-                                f"{20 * np.log10(peak / 32767):.0f} dBFS" if peak else "silence",
-                                zeros, frames)
-                yield with_comfort_noise(frame, rng, dbfs) if dbfs < 0 else frame
+                    if now_speaking:
+                        if not speaking:
+                            speaking, frames, zeros, peak, seconds = True, 0, 0, 0, 0.0
+                            before = max((p for _d, p in recent), default=0)
+                            logger.info("STT feed in the second before the VAD flipped → peak %s",
+                                        f"{20 * np.log10(before / 32767):.0f} dBFS" if before
+                                        else "digital silence")
+                        frames += 1
+                        seconds += frame.duration
+                        zeros += top == 0
+                        peak = max(peak, top)
+                    elif speaking:
+                        speaking = False
+                        level = f"{20 * np.log10(peak / 32767):.0f} dBFS" if peak else "silence"
+                        logger.info("STT feed during caller speech → %.1fs of audio, peak %s, "
+                                    "%d of %d frames digital zero", seconds, level, zeros, frames)
+                    recent.append((frame.duration, top))
+                    while recent and sum(d for d, _p in recent) > 1.0 + frame.duration:
+                        recent.pop(0)
+                    out = with_comfort_noise(frame, rng, dbfs) if dbfs < 0 else frame
+                    if dump is not None:
+                        dump += bytes(out.data)
+                        dump_rate = out.sample_rate
+                    yield out
+            finally:
+                if dump and dump_rate:
+                    _write_stt_feed_dump(self.brain.call_id, bytes(dump), dump_rate)
 
         async for event in Agent.default.stt_node(self, probed(), model_settings):
             yield event
@@ -858,6 +897,13 @@ class CarrierAgent(Agent):
             pass                          # session closing; the reply say() will report
 
     async def on_enter(self):
+        # Who is calling, from the SIP leg (`sip_+12602649808`): recorded on the
+        # call and repeated in the summary note the rep reads on the load.
+        identity = sip_participant_identity(self._ctx.room) if self._ctx is not None else None
+        if identity:
+            number = identity.removeprefix("sip_")
+            logger.info("CALLER number → %s", number)
+            await asyncio.to_thread(self.brain.set_caller, number)
         if self._greeting is not None:
             # Composed and rendered at process start: the caller hears a voice the
             # moment the line connects. `greet_with` only records the line, but

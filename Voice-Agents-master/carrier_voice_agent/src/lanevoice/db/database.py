@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS calls (
     start_time  TEXT,
     end_time    TEXT,
     outcome     TEXT,
-    transcript  TEXT
+    transcript  TEXT,
+    caller_number TEXT
 );
 
 CREATE TABLE IF NOT EXISTS negotiation_offers (
@@ -224,6 +225,13 @@ class Database:
         for name in ("delivery_json", "emailed_to", "emailed_at", "email_error"):
             if report_columns and name not in report_columns:
                 conn.execute(f"ALTER TABLE practice_reports ADD COLUMN {name} TEXT")
+
+        # `calls.caller_number` arrived with the per-call summary note: the number
+        # the phone leg reported, so a rep reading the load knows who to ring back.
+        call_columns = {r["name"] for r in
+                        conn.execute("PRAGMA table_info(calls)").fetchall()}
+        if call_columns and "caller_number" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN caller_number TEXT")
 
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}

@@ -120,6 +120,7 @@ def test_suspended_authority_never_reaches_a_rate(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC999888")                       # Ghost Carrier — suspended
+    a.handle("yes, that's us")                 # the name read back is confirmed first
     assert a.summary()["outcome"] == "rejected"
     assert a.state.value == "done"
     assert _agent_offers(repo) == set()        # no number was ever authorised
@@ -132,6 +133,7 @@ def test_inactive_authority_never_reaches_a_rate(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC 555444")                      # Dormant Transport — inactive
+    a.handle("yes, that's us")
     assert a.summary()["outcome"] == "rejected"
     assert _agent_offers(repo) == set()
 
@@ -143,6 +145,7 @@ def test_a_blocked_carrier_is_told_nothing_about_why(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC999888")
+    a.handle("yes, that's us")
     last = a._composer.turns[-1]
     assert "do not say which check failed" in last["directive"].lower()
     assert "Chicago" not in last["facts"]      # the lane never got near the model
@@ -154,6 +157,7 @@ def test_not_approved_carrier_declined(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC 222333")                      # active + insured, but not approved
+    a.handle("yes, that's us")
     assert a.summary()["outcome"] == "rejected"
 
 
@@ -162,6 +166,7 @@ def test_risk_flagged_carrier_goes_to_a_human(repo):
     a.greeting()
     a.handle("L1001")
     a.handle("MC 777111")                      # recently reactivated
+    a.handle("yes, that's us")
     assert a.summary()["outcome"] == "transferred"
 
 

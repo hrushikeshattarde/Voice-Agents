@@ -447,6 +447,32 @@ class CallState(str, enum.Enum):
     DONE = "done"
 
 
+# How far a call got, in the words a rep uses — the summary note names the stage
+# the call was in when it ended, not the state machine's label for it.
+_STAGE_NAMES = {
+    CallState.GREETING: "the greeting",
+    CallState.IDENTIFY_LOAD: "asking which load they were calling about",
+    CallState.VERIFY_CARRIER: "the MC/USDOT check",
+    CallState.ASK_EMPTY: "the empty-truck question (where and when)",
+    CallState.CHECK_REQUIREMENTS: "the load requirements",
+    CallState.STATE_PRICE: "the rate",
+    CallState.NEGOTIATE: "the rate negotiation",
+    CallState.CONFIRM_BOOKING: "confirming the pickup",
+    CallState.CONFIRM_EMAIL: "the booking email",
+    CallState.DONE: "the close",
+}
+_OUTCOME_NAMES = {
+    CallOutcome.BOOKED: "booking link sent",
+    CallOutcome.TRANSFERRED: "handed to a rep",
+    CallOutcome.REJECTED: "declined",
+    CallOutcome.NO_DEAL: "no deal",
+    CallOutcome.ABANDONED: "caller hung up",
+}
+# Transport Pro takes the note as one form field; keep it readable in the load's
+# note panel rather than exhaustive — the full transcript is in the call record.
+_SUMMARY_MAX_CHARS = 4000
+
+
 class CarrierSalesAgent:
     def __init__(
         self,
@@ -474,6 +500,16 @@ class CarrierSalesAgent:
         # read down a phone — but it belongs in the call record so a rep can see
         # what the carrier was actually sent.
         self._booking_link: str | None = None
+        # For the call summary a rep reads on the load — see `_call_summary`.
+        self.caller_number: str | None = None    # the phone leg's number, from the worker
+        self._started_at = time.time()
+        self._final_state: CallState | None = None   # where the call was when it ended
+        self._summary_posted = False
+        # The load the caller ASKED about, whether or not the agent could sell it:
+        # another office's, unposted or covered, it exists, and its rep still
+        # wants to know who called. The summary is posted there when `self.load`
+        # was never set.
+        self._asked_load_id: str | None = None
         self._email_asks = 0                     # re-asks when we didn't catch one
         self._mc_asks = 0                        # re-asks for an unheard MC/USDOT
         self._load_asks = 0                      # load numbers that didn't work out
@@ -481,6 +517,8 @@ class CarrierSalesAgent:
         self._requirement_asks = 0               # asks with no yes and no no
         self._mc_digits = ""                     # digits heard so far, across turns
         self._mc_narrowed = None                 # partial that matched one carrier
+        self._identity_confirmed_for: str | None = None  # number whose company they affirmed
+        self._identity_denied = False             # the name read back was NOT them
         # Set when a handoff resolved to a rep WITH a number: the worker dials it
         # (a SIP transfer) once the handoff line has been spoken. None means the
         # caller was promised a callback instead — see `_transfer_and_say`.
@@ -691,8 +729,9 @@ class CarrierSalesAgent:
         `flush_notes` collects the queue at call end.
         """
         self._repo.log_note(self.call_id, note)
-        if self.load is not None and self._settings.post_load_notes:
-            args = (self.load.load_id, f"[Voice AI call {self.call_id}] {note}")
+        target = self.load.load_id if self.load is not None else self._asked_load_id
+        if target and self._settings.post_load_notes:
+            args = (target, f"[Voice AI call {self.call_id}] {note}")
             try:
                 self._pending_notes.append(
                     self._tms_notes.submit(self._repo.post_load_note, *args))
@@ -850,6 +889,8 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
         result = self._loads.lookup(load_id)
+        if result.found or result.out_of_scope:
+            self._asked_load_id = load_id
 
         # The agent NEVER reads out a list of other loads. A carrier ringing about
         # one specific posting is not shopping a list, and five load numbers spoken
@@ -1018,12 +1059,15 @@ class CarrierSalesAgent:
                 carrier = self._mc_narrowed
                 number = re.sub(r"\D", "", carrier.mc_number or carrier.usdot_number)
                 self._mc_digits = number
+                self._identity_confirmed_for = number
                 return number
             if _DENIES_RE.search(text.lower()):
                 # Wrong carrier, so the digits behind the guess were wrong too.
                 # Keeping them would only narrow to the same wrong answer again.
                 self._mc_digits = ""
                 self._mc_narrowed = None
+                self.carrier = None
+                self._identity_denied = True
                 return None
 
         readings = parsing.digit_readings(self._mc_digits, heard)
@@ -1050,6 +1094,24 @@ class CarrierSalesAgent:
         """Ask for what's still missing — never for the whole thing again."""
         self._mc_asks += 1
         held = self._mc_digits
+
+        # They just told us the company we read back is NOT them: the number was
+        # misheard, and everything built on it is gone. Ask for it fresh — and
+        # say why, since "what's your MC?" a second time with no reason sounds
+        # like the agent wasn't listening.
+        if self._identity_denied:
+            self._identity_denied = False
+            if self._mc_asks >= _MAX_MC_ASKS:
+                self._note("Caller denied the company read back to them and the number "
+                           "could not be re-captured — handed to a rep.")
+                return self._transfer_and_say(reason="mc_not_captured")
+            return self._say(
+                "The company you read back was NOT them, so their number was misheard. "
+                "Apologise in a few words and ask for their MC or USDOT number once "
+                "more. Do NOT mention any status, requirement or check, and do not "
+                "read any digits back.",
+                amounts=set(),
+            )
 
         # Down to one carrier on a partial number: confirm by company name, which
         # is faster and far more reliable than collecting the last two digits.
@@ -1117,6 +1179,29 @@ class CarrierSalesAgent:
         result = self._verifier.verify(number, self.load)
         self.carrier = result.carrier
         who = result.carrier.legal_name if result.carrier else "not found"
+
+        # Every digit of that number came down a phone line. A verdict of PROCEED
+        # is checked in passing ("this is Blue Sky, correct?") on the way to the
+        # next question; every OTHER verdict is said TO the caller as a fact about
+        # their company, or sends an invite to that company's address on file, or
+        # hands them to a rep as that company — and it must not rest on digits
+        # nobody confirmed. Observed live, twice: 299953 came through as "99953";
+        # that is a DIFFERENT carrier, one Highway fails, and the caller was told
+        # their company didn't meet the requirements. So the name is read back
+        # first, and the verdict waits for them to say it's them. A denial clears
+        # the digits and asks again.
+        if (result.carrier is not None
+                and result.action != VerificationAction.PROCEED
+                and self._identity_confirmed_for != number):
+            self._mc_narrowed = result.carrier
+            return self._say(
+                "Before you go any further, make sure you have the right company: read "
+                "the company name back and ask if that's them — one short question. Say "
+                "NOTHING about their status, requirements, or why you're checking, and "
+                "do not read any digits back.",
+                facts=f"Company on file for the number you heard: {who}",
+                amounts=set(),
+            )
 
         # A carrier who passed vetting but has never connected with us. The invite
         # goes to the address on their FILE, not to anything said on this call, and
@@ -1998,6 +2083,8 @@ class CarrierSalesAgent:
 
     # -- persistence -------------------------------------------------------- #
     def _finish(self, outcome: CallOutcome, rep_id: str | None = None) -> None:
+        if self.state is not CallState.DONE:
+            self._final_state = self.state       # how far the call got, for the summary
         self.state = CallState.DONE
         self.outcome = outcome
         self._repo.end_call(
@@ -2036,6 +2123,91 @@ class CarrierSalesAgent:
             f'Caller spoke over this line — its audio was cut off mid-play, so '
             f'they may not have heard it: "{spoken_line}"')
 
+    def set_caller(self, number: str | None) -> None:
+        """The number this call came from, as the phone leg reports it. Recorded
+        on the call and repeated in the summary note, because "who called about
+        my load" is the first thing a rep wants and the transcript never says it."""
+        if not number:
+            return
+        self.caller_number = number
+        self._repo.set_caller_number(self.call_id, number)
+
+    def _call_summary(self) -> str:
+        """One note a rep can read instead of a dashboard: who called, how far it
+        got, what money was said, and every word of the conversation.
+
+        The decision notes written during the call are still there for the
+        moments that needed a reason; this is the whole call in one place, and it
+        is written for EVERY call that reached a load — the carrier who verified
+        and hung up at the empty-truck question left nothing on the load before
+        this existed, and that caller is exactly the one the rep wants to ring.
+        """
+        seconds = max(0, int(time.time() - self._started_at))
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._started_at))
+        who = self.caller_number or "number not available"
+        lines = [
+            f"[Voice AI call {self.call_id}] CALL SUMMARY",
+            f"When: {when} ({seconds // 60} min {seconds % 60} s) — Caller: {who}",
+        ]
+        if self.carrier is not None:
+            c = self.carrier
+            mc = (c.mc_number or "").upper().removeprefix("MC").strip() or "n/a"
+            lines.append(f"Carrier: {c.legal_name} (MC {mc}, USDOT "
+                         f"{c.usdot_number}) — authority {c.authority_status.value}")
+        else:
+            lines.append("Carrier: not identified — no MC/USDOT was verified on this call")
+        if self.load is not None:
+            lines.append(f"Load: {self.load.load_id}")
+        elif self._asked_load_id:
+            lines.append(f"Load asked about: {self._asked_load_id} (not sold on this call — "
+                         "see the note above for why)")
+        stage = _STAGE_NAMES.get(self._final_state or self.state, "the start of the call")
+        outcome = _OUTCOME_NAMES.get(self.outcome, "still open") if self.outcome else "still open"
+        lines.append(f"Got as far as: {stage} — Outcome: {outcome}")
+        empty = self._empty_summary()
+        if empty:
+            lines.append(f"Truck: {empty}")
+        offers = self._repo.offers_for_call(self.call_id)
+        if offers:
+            trail = " -> ".join(f"{'Alex' if party == 'agent' else 'carrier'} ${int(amount)}"
+                                for _round, party, amount in offers)
+            if self._agreed_rate is not None:
+                trail += f" -> agreed ${int(self._agreed_rate)}"
+            lines.append(f"Rates: {trail}")
+        if self._booking_email:
+            lines.append("Booking: " + (
+                f"link sent to {self._booking_email} — not the carrier's until they sign it"
+                if self._booking_link else
+                f"confirmation to {self._booking_email}"))
+        lines.append(f"Callback: {who}" + (f" — {self.carrier.legal_name}" if self.carrier else ""))
+        lines.append("Conversation:")
+        body = "\n".join(lines)
+        budget = _SUMMARY_MAX_CHARS - len(body) - 80
+        shown = 0
+        for speaker, text in self.transcript:
+            line = f"  {'Alex' if speaker == 'agent' else 'Caller'}: {text.strip()[:300]}"
+            if len(line) + 1 > budget:
+                break
+            body += "\n" + line
+            budget -= len(line) + 1
+            shown += 1
+        if shown < len(self.transcript):
+            body += f"\n  (... {len(self.transcript) - shown} more turns in the call record)"
+        return body
+
+    def _post_call_summary(self) -> None:
+        """Once per call, at the very end: onto the call record, and onto the load
+        in Transport Pro when there is one. Synchronous — the line is down and
+        nobody is waiting."""
+        if self._summary_posted:
+            return
+        self._summary_posted = True
+        summary = self._call_summary()
+        self._repo.log_note(self.call_id, summary)
+        target = self.load.load_id if self.load is not None else self._asked_load_id
+        if target and self._settings.post_load_notes:
+            self._repo.post_load_note(target, summary)
+
     def abandon(self) -> None:
         """The line dropped before the call concluded — finalize the record.
 
@@ -2047,6 +2219,7 @@ class CarrierSalesAgent:
         """
         if self.state != CallState.DONE:
             self._finish(CallOutcome.ABANDONED)
+        self._post_call_summary()
         # The line is down, so the TMS notes still in flight cost nobody a wait.
         self.flush_notes()
         self._tms_notes.shutdown(wait=False)

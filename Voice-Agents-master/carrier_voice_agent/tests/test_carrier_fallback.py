@@ -170,6 +170,7 @@ def test_the_whole_call_ends_in_a_rejection(fake, repo):
     agent.greeting()
     agent.handle(f"calling about load {LOAD}")
     agent.handle(f"my MC is {MC}")
+    agent.handle("yes, that's us")              # the name read back is confirmed first
 
     assert agent.summary()["outcome"] == "rejected"
     directive = agent._composer.turns[-1]["directive"].lower()
@@ -189,6 +190,7 @@ def test_the_rejection_is_recorded_with_the_real_reason(fake, repo):
     agent.greeting()
     agent.handle(f"calling about load {LOAD}")
     agent.handle(f"my MC is {MC}")
+    agent.handle("yes, that's us")
 
     conn = repo._db.connect()
     try:

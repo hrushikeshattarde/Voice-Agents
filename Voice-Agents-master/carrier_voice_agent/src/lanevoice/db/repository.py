@@ -267,6 +267,22 @@ class Repository:
             (load_id, carrier_dot, _now(), outcome, payload, call_id),
         )
 
+    def set_caller_number(self, call_id: str, number: str) -> None:
+        """The number the phone leg reported for this call (E.164)."""
+        self._execute("UPDATE calls SET caller_number=? WHERE call_id=?", (number, call_id))
+
+    def offers_for_call(self, call_id: str) -> list[tuple[int, str, float]]:
+        """(round, party, amount) for every offer logged on the call, in order."""
+        conn = self._db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT round_number, offered_by, amount FROM negotiation_offers "
+                "WHERE call_id=? ORDER BY id", (call_id,)).fetchall()
+            return [(int(r["round_number"]), str(r["offered_by"]), float(r["amount"]))
+                    for r in rows]
+        finally:
+            conn.close()
+
     # -- write-backs to a system of record --------------------------------- #
     # These exist because the conversation layer calls them at the right moments
     # regardless of where its data came from; the alternative is the agent asking
