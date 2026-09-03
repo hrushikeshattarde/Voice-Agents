@@ -3,7 +3,23 @@
 How the agent stops *saying* "I'm putting you through to Sarah" and actually puts
 them through, to the person whose freight this is, on 8x8.
 
-Plan only. Nothing here is implemented yet.
+**Status (2026-09-02): Phase 1, Option A is implemented.** A handoff now resolves
+the load's `CARRIERSALESREP` from Transport Pro's `internalContacts` (order taker
+as fallback), reads that user's name and number from `GET /user/{id}` — `CELL`
+first, then the `OFFICE` line; an extension is dropped and logged — lets the
+desk override either with a `reps.toml` entry keyed on the Transport Pro user id
+(a direct 8x8 DID belongs there), speaks "putting you through to <name>", and
+then sends the SIP REFER via `transfer_sip_participant`. The audit log records
+`requested` at the decision and `connected` or `failed: <reason>` after the
+REFER; a failure is spoken to the caller ("a rep will call you straight back").
+A rep with no diallable number is named but promised as a callback, never as a
+transfer. The REFER itself is behind `SIP_TRANSFER_ENABLED` (off by default):
+until it is on, the handoff is announced and logged as `not performed`.
+**Prerequisite for turning it on:** call transfer and PSTN transfer enabled on
+the Twilio trunk (§2A). Not yet done: the queue fallback (Option C) and the warm
+shape (B′).
+
+The original plan follows.
 
 ---
 

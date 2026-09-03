@@ -202,8 +202,8 @@ def test_a_plain_yes_still_books(repo):
 
 
 def test_asking_for_a_human_still_transfers(repo):
-    """One of the phrases `_HUMAN_WORDS` matches — it is a fixed list, not intent
-    detection, so the test uses a phrase that is actually on it."""
+    """One of the phrases the person-request matcher knows — it is a fixed
+    pattern, not intent detection, so the test uses a phrase that is on it."""
     agent = _to_rate(repo)
     agent.handle("can I speak to someone about this")
     assert agent.outcome is not None
@@ -211,11 +211,12 @@ def test_asking_for_a_human_still_transfers(repo):
 
 
 def test_an_unrecognised_request_for_a_human_falls_into_the_question_branch(repo):
-    """"Can I talk to a person" is NOT on that list, so it lands here instead —
-    answered, with the standing offer speakable, rather than transferred. Worth
-    pinning: it is the branch's job to handle everything the fixed lists miss."""
+    """"Can I get somebody on the line" is NOT a phrase the person-request matcher
+    knows, so it lands here instead — answered, with the standing offer speakable,
+    rather than transferred. Worth pinning: it is the branch's job to handle
+    everything the fixed patterns miss."""
     agent = _to_rate(repo, _EchoesTheRate())
-    agent.handle("can I talk to a person")
+    agent.handle("can I get somebody on the line")
     assert agent.outcome is None
     assert agent._composer.turns[-1]["speakable"] == f"${int(agent.neg.current_offer)}"
 

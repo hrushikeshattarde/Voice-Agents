@@ -412,6 +412,16 @@ class Settings(BaseSettings):
     # disables.
     unheard_reask_delay: float = Field(
         default=4.5, validation_alias="UNHEARD_REASK_DELAY")
+    # White noise (dBFS, RMS) mixed into the audio the RECOGNISER gets — nothing
+    # else hears it. After noise cancellation the line between the caller's
+    # utterances is digital zero, and AssemblyAI's streaming speech detector goes
+    # idle on that: after 15-20s of it the first ~0.3-0.5s of the next utterance
+    # is lost ("Transfer it" -> "Sfer it"; a short "It's 299953" -> nothing, and
+    # the agent sat silent). Reproduced offline from the recordings; -55 dBFS in
+    # the gap cured it, and that is 35 dB under quiet speech. 0 disables. See
+    # `telephony.worker.CarrierAgent.stt_node`.
+    stt_comfort_noise_dbfs: float = Field(
+        default=-55.0, validation_alias="STT_COMFORT_NOISE_DBFS")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are
@@ -783,6 +793,22 @@ class Settings(BaseSettings):
     # Still used when DATA_SOURCE=transportpro: Transport Pro has no endpoint for
     # a call audit trail, so calls, offers, notes and handoffs are recorded here.
     db_path: str = Field(default="carrier_agent.db", validation_alias="DB_PATH")
+    # Who a call gets handed to, as a TOML file the desk edits — see
+    # reps.toml.example and `lanevoice.reps`. A relative path is taken next to the
+    # database. When the file exists it replaces the `reps` table at every worker
+    # and dashboard start; when it does not, the table is left as it is — EMPTY
+    # on a live deployment, where the agent then names the load's Transport Pro
+    # rep or logs a callback. The invented sample reps are never written to a
+    # live database.
+    reps_file: str = Field(default="reps.toml", validation_alias="REPS_FILE")
+    # Whether the worker actually moves the call when the agent hands off. The
+    # agent resolves the load's rep and announces the handoff either way; with
+    # this OFF (the default) the call is left where it is and the audit log says
+    # the transfer was requested, nothing more — the state a desk is in until the
+    # trunk allows SIP REFER (docs/LIVE_SETUP.md B5). Turn it on and the worker
+    # sends the REFER to the rep's number after the handoff line is spoken.
+    sip_transfer_enabled: bool = Field(
+        default=False, validation_alias="SIP_TRANSFER_ENABLED")
 
     # --- Observability ------------------------------------------------------ #
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")

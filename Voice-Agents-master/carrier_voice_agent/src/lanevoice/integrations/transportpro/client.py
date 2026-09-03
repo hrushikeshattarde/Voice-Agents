@@ -389,6 +389,15 @@ class TransportProClient:
         """
         return _first_record(self._request("GET", f"/load/{load_id}"))
 
+    def user(self, user_id: str) -> dict | None:
+        """`GET /user/{id}` — the Transport Pro user behind an id a load carries.
+
+        A load names its people under `internalContacts` by user id only; this is
+        where the id becomes a rep with a name and a phone number, which is what a
+        transfer needs. Returns None for an id that does not exist.
+        """
+        return _first_record(self._request("GET", f"/user/{user_id}"))
+
     def iter_search_loads(
         self,
         *,

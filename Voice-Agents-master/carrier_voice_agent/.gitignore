@@ -4,6 +4,9 @@ __pycache__/
 *.py[cod]
 carrier_agent.db
 carrier_agent.db-journal
+# Real reps' names and phone numbers — local deployment data, not repository
+# content. `reps.toml.example` is the template.
+reps.toml
 
 # Audio written by tools/audition_voices.py when comparing TTS voices.
 voice-samples/

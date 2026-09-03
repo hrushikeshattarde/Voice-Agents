@@ -171,7 +171,9 @@ print('--- notes ---'); [print(r['note']) for r in c.execute('SELECT note FROM c
 Or open `carrier_agent.db` in any SQLite browser. Tables: `calls`,
 `negotiation_offers`, `transfer_events`, `call_notes`, `loads`, `carriers`, `reps`.
 
-Reset the seed data (fresh loads/carriers):
+Reset the seed data (fresh loads/carriers — offline playground only; a
+Transport Pro deployment carries no sample rows and `lanevoice-initdb` needs
+`--seed` to write them):
 ```bash
 uv run python -c "from lanevoice.db import Database; from lanevoice.settings import get_settings; Database(get_settings().db_path).reset(seed=True); print('reset')"
 ```

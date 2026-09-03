@@ -30,6 +30,8 @@ from collections.abc import AsyncIterable, Coroutine
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from livekit import api as lk_api
 from livekit import rtc
 from livekit.agents import (
     Agent,
@@ -229,6 +231,20 @@ def _stt_extra_kwargs(model: str) -> dict[str, Any]:
     return {}
 
 
+def with_comfort_noise(frame: rtc.AudioFrame, rng: np.random.Generator,
+                       dbfs: float) -> rtc.AudioFrame:
+    """The frame with white noise at `dbfs` (RMS) mixed in — see
+    `CarrierAgent.stt_node` for why. `dbfs >= 0` returns the frame untouched."""
+    if dbfs >= 0:
+        return frame
+    samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.int32)
+    noise = rng.normal(0.0, 32767 * 10 ** (dbfs / 20), size=samples.shape)
+    mixed = np.clip(samples + np.rint(noise).astype(np.int32), -32768, 32767).astype(np.int16)
+    return rtc.AudioFrame(data=mixed.tobytes(), sample_rate=frame.sample_rate,
+                          num_channels=frame.num_channels,
+                          samples_per_channel=frame.samples_per_channel)
+
+
 def build_stt(settings: Settings):
     """The recogniser for the phone line, per STT_PROVIDER."""
     if settings.stt_on_inference:
@@ -304,6 +320,47 @@ REASK_LINE = "Sorry, I didn't catch that — say that one more time for me?"
 # returns nothing three times in a row is not going to start; the rep handoff
 # paths in the conversation layer are the right end for that call.
 _MAX_REASKS = 3
+
+# Spoken when the agent said "transferring you to X" and the SIP transfer then
+# failed — the rep's line busy, the trunk refusing the transfer. The caller is
+# still on the line with us at that point, and silence would be the worst answer.
+TRANSFER_FAILED_LINE = ("Looks like I can't get them on the line right now. A rep will "
+                        "call you straight back on this one.")
+# How long to let the rep's phone ring before the transfer counts as failed.
+_TRANSFER_TIMEOUT = 60.0
+
+
+# --------------------------------------------------------------------------- #
+# Handing the call to a person: a cold SIP transfer (REFER) up the trunk
+# --------------------------------------------------------------------------- #
+def sip_participant_identity(room) -> str | None:
+    """The caller's SIP participant in the room, or None on a non-phone session.
+
+    LiveKit's SIP bridge joins the caller as a participant of kind SIP with an
+    identity like `sip_+19303334183`; that identity is what the transfer request
+    names. Falls back to the identity prefix in case `kind` is not populated.
+    """
+    participants = list(getattr(room, "remote_participants", {}).values())
+    for participant in participants:
+        if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+            return participant.identity
+    for participant in participants:
+        if str(getattr(participant, "identity", "")).startswith("sip_"):
+            return participant.identity
+    return None
+
+
+def transfer_request(room_name: str, participant_identity: str,
+                     phone: str) -> lk_api.TransferSIPParticipantRequest:
+    """The REFER: LiveKit asks the trunk to re-invite the caller to `phone` and
+    drops out of the call. `play_dialtone` gives the caller ringing instead of
+    silence while the rep's phone is dialled."""
+    return lk_api.TransferSIPParticipantRequest(
+        room_name=room_name,
+        participant_identity=participant_identity,
+        transfer_to=f"tel:{phone}",
+        play_dialtone=True,
+    )
 
 # (text, 16-bit mono PCM, sample rate). The rate travels with the clip: it is
 # whatever the voice answered with, not a setting.
@@ -539,9 +596,11 @@ class CarrierAgent(Agent):
     def __init__(self, repo: Repository, composer, tts: lk_tts.TTS,
                  fillers: list[Clip] | None = None,
                  greeting: Clip | None = None,
-                 reask: Clip | None = None):
+                 reask: Clip | None = None,
+                 ctx: JobContext | None = None):
         super().__init__(instructions="Carrier sales agent (logic in conversation layer).")
         self.brain = CarrierSalesAgent(repo, composer, _settings)
+        self._ctx = ctx                    # the room and the LiveKit API, for transfers
         self._tts = tts
         self._fillers = list(fillers or [])
         self._greeting = greeting
@@ -638,6 +697,36 @@ class CarrierAgent(Agent):
         self._last_filler = random.choice(choices or [0])
         return self._fillers[self._last_filler]
 
+    async def stt_node(self, audio: AsyncIterable[rtc.AudioFrame],
+                       model_settings: ModelSettings):
+        """Keep the recogniser awake through the caller's silences.
+
+        Between the caller's utterances the phone audio, after noise cancellation,
+        is digital zero — and AssemblyAI's streaming speech detector goes idle on
+        it. After 15-20s of that it needs the first ~0.3-0.5s of the next
+        utterance to wake up, and that audio is lost: "Transfer it to the person"
+        reached the agent as "Sfer it to the person", an MC said as "299953" came
+        back as "93", and a one-second answer produced nothing at all — six times
+        on one call, each met with silence until the caller said "Hello". Reproduced
+        offline from the recordings: the same utterance after 20s of digital
+        silence is clipped, after 3s it is whole, and after 20s of white noise at
+        -55 dBFS it is whole. (Deepgram clipped the same clip harder.) So a whisper
+        of noise, 35 dB under quiet speech, rides every frame into the recogniser
+        and nowhere else: the VAD, the recorder and the caller never hear it.
+        STT_COMFORT_NOISE_DBFS=0 turns it off.
+        """
+        dbfs = _settings.stt_comfort_noise_dbfs
+        if dbfs >= 0:
+            source = audio
+        else:
+            async def dithered():
+                rng = np.random.default_rng()
+                async for frame in audio:
+                    yield with_comfort_noise(frame, rng, dbfs)
+            source = dithered()
+        async for event in Agent.default.stt_node(self, source, model_settings):
+            yield event
+
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):
         """Every composed line passes through here on its way to the voice.
 
@@ -669,6 +758,54 @@ class CarrierAgent(Agent):
 
         async for frame in Agent.default.tts_node(self, spoken(), model_settings):
             yield frame
+
+    # -- handing the call to a person ---------------------------------------- #
+    async def _transfer_if_pending(self) -> None:
+        """Dial the rep the brain resolved, once the handoff line has been spoken.
+
+        The brain sets `pending_transfer` only for a rep with a number — the load's
+        carrier sales rep from Transport Pro, or the desk's own directory entry
+        for them. The transfer is a SIP REFER: the trunk re-invites the caller to
+        the rep's number and this session ends when they leave the room. What
+        happened is written back to the call record either way, and a failure is
+        SAID to the caller, who is otherwise sitting in silence after being told
+        they were being put through.
+        """
+        rep = self.brain.pending_transfer
+        if rep is None:
+            return
+        self.brain.pending_transfer = None
+        if not _settings.sip_transfer_enabled:
+            # Announced, resolved, not dialled: the trunk isn't set up for it yet.
+            logger.info("TRANSFER not performed (SIP_TRANSFER_ENABLED is off): would "
+                        "dial %s at %s", rep.name, rep.phone)
+            await asyncio.to_thread(self.brain.note_transfer_skipped, rep)
+            return
+        room = self._ctx.room if self._ctx is not None else None
+        identity = sip_participant_identity(room) if room is not None else None
+        if identity is None:
+            await self._transfer_failed(rep, "no SIP participant in the room — not a "
+                                             "phone call, or the caller already left")
+            return
+        logger.info("TRANSFER → %s at %s (SIP REFER for %s)", rep.name, rep.phone, identity)
+        try:
+            await asyncio.wait_for(
+                self._ctx.api.sip.transfer_sip_participant(
+                    transfer_request(room.name, identity, rep.phone)),
+                timeout=_TRANSFER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - a failed transfer is told to the caller, never raised
+            await self._transfer_failed(rep, f"{type(exc).__name__}: {exc}")
+            return
+        logger.info("TRANSFER connected → %s", rep.name)
+        await asyncio.to_thread(self.brain.note_transfer_result, rep, True)
+
+    async def _transfer_failed(self, rep, detail: str) -> None:
+        logger.error("TRANSFER failed → %s at %s: %s", rep.name, rep.phone, detail)
+        await asyncio.to_thread(self.brain.note_transfer_result, rep, False, detail)
+        try:
+            await self.session.say(TRANSFER_FAILED_LINE, add_to_chat_ctx=False)
+        except RuntimeError:
+            pass                           # session closing; the caller is gone
 
     async def _acknowledge_if_slow(self, reply_task: asyncio.Task) -> None:
         """Fill the composing gap with a spoken acknowledgment, never silence.
@@ -756,6 +893,8 @@ class CarrierAgent(Agent):
                 if getattr(speech, "interrupted", False):
                     logger.info("PLAYBACK CUT by caller → %s", reply)
                     await asyncio.to_thread(self.brain.note_playback_cut, reply)
+                # "Transferring you to X" has been said; now put them through.
+                await self._transfer_if_pending()
             except RuntimeError as e:  # e.g. caller hung up mid-turn
                 logger.info("Could not speak (session closing): %s", e)
         finally:
@@ -854,7 +993,7 @@ async def entrypoint(ctx: JobContext):
     session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
                          fillers=ud.get("fillers"), greeting=ud.get("greeting"),
-                         reask=ud.get("reask"))
+                         reask=ud.get("reask"), ctx=ctx)
     session.on("user_input_transcribed", agent.on_user_input_transcribed)
     session.on("user_state_changed", agent.on_user_state_changed)
 

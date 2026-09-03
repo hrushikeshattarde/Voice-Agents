@@ -59,7 +59,7 @@ from urllib.parse import parse_qs, urlparse
 
 from lanevoice.dashboard.queries import DashboardQueries
 from lanevoice.dashboard.sessions import SessionManager
-from lanevoice.db.database import Database
+from lanevoice.datasource import open_database
 from lanevoice.logging_config import get_logger
 from lanevoice.practice.sessions import PracticeSessionManager
 from lanevoice.settings import Settings, get_settings
@@ -87,10 +87,10 @@ class DashboardApp:
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
-        db = Database(self.settings.db_path)
-        # Same seeding rule as `build_repository`: the demo board offline, an
-        # untouched audit DB when Transport Pro is the system of record.
-        db.init(seed=not self.settings.uses_transport_pro)
+        # Same rule as the worker: the sample board offline, and with Transport
+        # Pro as the system of record an audit DB that carries no sample rows and
+        # reads its rep directory from REPS_FILE. See `datasource.open_database`.
+        db = open_database(self.settings)
         self.queries = DashboardQueries(db)
         self.sessions = SessionManager()
         # Loads and validates the profile TOMLs here, at boot — a malformed
@@ -338,6 +338,11 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(self.app.sessions.turn(m.group(1), text))
 
         if path == "/api/board/reset":
+            if self.app.settings.uses_transport_pro:
+                # The reset re-writes the SAMPLE board. Live, the board is
+                # Transport Pro's and the sample rows must never reappear.
+                raise ValueError("The board is Transport Pro's in this deployment; "
+                                 "there is no sample board to reset.")
             self.app.queries.reset_board()
             return self._send_json({"reset": True})
 

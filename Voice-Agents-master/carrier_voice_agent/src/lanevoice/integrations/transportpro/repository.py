@@ -54,6 +54,7 @@ from lanevoice.integrations.transportpro.mappers import (
     contact_emails,
     map_carrier,
     map_load,
+    map_rep,
 )
 from lanevoice.integrations.transportpro.terminals import (
     TerminalScope,
@@ -178,6 +179,9 @@ class TransportProRepository:
         self._loads = _TTLCache(settings.transport_pro_load_cache_seconds)
         self._carriers = _TTLCache(settings.transport_pro_carrier_cache_seconds)
         self._emails = _TTLCache(settings.transport_pro_carrier_cache_seconds)
+        # Reps are org structure — a name and a desk phone change when somebody is
+        # hired — so they are held as long as the terminal tree is.
+        self._reps = _TTLCache(settings.transport_pro_terminal_cache_seconds)
         # usdot (as the rest of the system keys carriers) -> Transport Pro id,
         # so `carrier_emails` can reach `/contact/search` from a USDOT alone.
         self._carrier_ids: dict[str, str] = {}
@@ -950,7 +954,32 @@ class TransportProRepository:
 
     # -- local audit trail (delegated verbatim) ----------------------------- #
     def get_rep(self, rep_id: str) -> Rep | None:
-        return self._audit.get_rep(rep_id)
+        """The rep behind an id a load carries.
+
+        The desk's own directory (`reps.toml`) is consulted first: it is where a
+        direct number or an availability flag lives when Transport Pro's record
+        has only the office main line. Then Transport Pro's user record, so that
+        the carrier sales rep on a load resolves to a real name and number with
+        no directory entry at all. Never raises — an unreadable user costs the
+        named handoff, and the call falls back to any available rep.
+        """
+        local = self._audit.get_rep(rep_id)
+        if local is not None:
+            return local
+        if not str(rep_id).strip().isdigit():
+            return None                       # a directory-only id, not a Transport Pro one
+        hit, cached = self._reps.get(rep_id)
+        if hit:
+            return cached
+        try:
+            record = self._client.user(rep_id)
+        except TransportProError as exc:
+            logger.warning("Transport Pro user %s could not be read (%s) — the call "
+                           "falls back to any available rep.", rep_id, exc)
+            return None
+        rep = map_rep(record)
+        self._reps.put(rep_id, rep)
+        return rep
 
     def available_rep(self, exclude_rep_id: str | None = None) -> Rep | None:
         return self._audit.available_rep(exclude_rep_id)

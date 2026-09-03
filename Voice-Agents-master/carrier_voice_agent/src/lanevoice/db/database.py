@@ -163,7 +163,10 @@ class Database:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
-    def init(self, seed: bool = True) -> None:
+    def init(self, seed: bool = False) -> None:
+        """Create or migrate the schema. `seed=True` adds the sample board — the
+        offline playground and the tests; never a live deployment, whose sample
+        rows `datasource.open_database` removes."""
         conn = self.connect()
         try:
             conn.executescript(SCHEMA)
@@ -242,22 +245,40 @@ class Database:
         from lanevoice.db.seed import seed_reps
         seed_reps(self)
 
-    def reset(self, seed: bool = True) -> None:
+    def reset(self, seed: bool = False) -> None:
         """Drop the file and recreate — handy for tests and repeatable demos."""
         self.path.unlink(missing_ok=True)
         self.init(seed=seed)
 
 
 def main() -> None:
-    """`lanevoice-initdb` entry point."""
+    """`lanevoice-initdb` entry point: the schema, the rep directory, and — only
+    when asked — the sample board for the offline playground."""
+    import argparse
+
+    from lanevoice.datasource import open_database
     from lanevoice.env import load_env
     from lanevoice.settings import get_settings
 
+    parser = argparse.ArgumentParser(description="Initialize the LaneVoice database")
+    parser.add_argument(
+        "--seed", action="store_true",
+        help="also write the SAMPLE board (L1001, MC 123456, invented reps) — for "
+             "the offline playground only; refused when DATA_SOURCE=transportpro")
+    args = parser.parse_args()
+
     load_env()
     settings = get_settings()
-    db = Database(settings.db_path)
-    db.init(seed=True)
-    print(f"Initialized {db.path}")
+    if args.seed and settings.uses_transport_pro:
+        raise SystemExit(
+            "--seed writes invented loads, carriers and reps, and DATA_SOURCE is "
+            "transportpro: a live deployment must not carry them. Set "
+            "DATA_SOURCE=sqlite for an offline playground database.")
+    db = open_database(settings)
+    if args.seed:
+        db.init(seed=True)
+    print(f"Initialized {db.path}"
+          + (" with the sample board" if args.seed else ""))
 
 
 if __name__ == "__main__":

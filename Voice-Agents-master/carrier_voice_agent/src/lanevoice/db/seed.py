@@ -100,6 +100,41 @@ def seed_reps(db: Database) -> None:
         conn.close()
 
 
+def purge_seed(db: Database) -> dict[str, int]:
+    """Remove the sample rows — and ONLY them — from a database.
+
+    A Transport Pro deployment shares this schema for its audit trail, and an
+    earlier `lanevoice-initdb` or a dashboard started offline will have written
+    the sample board and the three invented reps into it. Live, those rows are a
+    trap: the transfer list is where the agent reads a rep's name from, and a
+    real carrier was told "let me get you over to Sarah Chen". Rows are matched
+    on the seed's own keys (reps on id AND phone), so anything a desk added
+    itself is untouched. Returns what was removed, per table, omitting zeros.
+    """
+    loads = [row[0] for row in _LOADS]
+    dots = [row[0] for row in _CARRIERS]
+    marks_loads = ",".join("?" * len(loads))
+    marks_dots = ",".join("?" * len(dots))
+    removed: dict[str, int] = {}
+    conn = db.connect()
+    try:
+        removed["loads"] = conn.execute(
+            f"DELETE FROM loads WHERE load_id IN ({marks_loads})", loads).rowcount  # noqa: S608
+        removed["carrier_emails"] = conn.execute(
+            f"DELETE FROM carrier_emails WHERE usdot_number IN ({marks_dots})",  # noqa: S608
+            dots).rowcount
+        removed["carriers"] = conn.execute(
+            f"DELETE FROM carriers WHERE usdot_number IN ({marks_dots})", dots).rowcount  # noqa: S608
+        removed["reps"] = sum(
+            conn.execute("DELETE FROM reps WHERE rep_id=? AND phone=?",
+                         (rep_id, phone)).rowcount
+            for rep_id, _name, phone, _available in _REPS)
+        conn.commit()
+    finally:
+        conn.close()
+    return {table: count for table, count in removed.items() if count}
+
+
 def seed_if_empty(db: Database) -> None:
     """Fill in anything missing. Every insert is OR IGNORE, so a database that's
     already half-populated (an older one being migrated, say) tops up instead of

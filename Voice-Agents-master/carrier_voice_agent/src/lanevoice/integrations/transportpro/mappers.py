@@ -42,7 +42,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from lanevoice.domain.models import AuthorityStatus, Carrier, Load, LoadStatus
+from lanevoice.domain.models import AuthorityStatus, Carrier, Load, LoadStatus, Rep
 from lanevoice.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -818,7 +818,7 @@ def map_load(record: dict, *, posted: bool, fraud_low_ratio: float = 0.5,
         open_rate=open_rate,
         ceiling_rate=ceiling_rate,
         fraud_low_rate=open_rate * fraud_low_ratio,
-        assigned_rep_id=None,
+        assigned_rep_id=_assigned_rep(record, shipment),
         status=status,
         is_posted=is_posted,
         notes=_notes(record, shipment, pickup, delivery),
@@ -856,6 +856,99 @@ def _coordinate(waypoint: Any, key: str) -> float | None:
     source = location if isinstance(location, dict) else waypoint
     value = _number(source.get(key))
     return value if value else None
+
+
+# Who on a load a carrier call belongs to, in order. The carrier sales rep is
+# whose freight this is from the carrier's side; the order taker is the fallback
+# on a load that has no CSR yet. Billing and dispatch contacts are not people a
+# carrier should be handed to.
+_REP_CONTACT_TYPES = ("CARRIERSALESREP", "ORDERTAKER")
+
+
+def _assigned_rep(*holders: Any) -> str | None:
+    """The Transport Pro user who owns this load, as a string id, or None.
+
+    `/load/{id}` lists the people on a load under `internalContacts` as
+    `{type, id}` pairs — verified live on load 2551913:
+    `[{"type": "ORDERTAKER", "id": 2237}, {"type": "CARRIERSALESREP", "id": 4507}]`.
+    The id is what `TransportProClient.user` turns into a name and a number, and
+    what a `reps.toml` entry is keyed on when the desk wants to override either.
+    """
+    for holder in holders:
+        contacts = holder.get("internalContacts") if isinstance(holder, dict) else None
+        if not isinstance(contacts, list):
+            continue
+        by_type: dict[str, str] = {}
+        for contact in contacts:
+            if not isinstance(contact, dict) or contact.get("id") in (None, "", 0):
+                continue
+            kind = re.sub(r"[\s_-]", "", str(contact.get("type") or "")).upper()
+            by_type.setdefault(kind, str(contact["id"]).strip())
+        for wanted in _REP_CONTACT_TYPES:
+            if wanted in by_type:
+                return by_type[wanted]
+    return None
+
+
+# Which of a user's numbers to dial, in order. FAX is never dialled. Transport
+# Pro writes numbers the way people type them ("260-208-4500 ext 1310") and a
+# SIP transfer wants E.164 with no extension.
+_DIALABLE_PHONE_TYPES = ("CELL", "MOBILE", "OFFICE", "MAIN", "HOME")
+_EXTENSION_RE = re.compile(r"\b(?:ext|extension|x)\.?\s*(\d+)\b", re.IGNORECASE)
+
+
+def _e164(raw: Any) -> tuple[str, str | None]:
+    """`('+12602084500', '1310')` from `'260-208-4500 ext 1310'`; `('', None)`
+    when nothing diallable is in it. US/Canada only — that is the desk."""
+    text = str(raw or "")
+    match = _EXTENSION_RE.search(text)
+    extension = match.group(1) if match else None
+    digits = re.sub(r"\D", "", _EXTENSION_RE.sub("", text))
+    if len(digits) == 10:
+        return f"+1{digits}", extension
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}", extension
+    return "", extension
+
+
+def map_rep(record: dict | None) -> Rep | None:
+    """A Transport Pro user record -> the rep a call can be handed to, or None.
+
+    `phone` is the number a SIP transfer dials, E.164, preferring a cell over the
+    office line. An extension cannot ride a transfer, so an office number that
+    carries one ("260-208-4500 ext 1310" — the live shape for a rep whose desk has
+    no direct number) dials the main line and is logged, because the fix is a
+    `reps.toml` entry with that rep's direct number. `phone` is "" when the record
+    has nothing diallable at all; the agent then names the rep and promises a
+    callback rather than a transfer it cannot make.
+    """
+    if not isinstance(record, dict) or record.get("id") in (None, ""):
+        return None
+    name = " ".join(part for part in (_text(record.get("firstName")),
+                                      _text(record.get("lastName"))) if part)
+    if not name:
+        return None
+    numbers: dict[str, Any] = {}
+    for entry in record.get("phoneNumbers") or []:
+        if isinstance(entry, dict):
+            numbers.setdefault(str(entry.get("type") or "").upper(), entry.get("value"))
+    phone, extension = "", None
+    for kind in _DIALABLE_PHONE_TYPES:
+        if kind in numbers:
+            phone, extension = _e164(numbers[kind])
+            if phone:
+                break
+    rep_id = str(record["id"]).strip()
+    if phone and extension:
+        logger.info("Transport Pro rep %s (%s) is listed at %s ext %s — a main line. A "
+                    "transfer dials the main line; add their direct number to reps.toml "
+                    "under id %r to reach them straight.", name, rep_id, phone, extension,
+                    rep_id)
+    elif not phone:
+        logger.info("Transport Pro rep %s (%s) has no diallable number on file — the "
+                    "agent will promise a callback, not a transfer. Add one to "
+                    "reps.toml under id %r.", name, rep_id, rep_id)
+    return Rep(rep_id=rep_id, name=name, phone=phone, available=True)
 
 
 def _terminal_id(*holders: Any) -> str | None:

@@ -14,6 +14,7 @@ neither of which the Public API has an endpoint for.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from lanevoice.db import Database, Repository
@@ -26,23 +27,61 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def build_repository(
-    settings: Settings | None = None,
-) -> Repository | TransportProRepository:
-    """The repository the conversation layer should use, per `DATA_SOURCE`.
+def open_database(settings: Settings | None = None) -> Database:
+    """The local database, ready for this deployment's mode.
 
-    Seeding the sample loads and carriers is skipped in Transport Pro mode — the
-    real board is the source, and seeded L1001s sitting alongside it would be a
-    trap for whoever debugs this next. The rep table is always seeded, because
-    that is the transfer list.
+    Offline (DATA_SOURCE=sqlite) it carries the sample board the demo and the
+    tests run against. With Transport Pro as the system of record it is an audit
+    trail and a rep directory and NOTHING else: no sample rows are written, and
+    any left behind by an earlier offline start or an old `lanevoice-initdb` are
+    removed — they are how a live carrier came to be told "let me get you over to
+    Sarah Chen", an invented rep. The rep directory is then loaded from
+    REPS_FILE when that file exists (relative paths sit next to the database).
     """
+    from lanevoice.db.seed import purge_seed
+    from lanevoice.reps import load_reps, sync_reps
+
     settings = settings or get_settings()
     live = settings.uses_transport_pro
 
     db = Database(settings.db_path)
     db.init(seed=not live)
     if live:
-        db.seed_reps()
+        removed = purge_seed(db)
+        if removed:
+            logger.warning(
+                "removed sample rows left in %s by an offline start: %s — a live "
+                "deployment carries no sample loads, carriers or reps", settings.db_path,
+                removed)
+
+    reps_path = Path(settings.reps_file)
+    if not reps_path.is_absolute():
+        reps_path = Path(settings.db_path).resolve().parent / reps_path
+    reps = load_reps(reps_path)
+    if reps is not None:
+        sync_reps(db, reps)
+    elif live:
+        logger.info(
+            "no rep directory at %s: handoffs go to the load's carrier sales rep as "
+            "Transport Pro lists them. Copy reps.toml.example to reps.toml to give a "
+            "rep a direct number (Transport Pro often has only the office line and an "
+            "extension) or to add a fallback pool for loads with no rep.", reps_path)
+    return db
+
+
+def build_repository(
+    settings: Settings | None = None,
+) -> Repository | TransportProRepository:
+    """The repository the conversation layer should use, per `DATA_SOURCE`.
+
+    In Transport Pro mode the real board is the source and the local database is
+    the audit trail plus the rep directory — see `open_database` for what is,
+    and is not, written into it.
+    """
+    settings = settings or get_settings()
+    live = settings.uses_transport_pro
+
+    db = open_database(settings)
     audit = Repository(db)
 
     if not live:

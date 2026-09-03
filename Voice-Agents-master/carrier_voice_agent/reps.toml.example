@@ -1,0 +1,30 @@
+# The rep directory — OPTIONAL. A handoff goes to the load's carrier sales rep
+# as Transport Pro lists them (`internalContacts` on the load, name and number
+# from the user record), with no entry here. This file OVERRIDES that: use the
+# rep's Transport Pro user id as `id` to give them a direct line or 8x8 DID when
+# Transport Pro only has the office main line with an extension (which a SIP
+# transfer cannot dial through), or to mark them unavailable. Entries with
+# other ids are the fallback pool for a load with no rep of its own.
+#
+# Copy this file to `reps.toml` next to the database (or point REPS_FILE at it).
+# The worker and the dashboard reload it at every start; the file is the source
+# of truth for the `reps` table.
+#
+# With no file, the agent never invents a name: a rep with no diallable number is
+# named and promised as a callback, and a load with no rep at all gets "a rep
+# will call you back", logged on the call record.
+#
+# `available = false` keeps somebody in the directory without routing calls to
+# them (out sick, on leave). All of `id`, `name` and `phone` are required.
+#
+# [[reps]]
+# id = "jsmith"
+# name = "Jordan Smith"
+# phone = "+12605551234"
+# available = true
+#
+# [[reps]]
+# id = "alee"
+# name = "Alex Lee"
+# phone = "+12605555678"
+# available = false

@@ -48,6 +48,7 @@ from lanevoice.domain.models import (
     Decision,
     LoadStatus,
     OfferParty,
+    Rep,
     VerificationAction,
 )
 from lanevoice.logging_config import get_logger
@@ -203,9 +204,16 @@ _ACCEPT_WORDS = (
     "sounds good", "book it", "agreed", "accept", "perfect", "yes", "yeah",
     "yep", "yup", "ok", "okay", "sure", "fine", "let's do it", "you got it",
 )
-_HUMAN_WORDS = (
-    "talk to a human", "speak to someone", "representative", "a rep",
-    "real person", "agent please",
+# The caller asking for a person, in any state of the call. Observed live: "Can
+# you transfer it to the sales rep?" in the middle of the empty-call question was
+# answered with "I'm actually the one handling this load" and a repeat of the
+# question, twice, and the caller hung up. A carrier who asks for a person gets
+# one — the load's own rep by name when there is one — not an argument.
+_WANTS_PERSON_RE = re.compile(
+    r"\b(?:transfer(?:red)?\b|"
+    r"(?:talk|speak) (?:to|with) (?:a|the|your|some(?:one|body)?|any(?:one|body))\b|"
+    r"(?:a|the|your|sales) rep\b|representative|real person|"
+    r"(?:a|the) person\b|human|agent please|manager|someone else)"
 )
 # The carrier calls their number their best. A rep stops asking at that point and
 # either closes it or lets it go — pressing a fourth time just burns the call.
@@ -473,6 +481,10 @@ class CarrierSalesAgent:
         self._requirement_asks = 0               # asks with no yes and no no
         self._mc_digits = ""                     # digits heard so far, across turns
         self._mc_narrowed = None                 # partial that matched one carrier
+        # Set when a handoff resolved to a rep WITH a number: the worker dials it
+        # (a SIP transfer) once the handoff line has been spoken. None means the
+        # caller was promised a callback instead — see `_transfer_and_say`.
+        self.pending_transfer: Rep | None = None
         self._levers_used = 0                    # non-price pitches already spent
         self._empty_location: str | None = None  # where their truck frees up
         self._empty_when: str | None = None      # and when
@@ -646,6 +658,8 @@ class CarrierSalesAgent:
         resolution = self._transfers.resolve(self.load)
         rep_id = resolution.rep.rep_id if resolution.rep else None
         self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id)
+        rep = resolution.rep
+        self.pending_transfer = rep if (rep is not None and rep.phone) else None
         self.transcript.append(("agent", _LAST_RESORT))
         return _LAST_RESORT
 
@@ -773,6 +787,12 @@ class CarrierSalesAgent:
             CallState.DONE: lambda _t: "This call has ended. Goodbye.",
         }.get(self.state, self._identify_load)
         try:
+            if self.state is not CallState.DONE and _WANTS_PERSON_RE.search(user_text.lower()):
+                # They asked for a person. Hand them to the load's rep by name
+                # when a load is known; before that, to whoever the directory
+                # says is free, or a callback. Never talk them out of it.
+                self._note("Caller asked to be transferred to a rep.")
+                return self._transfer_and_say(reason="carrier_request")
             return handler(user_text)
         except SourceUnavailable as exc:
             # The board, the carrier file or the contact list is unreachable. Not
@@ -1157,11 +1177,24 @@ class CarrierSalesAgent:
                 f"Carrier {who} not cleared automatically: {result.reason}, flags "
                 f"{list(result.risk_flags)} — routed to a rep, no rate discussed."
             )
-            self._transfer(reason="verification_review")
+            resolution = self._transfer(reason="verification_review")
+            if resolution.rep is None or self.pending_transfer is None:
+                # Nobody in the rep directory is free (or the directory is empty):
+                # promising to put them through to someone would be a lie followed
+                # by silence. A callback is the honest version.
+                return self._say(
+                    "Nobody who can finish getting them set up is free right now, so a "
+                    "rep will call them back on this. Tell them that, briefly — nothing "
+                    "accusatory, no detail about what flagged, and do not discuss the "
+                    "load or a rate. Do NOT say or imply they are verified, approved or "
+                    "good to go.",
+                    amounts=set(),
+                )
             return self._say(
                 "You're putting them through to a rep to finish getting them set up. Say "
                 "so smoothly and keep it moving — nothing accusatory, no detail about what "
                 "flagged, and do not discuss the load or a rate.",
+                facts=f"Rep taking the call: {resolution.rep.name}",
                 amounts=set(),
             )
 
@@ -1367,7 +1400,7 @@ class CarrierSalesAgent:
         # Explicit "yes" with no number -> accept the offer on the table.
         if money is None and any(w in lowered for w in _ACCEPT_WORDS):
             return self._propose_booking(self.neg.current_offer)
-        if any(w in lowered for w in _HUMAN_WORDS):
+        if _WANTS_PERSON_RE.search(lowered):
             return self._transfer_and_say(reason="carrier_request")
 
         if money is not None:
@@ -1827,13 +1860,21 @@ class CarrierSalesAgent:
         resolution = self._transfers.resolve(self.load)
         self._finish(CallOutcome.TRANSFERRED, rep_id=resolution.rep.rep_id
                      if resolution.rep else None)
+        # Only a rep with a number can actually be dialled. The worker performs
+        # the transfer after the line below has been spoken; a rep without a
+        # number is named, and the caller is promised a callback instead.
+        rep = resolution.rep
+        self.pending_transfer = rep if (rep is not None and rep.phone) else None
         return resolution
 
     def _transfer_and_say(self, reason: str) -> str:
         resolution = self._transfer(reason)
+        # "Putting you through to X" is only true when X can be dialled. Every
+        # branch below says callback instead when they cannot.
+        can_dial = self.pending_transfer is not None
         if reason == "above_agent_authority":
             # Don't hand the carrier a "no" — hand them to someone who can say yes.
-            who = resolution.rep.name if resolution.rep else None
+            who = resolution.rep.name if (resolution.rep and can_dial) else None
             if who is None:
                 return self._say(
                     "Their number is above what you can approve on your own, and nobody "
@@ -1868,12 +1909,47 @@ class CarrierSalesAgent:
                 "Name NO dollar figure." + _NOT_VERIFIED,
                 amounts=set(),
             )
+        if not can_dial:
+            # The load's rep is known but has no number on file to transfer to.
+            return self._say(
+                f"{resolution.rep.name} handles this load but can't be put through to "
+                f"right now. Tell them {resolution.rep.name} will call them straight "
+                f"back on it. Brief. Name NO dollar figure." + _NOT_VERIFIED,
+                facts=f"Rep who will call back: {resolution.rep.name}",
+                amounts=set(),
+            )
         return self._say(
-            f"Tell them you're putting them through to {resolution.rep.name}, who handles "
+            f"Tell them you're transferring them to {resolution.rep.name}, who handles "
             f"this load, and to hold a moment. Name NO dollar figure." + _NOT_VERIFIED,
             facts=f"Rep taking the call: {resolution.rep.name}",
             amounts=set(),
         )
+
+    def note_transfer_skipped(self, rep: Rep) -> None:
+        """The handoff was announced but the trunk isn't set up to move the call
+        (SIP_TRANSFER_ENABLED is off). Said plainly on the record so the rep — who
+        was named to the caller — knows the call did NOT arrive and must ring back."""
+        self._repo.log_transfer(self.call_id, rep.rep_id, "not performed: SIP transfer off")
+        self._note(f"Handoff to {rep.name} announced but not performed — SIP transfer is "
+                   f"not enabled on this deployment. {rep.name} needs to call the carrier "
+                   "back.")
+
+    def note_transfer_result(self, rep: Rep, connected: bool,
+                             detail: str | None = None) -> None:
+        """What actually happened on the phone line after the handoff was spoken.
+
+        `_finish` records the transfer as REQUESTED; this is the worker reporting
+        whether the SIP transfer went through. Until this existed the audit log
+        said "connected" for every handoff, with no connection ever attempted.
+        """
+        result = "connected" if connected else f"failed: {detail or 'unknown'}"[:200]
+        self._repo.log_transfer(self.call_id, rep.rep_id, result)
+        if connected:
+            self._note(f"Transferred the caller to {rep.name} at {rep.phone}.")
+        else:
+            self._note(f"Could NOT transfer the caller to {rep.name} at {rep.phone} "
+                       f"({detail or 'unknown'}) — they were told a rep will call them "
+                       "back. Somebody has to.")
 
     # -- Above the agent's own authority -> hand it to a human -------------- #
     def _escalate(self, ask: float, result) -> str:
@@ -1924,7 +2000,9 @@ class CarrierSalesAgent:
             self.transcript,
         )
         if rep_id and outcome == CallOutcome.TRANSFERRED:
-            self._repo.log_transfer(self.call_id, rep_id, "connected")
+            # Requested, not connected: whether the caller actually reached the
+            # rep is the worker's to report — see `note_transfer_result`.
+            self._repo.log_transfer(self.call_id, rep_id, "requested")
 
     def note_unheard(self) -> None:
         """The caller spoke and nothing was transcribed; the worker asked them to

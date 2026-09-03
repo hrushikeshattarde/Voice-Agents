@@ -69,6 +69,31 @@ In the Twilio Console:
 Now: caller dials your Twilio number → Twilio sends it to LiveKit SIP → LiveKit
 puts it in a `call-…` room → your worker answers.
 
+### B5. Let the agent transfer calls to reps (optional, off by default)
+When a call needs a person, the agent looks up the load's carrier sales rep in
+Transport Pro and tells the caller it is putting them through to that rep by
+name. Moving the call is a separate switch: with `SIP_TRANSFER_ENABLED=1` the
+worker then sends a SIP REFER to the rep's number up the Twilio trunk. Twilio
+refuses that unless the trunk allows it: in the Twilio Console open the trunk →
+**Settings** → enable **Call Transfer (SIP REFER)** and **Enable PSTN Transfer**
+(reps' phones are PSTN numbers; see [TRANSFER_8X8.md](TRANSFER_8X8.md) §6 for
+what Twilio bills after the handoff). Until then leave the switch off: the
+handoff is announced and recorded as `not performed`, and the named rep has to
+call the carrier back. With it on and the trunk not ready, every transfer fails,
+the caller hears "a rep will call you straight back", and the failure is logged
+as `TRANSFER failed` with Twilio's reason.
+
+Transport Pro often lists a rep at the office main line with an extension, which
+a transfer cannot dial through. Give such reps a direct number in `reps.toml`,
+keyed on their Transport Pro user id (the startup log names the id when it sees
+an extension):
+```toml
+[[reps]]
+id = "4507"                # Transport Pro user id
+name = "Salomon Castillo"
+phone = "+12605551234"     # their direct line / 8x8 DID
+```
+
 ---
 
 ## Part C — Run the worker
@@ -80,10 +105,17 @@ uv sync
 No local ML models — STT/LLM/TTS all run on OpenRouter, so there's nothing heavy
 to download and no GPU needed.
 
-### C2. Initialize the database once
+### C2. Initialize the database and the rep directory once
 ```bash
+cp reps.toml.example reps.toml     # then list the reps calls get handed to
 uv run lanevoice-initdb
 ```
+With `DATA_SOURCE=transportpro` this creates the schema and loads `reps.toml`
+and nothing else: no sample loads, carriers or reps are written, and any left
+over from an offline start are removed. (`--seed` writes the sample board for
+the offline playground and is refused in Transport Pro mode.) Without a
+`reps.toml` the agent never invents a rep's name; it tells the caller a rep will
+call back and logs the callback on the call record.
 
 ### C3. Start the worker
 ```bash

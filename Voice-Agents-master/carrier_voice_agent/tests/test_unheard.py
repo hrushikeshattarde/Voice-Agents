@@ -34,6 +34,25 @@ def test_a_dotted_clock_time_is_read_as_a_time():
     assert parsing.extract_empty_when("10 AM.") == "10 am"
 
 
+def test_comfort_noise_is_a_whisper_under_the_speech():
+    """What the recogniser gets between the caller's words is no longer digital
+    zero — a -55 dBFS hiss, enough to keep its speech detector awake, 35 dB under
+    quiet speech — and nothing else about the frame changes. 0 dBFS means off."""
+    import numpy as np
+    from livekit import rtc
+
+    from lanevoice.telephony.worker import with_comfort_noise
+
+    silence = rtc.AudioFrame(data=bytes(2 * 480), sample_rate=48000, num_channels=1,
+                             samples_per_channel=480)
+    out = with_comfort_noise(silence, np.random.default_rng(0), -55.0)
+    samples = np.frombuffer(out.data, dtype=np.int16).astype(np.float64)
+    rms_dbfs = 20 * np.log10(np.sqrt((samples ** 2).mean()) / 32767)
+    assert -58 < rms_dbfs < -52
+    assert (out.sample_rate, out.num_channels, out.samples_per_channel) == (48000, 1, 480)
+    assert with_comfort_noise(silence, np.random.default_rng(0), 0.0) is silence
+
+
 def test_the_clock_fallback_does_not_invent_times():
     assert parsing.extract_empty_when("I'm in Lexington") is None
     assert parsing.extract_empty_when("about 42,000 pounds") is None
