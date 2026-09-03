@@ -23,11 +23,18 @@ Three deliberate limits, because this number gets SAID to a driver:
   confidently wrong number is worse here than no number — the agent simply
   doesn't mention it.
 
-The city table is bundled (`data/us_cities.csv.gz`, ~56 KB, 3,407 US places) so
-this costs no network call on the critical path and the test suite stays hermetic.
-It covers US places over ~15,000 people; a truck empty in a smaller town falls
-through to None, which is the honest answer rather than a guess at the nearest
-big city.
+* **The pickup steers the match.** Names repeat across the country and the
+  recogniser mangles them. When the pickup's coordinates are known, a name
+  shared by several towns resolves to the one nearest the pickup, and a name
+  that only matches loosely is matched against the towns within `_REGION_MILES`
+  of it before the whole country — a truck calling a Fort Wayne desk about a
+  Fort Wayne load is far likelier to be in Columbia City, Indiana than Columbia
+  City, Washington, whatever the population figures say.
+
+The city table is bundled (`data/us_cities.csv.gz`, ~280 KB, every US place of
+1,000+ people, ~17,000 of them) so this costs no network call on the critical
+path and the test suite stays hermetic. A hamlet below that floor falls through
+to None, which is the honest answer rather than a guess at the nearest town.
 
 Data source: GeoNames (https://www.geonames.org/), CC BY 4.0, extracted via the
 `geonamescache` package. See `data/SOURCE.md`.
@@ -63,6 +70,9 @@ _TRIVIAL_MILES = 15
 # agent confidently talking about the wrong town, which is worse than saying
 # nothing. 0.86 accepts "ft wayne"/"fort wayne" and rejects "wayne"/"fort payne".
 _FUZZY_CUTOFF = 0.86
+# Towns within this many miles of the pickup are tried first for a loose match
+# and win outright when several towns share the name the caller said.
+_REGION_MILES = 500
 
 # Speech-to-text and truckers both abbreviate. Applied to BOTH sides of the match
 # so "St. Louis" in the table and "st louis" from the caller meet in the middle.
@@ -195,13 +205,35 @@ def _state_code(raw: str) -> str | None:
     return STATE_CODES.get(text.lower())
 
 
-def locate(place: str | None) -> Place | None:
+def state_only(place: str | None) -> str | None:
+    """The state's code when `place` names a state and nothing else — "Indiana",
+    "IN" — or None. Observed live: the recogniser dropped "Fort Wayne" off the
+    front of "Fort Wayne, Indiana at 10 am" and the agent moved on with a state
+    for a location; a city has to be asked for."""
+    city, code = _split(place or "")
+    return code if (code and not city) else None
+
+
+def _miles_from(place: Place, near: tuple[float, float]) -> float:
+    return haversine_miles(place.lat, place.lon, near[0], near[1])
+
+
+def _nearest(places: list[Place], near: tuple[float, float]) -> Place:
+    return min(places, key=lambda p: _miles_from(p, near))
+
+
+def locate(place: str | None, near: tuple[float, float] | None = None) -> Place | None:
     """A spoken place -> a point, or None when we cannot place it confidently.
 
+    `near` is the pickup, when its coordinates are known. It never widens what
+    matches — a name that matches nothing still matches nothing — it decides
+    BETWEEN matches: the nearest of several towns sharing a name, and the towns
+    around the pickup before the rest of the country for a loose match.
+
     None is a first-class answer and the caller must treat it as "say nothing
-    about distance". It happens for a state with no city, a town too small for the
-    table, and a name mangled beyond a tight fuzzy match — and in every one of
-    those cases a number would be a guess.
+    about distance". It happens for a state with no city, a hamlet below the
+    table's floor, and a name mangled beyond a tight fuzzy match — and in every
+    one of those cases a number would be a guess.
     """
     city, state = _split(place or "")
     if not city:
@@ -209,33 +241,68 @@ def locate(place: str | None) -> Place | None:
             logger.debug("%r is a state with no city — no distance will be given.",
                          place)
         return None
-
     wanted = _normalise(city)
     if not wanted:
         return None
-
-    candidates = _CITIES.in_state(state) if state else _CITIES.everywhere()
-    if not candidates:
+    pool = _CITIES.in_state(state) if state else _CITIES.everywhere()
+    if not pool:
         if state:
             logger.debug("No cities on file for state %s.", state)
         return None
 
-    index: dict[str, Place] = {}
-    for candidate in candidates:
-        index.setdefault(_normalise(candidate.name), candidate)
+    exact = [p for p in pool if _normalise(p.name) == wanted]
+    if exact:
+        if len(exact) == 1 or near is None:
+            return exact[0]                  # unique — or the most populous, the table's order
+        best = _nearest(exact, near)
+        logger.info("Heard %r; %d places share that name — taking %s, the nearest to "
+                    "the pickup.", place, len(exact), best.label)
+        return best
 
-    if (exact := index.get(wanted)) is not None:
-        return exact
-
-    close = difflib.get_close_matches(wanted, list(index), n=1, cutoff=_FUZZY_CUTOFF)
-    if close:
-        match = index[close[0]]
-        logger.info("Heard %r; matched it to %s.", place, match.label)
-        return match
-
+    tiers: list[list[Place]] = []
+    if near is not None:
+        tiers.append([p for p in pool if _miles_from(p, near) <= _REGION_MILES])
+    tiers.append(pool)
+    for candidates in tiers:
+        index: dict[str, list[Place]] = {}
+        for candidate in candidates:
+            index.setdefault(_normalise(candidate.name), []).append(candidate)
+        close = difflib.get_close_matches(wanted, list(index), n=1, cutoff=_FUZZY_CUTOFF)
+        if close:
+            options = index[close[0]]
+            match = _nearest(options, near) if (near is not None and len(options) > 1) \
+                else options[0]
+            logger.info("Heard %r; matched it to %s.", place, match.label)
+            return match
     logger.info("Could not place %r%s — no distance will be given.",
                 place, f" in {state}" if state else "")
     return None
+
+
+def region_keyterms(office: str | None, miles: float = 150.0, limit: int = 60,
+                    local_miles: float = 30.0) -> list[str]:
+    """The names of the towns around the office, for the recogniser's vocabulary.
+
+    A caller's "Columbia City" or "Auburn" is a word the recogniser has to pick
+    out of a phone line; giving it the towns a truck near this desk is likely to
+    be empty in makes those the words it expects. Two tiers: every place within
+    `local_miles` (the desk's own back yard, small towns included), then the
+    largest places out to `miles`, up to `limit` names in all. Empty when the
+    office cannot be placed.
+    """
+    centre = locate(office)
+    if centre is None or limit <= 0:
+        return []
+    here = (centre.lat, centre.lon)
+    everywhere = _CITIES.everywhere()          # population order
+    names: list[str] = []
+    for tier in (local_miles, miles):
+        for place in everywhere:
+            if _miles_from(place, here) <= tier and place.name not in names:
+                names.append(place.name)
+                if len(names) >= limit:
+                    return names
+    return names
 
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -296,7 +363,13 @@ def deadhead_phrase(place: str | None, lat: float | None,
     along the way — unplaceable city, state only, pickup with no coordinates —
     collapses to None, which means the agent says nothing about distance at all.
     """
-    located = locate(place)
+    near = None
+    if lat is not None and lon is not None:
+        try:
+            near = (float(lat), float(lon))
+        except (TypeError, ValueError):
+            near = None
+    located = locate(place, near=near)
     if located is None:
         return None
     return spoken_miles(deadhead_miles(located, lat, lon,

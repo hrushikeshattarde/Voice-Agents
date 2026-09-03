@@ -89,10 +89,34 @@ def test_a_state_alone_is_not_placeable():
 
 
 def test_a_town_below_the_tables_floor_is_not_placeable():
-    """Breckenridge, MN has ~3,300 people and is not in a 15,000-plus table. The
-    honest answer is None — NOT the nearest big city, which would be 50 miles off
-    and stated with total confidence."""
-    assert geo.locate("Breckenridge, Minnesota") is None
+    """The table now holds every place of 1,000+ people, so Breckenridge, MN
+    (~3,300) is in it — a live pickup that used to fall through. A hamlet below
+    the floor still comes back as None: NOT the nearest town, which would be
+    miles off and stated with total confidence."""
+    assert geo.locate("Breckenridge, Minnesota").state == "MN"
+    assert geo.locate("Klondike Corner, Ohio") is None
+
+
+def test_a_name_shared_by_many_towns_takes_the_one_near_the_pickup():
+    """Observed live: a caller empty in Columbia City, Indiana — 20 miles from a
+    Fort Wayne pickup — and the only Columbia City the old table knew was in
+    Washington state. With the pickup to steer by, the nearest wins; with no
+    pickup, the most populous, as before."""
+    fort_wayne = (41.1306, -85.1289)
+    assert geo.locate("Columbia City", near=fort_wayne).state == "IN"
+    assert geo.locate("Columbia City").state == "WA"
+    assert geo.locate("Springfield", near=(39.78, -89.65)).state == "IL"
+    assert geo.locate("Springfield").label == "Springfield, MO"
+    # A state given by the caller still beats the pickup.
+    assert geo.locate("Columbia City, Washington", near=fort_wayne).state == "WA"
+
+
+def test_the_offices_towns_become_vocabulary():
+    names = geo.region_keyterms("Fort Wayne, IN", miles=150, limit=60)
+    assert names and names[0] == "Fort Wayne"                 # the back yard first
+    assert {"Columbia City", "Huntington", "Auburn", "Decatur"} <= set(names)
+    assert len(names) <= 60
+    assert geo.region_keyterms("Nowhere at all", 150, 60) == []
 
 
 def test_an_unrecognisable_place_is_not_placeable():

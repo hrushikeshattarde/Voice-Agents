@@ -155,7 +155,15 @@ class Settings(BaseSettings):
     # produced 3-5x more interim transcripts per second. `deepgram/nova-3` is the
     # alternative; `telephony.worker._stt_extra_kwargs` has the per-provider
     # options and the measurements.
-    stt_inference_model: str = Field(default="assemblyai/universal-streaming",
+    #
+    # `assemblyai/u3-rt-pro` replaced `assemblyai/universal-streaming` on
+    # 2026-09-03. The older model lost the FIRST short word of an utterance that
+    # followed a long quiet stretch — reproduced offline from live recordings:
+    # "Fort Wayne, Indiana at 10 am" came back as "In Indiana at 10 a.m.", "It's
+    # 299953" as "299953", a quiet "sure" as "Sheila" or nothing. On the same
+    # clips u3-rt-pro returned every word. Same formatting (digits, "10 AM"), so
+    # the parser is unchanged.
+    stt_inference_model: str = Field(default="assemblyai/u3-rt-pro",
                                      validation_alias="STT_INFERENCE_MODEL")
     # Extra vocabulary for the recogniser, comma-separated, ADDED to the built-in
     # freight list in `telephony.worker.STT_KEYTERMS`. Words and short phrases —
@@ -427,6 +435,27 @@ class Settings(BaseSettings):
     # checked against what the recogniser actually received, offline. Off unless
     # a hearing problem is being chased; it is a second recording of the caller.
     stt_feed_dump: bool = Field(default=False, validation_alias="STT_FEED_DUMP")
+    # A caller who says nothing after the agent's question. After this many
+    # seconds of silence the agent asks "you still there?"; after as many again it
+    # says goodbye, records the call as abandoned and hangs up. A real caller who
+    # set the phone down costs agent minutes for as long as the line stays open;
+    # observed: a caller went quiet for forty seconds and the agent sat mute. 0
+    # disables both.
+    idle_prompt_seconds: float = Field(default=12.0, validation_alias="IDLE_PROMPT_SECONDS")
+    idle_close_seconds: float = Field(default=12.0, validation_alias="IDLE_CLOSE_SECONDS")
+    # How long after the closing line has finished playing the worker ends the
+    # call. A desk hangs up after "have a good one"; leaving the line open bills
+    # minutes and leaves the caller wondering. 0 keeps the line open.
+    hangup_after_close_seconds: float = Field(
+        default=1.5, validation_alias="HANGUP_AFTER_CLOSE_SECONDS")
+    # Where this desk is, as a place the city table knows ("Fort Wayne, IN"). The
+    # towns around it become recogniser vocabulary (`geo.region_keyterms`): a
+    # caller's "Columbia City" is then a word the recogniser expects rather than
+    # one it guesses at. Empty disables.
+    office_location: str = Field(default="", validation_alias="OFFICE_LOCATION")
+    stt_region_keyterms_miles: float = Field(
+        default=150.0, validation_alias="STT_REGION_KEYTERMS_MILES")
+    stt_region_keyterms_max: int = Field(default=60, validation_alias="STT_REGION_KEYTERMS_MAX")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are

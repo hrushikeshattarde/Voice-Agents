@@ -420,6 +420,52 @@ def is_probably_noise(text: str) -> bool:
 _TLDS = "com|net|org|io|co|us|biz|info|trucking|transport"
 
 
+def _email_sound(text: str) -> str:
+    """An address, or a stretch of speech about one, reduced to what survives a
+    phone line and a recogniser: lowercase letters and digits only. "dispatch
+    at circle delivers dot com", "dispatch@circledelivers.com" and "Dispatch,
+    circle delivers.com" all become "dispatchcircledeliverscom"."""
+    low = f" {text.lower()} "
+    low = re.sub(r"\b(?:at|dot|period|point|underscore|under score|dash|hyphen|minus)\b", " ", low)
+    return re.sub(r"[^a-z0-9]", "", low)
+
+
+def match_spoken_email(text: str, candidates) -> str | None:
+    """The address on the carrier's account that the caller most plausibly said.
+
+    Observed live: "dispatch at circle delivers dot com" arrives from the
+    recogniser as "Dispatch, circle delivers.com" — no "@", the domain in two
+    words — and the exact parser hands back nothing, so a caller who read a real
+    account address perfectly was asked again and then handed to a rep. The
+    booking gate only ever sends to an address ALREADY on the account, so
+    matching by sound against those addresses keeps the guarantee the gate
+    exists for; the worst case is a link sent to another of the carrier's own
+    addresses, and only when the whole of that address was heard.
+
+    The whole normalised address has to appear in the normalised speech. A bare
+    domain ("circle delivers dot com") matches nothing — that would pick one of
+    many addresses at the same company by chance.
+    """
+    heard = _email_sound(text)
+    if len(heard) < 6:
+        return None
+    hits = []
+    for candidate in candidates:
+        wanted = _email_sound(candidate)
+        local = _email_sound(candidate.split("@", 1)[0])
+        if wanted and wanted in heard and len(local) >= 3:
+            hits.append(candidate)
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        # "asmith" is inside "zachary.smith" sound-wise only when the longer
+        # one was said; prefer the longest match, and give up on a tie.
+        hits.sort(key=lambda c: len(_email_sound(c)), reverse=True)
+        if len(_email_sound(hits[0])) > len(_email_sound(hits[1])):
+            return hits[0]
+    return None
+
+
 def _spoken_email(text: str) -> str | None:
     """Recover an address a human SAID rather than typed.
 

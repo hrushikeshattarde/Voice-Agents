@@ -23,6 +23,8 @@ Run:  lanevoice-worker dev      (local)
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import logging
 import random
 import shutil
 import threading
@@ -58,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover
     from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 
-from lanevoice import parsing
+from lanevoice import geo, parsing
 from lanevoice.conversation import CarrierSalesAgent, is_closing_turn
 from lanevoice.conversation.agent import compose_greeting
 from lanevoice.datasource import build_repository
@@ -76,6 +78,28 @@ load_env()
 _settings = get_settings()
 setup_logging(_settings.log_level)
 logger = get_logger("lanevoice.worker")
+
+# Which call a log line belongs to. Two callers can be on the line at once in one
+# worker process, and their turns interleave in the log with nothing to tell
+# them apart — observed live. Set per job in `entrypoint`; inherited by every
+# task and `to_thread` call under it.
+_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "lanevoice_call_id", default=None)
+
+
+class _CallIdFilter(logging.Filter):
+    """Prefix this deployment's own log lines with the call they belong to."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        call_id = _CALL_ID.get(None)
+        if call_id and record.name.startswith("lanevoice") and not getattr(
+                record, "_call_tagged", False):
+            record.msg = f"[{call_id}] {record.msg}"
+            record._call_tagged = True
+        return True
+
+
+_CALL_ID_FILTER = _CallIdFilter()
 
 _SPEECH_PROVIDERS = ("inference", "openrouter")
 
@@ -185,7 +209,19 @@ STT_KEYTERMS = (
 
 def _stt_keyterms(settings: Settings) -> list[str]:
     extra = [term.strip() for term in settings.stt_keyterms.split(",") if term.strip()]
-    return list(dict.fromkeys([*STT_KEYTERMS, *extra]))
+    region: list[str] = []
+    if settings.office_location.strip():
+        region = geo.region_keyterms(settings.office_location, settings.stt_region_keyterms_miles,
+                                     settings.stt_region_keyterms_max)
+        if region:
+            logger.info("regional vocabulary: %d towns within %.0f miles of %s added to the "
+                        "recogniser's keyterms (%s ...)", len(region),
+                        settings.stt_region_keyterms_miles, settings.office_location,
+                        ", ".join(region[:6]))
+        else:
+            logger.warning("OFFICE_LOCATION %r is not a place the city table knows — no "
+                           "regional vocabulary for the recogniser.", settings.office_location)
+    return list(dict.fromkeys([*STT_KEYTERMS, *extra, *region]))
 
 
 def _stt_extra_kwargs(model: str) -> dict[str, Any]:
@@ -339,6 +375,15 @@ REASK_LINE = "Sorry, I didn't catch that — say that one more time for me?"
 # returns nothing three times in a row is not going to start; the rep handoff
 # paths in the conversation layer are the right end for that call.
 _MAX_REASKS = 3
+
+# A caller who has gone quiet after a question: one nudge, then a goodbye. Both
+# pre-rendered, both kept out of the dialogue record. See `_idle_watch`.
+STILL_THERE_LINE = "You still there?"
+IDLE_CLOSE_LINE = "Alright, I'll let you go — give us a call back whenever you're ready."
+# Spoken once the re-asks have run out: the line is up, the VAD hears them, and
+# the recogniser keeps returning nothing. Better than the silence it replaces.
+HEARING_TROUBLE_LINE = ("I'm having a hard time hearing you on this line — sorry about "
+                        "that. A rep will give you a call right back.")
 
 # Spoken when the agent said "transferring you to X" and the SIP transfer then
 # failed — the rep's line busy, the trunk refusing the transfer. The caller is
@@ -526,11 +571,12 @@ def prewarm(proc):
     # worker process and shared by every call it handles — the repository caches
     # reads briefly and handles its own concurrency.
     proc.userdata["repo"] = build_repository(_settings)
+    # Computed once per process (it reads the city table), logged once.
+    proc.userdata["keyterms"] = _stt_keyterms(_settings)
     if _settings.log_level.upper() == "TRACE":
         # The CLI's dev mode sets the framework's loggers to DEBUG after our
         # logging is configured; the trace level has to be re-applied here,
         # inside the worker, to survive that.
-        import logging
         logging.getLogger("livekit.agents").setLevel(TRACE_LEVEL)
         logger.info("livekit.agents at TRACE: transcript hold/flush decisions will be logged")
     # VAD sensitivity is a real tradeoff (noise-immune vs. hearing a short
@@ -583,6 +629,9 @@ def prewarm(proc):
         texts.extend(FILLER_LINES)
     if _settings.unheard_reask_delay > 0:
         texts.append(REASK_LINE)
+        texts.append(HEARING_TROUBLE_LINE)
+    if _settings.idle_prompt_seconds > 0:
+        texts.extend((STILL_THERE_LINE, IDLE_CLOSE_LINE))
     clips = {text: (pcm, rate) for text, pcm, rate in
              prerender_clips(_settings, texts, proc.userdata["tts"])} if texts else {}
     proc.userdata["greeting"] = (
@@ -592,6 +641,12 @@ def prewarm(proc):
         (text, *clips[text]) for text in FILLER_LINES if text in clips]
     proc.userdata["reask"] = (
         (REASK_LINE, *clips[REASK_LINE]) if REASK_LINE in clips else None)
+    for key, line in (("hearing_trouble", HEARING_TROUBLE_LINE),
+                      ("still_there", STILL_THERE_LINE), ("idle_close", IDLE_CLOSE_LINE)):
+        proc.userdata[key] = (line, *clips[line]) if line in clips else None
+    for handler in logging.getLogger().handlers:
+        if _CALL_ID_FILTER not in handler.filters:
+            handler.addFilter(_CALL_ID_FILTER)
     if proc.userdata["greeting"]:
         logger.info("greeting rendered: %.1fs of audio, ready before the phone rings",
                     len(proc.userdata["greeting"][1]) / 2 / proc.userdata["greeting"][2])
@@ -616,7 +671,10 @@ class CarrierAgent(Agent):
                  fillers: list[Clip] | None = None,
                  greeting: Clip | None = None,
                  reask: Clip | None = None,
-                 ctx: JobContext | None = None):
+                 ctx: JobContext | None = None,
+                 hearing_trouble: Clip | None = None,
+                 still_there: Clip | None = None,
+                 idle_close: Clip | None = None):
         super().__init__(instructions="Carrier sales agent (logic in conversation layer).")
         self.brain = CarrierSalesAgent(repo, composer, _settings)
         self._ctx = ctx                    # the room and the LiveKit API, for transfers
@@ -624,6 +682,11 @@ class CarrierAgent(Agent):
         self._fillers = list(fillers or [])
         self._greeting = greeting
         self._reask = reask
+        self._hearing_trouble = hearing_trouble
+        self._still_there = still_there
+        self._idle_close = idle_close
+        self._idle_task: asyncio.Task | None = None
+        self._hung_up = False
         self._last_filler: int | None = None
         # The unheard-speech watchdog — see `on_user_state_changed`.
         self._turn_seq = 0                 # bumps on every committed caller turn
@@ -666,6 +729,7 @@ class CarrierAgent(Agent):
             # The VAD's view of the caller, beside the recogniser's: a "started
             # speaking" with no STT line after it is the caller going unheard.
             logger.info("VAD → caller started speaking")
+            self._cancel_idle_watch()
         elif ev.new_state == "listening" and ev.old_state == "speaking":
             logger.info("VAD → caller stopped speaking")
         if _settings.unheard_reask_delay <= 0:
@@ -675,7 +739,7 @@ class CarrierAgent(Agent):
             self._caller_spoke_while_idle = (
                 self.session.current_speech is None and not self._turn_in_flight)
         elif ev.new_state == "listening" and ev.old_state == "speaking":
-            if self._caller_spoke_while_idle and self._reasks < _MAX_REASKS:
+            if self._caller_spoke_while_idle:
                 self._unheard_task = asyncio.create_task(
                     self._reask_if_unheard(self._turn_seq))
 
@@ -693,21 +757,125 @@ class CarrierAgent(Agent):
                 or self.session.current_speech is not None
                 or self.session.user_state == "speaking"):
             return  # a turn landed, a reply is under way, or they are talking again
+        if self._reasks >= _MAX_REASKS:
+            # The re-asks are spent and they are still not coming through. Say
+            # so, promise the callback, put it on the record, and end the call —
+            # observed live: the cap was reached and the agent sat mute for forty
+            # seconds until the caller gave up.
+            logger.info("UNHEARD → still nothing after %d re-asks; telling the caller a "
+                        "rep will call back and ending the call", _MAX_REASKS)
+            await self._say_clip(self._hearing_trouble, HEARING_TROUBLE_LINE)
+            await asyncio.to_thread(self.brain.give_up_unheard, HEARING_TROUBLE_LINE)
+            await self._hang_up()
+            return
         self._reasks += 1
         logger.info("UNHEARD → the caller spoke but no turn arrived in %.1fs; the "
                     "recogniser's last output since the previous turn was %r; asking "
                     "them to repeat (%d of %d)", _settings.unheard_reask_delay,
                     self._last_stt, self._reasks, _MAX_REASKS)
         await asyncio.to_thread(self.brain.note_unheard)
+        await self._say_clip(self._reask, REASK_LINE)
+        self._arm_idle_watch()
+
+    async def _say_clip(self, clip: Clip | None, text: str) -> None:
+        """A pre-rendered line, or the same words through the voice when the clip
+        is missing. Never part of the dialogue record; never raises."""
         try:
-            if self._reask is not None:
-                text, pcm, rate = self._reask
+            if clip is not None:
+                _text, pcm, rate = clip
                 await self.session.say(text, audio=_pcm_frames(pcm, rate),
                                        add_to_chat_ctx=False)
             else:
-                await self.session.say(REASK_LINE, add_to_chat_ctx=False)
+                await self.session.say(text, add_to_chat_ctx=False)
         except RuntimeError:
             pass                           # session closing
+
+    # -- a caller who has gone quiet ---------------------------------------- #
+    def _arm_idle_watch(self) -> None:
+        """Start the clock on the caller's next words. Armed whenever the agent
+        has just finished speaking and is waiting; cancelled the moment the VAD
+        hears them."""
+        self._cancel_idle_watch()
+        if _settings.idle_prompt_seconds <= 0 or self.brain.state.value == "done":
+            return
+        self._idle_task = asyncio.create_task(self._idle_watch(self._turn_seq))
+
+    def _cancel_idle_watch(self) -> None:
+        if self._idle_task is not None and not self._idle_task.done():
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    def _caller_is_back(self, seq: int) -> bool:
+        return (self._turn_seq != seq or self._turn_in_flight
+                or self.session.current_speech is not None
+                or self.session.user_state == "speaking")
+
+    async def _idle_watch(self, seq: int) -> None:
+        """"You still there?" after the first silence; goodbye after the second.
+
+        A real caller who set the phone down, walked off or lost the line
+        otherwise holds the call open indefinitely — every minute billed, and a
+        desk that never noticed. Both lines are pre-rendered and stay out of the
+        dialogue; the close is recorded as abandoned.
+        """
+        try:
+            await asyncio.sleep(_settings.idle_prompt_seconds)
+            if self._caller_is_back(seq):
+                return
+            logger.info("IDLE → nothing from the caller for %.0fs; asking if they're there",
+                        _settings.idle_prompt_seconds)
+            await self._say_clip(self._still_there, STILL_THERE_LINE)
+            await asyncio.sleep(_settings.idle_close_seconds)
+            if self._caller_is_back(seq):
+                return
+            logger.info("IDLE → still nothing after the prompt; closing the call")
+            await self._say_clip(self._idle_close, IDLE_CLOSE_LINE)
+            await asyncio.to_thread(self.brain.close_idle, IDLE_CLOSE_LINE)
+            await self._hang_up()
+        except asyncio.CancelledError:
+            return
+
+    # -- ending the call ---------------------------------------------------- #
+    async def _hang_up(self) -> None:
+        """End the call once the closing line has been heard.
+
+        A desk hangs up after "have a good one". Until this existed the agent
+        said goodbye and the line stayed open — the caller left wondering, the
+        minutes still billing — and a handoff the trunk cannot perform ended in
+        the same open silence. Deleting the room drops the SIP leg; the job's
+        shutdown then finalizes the record and the recording as for any hang-up.
+        """
+        if self._hung_up or self._ctx is None or _settings.hangup_after_close_seconds <= 0:
+            return
+        self._hung_up = True
+        self._cancel_idle_watch()
+        self._cancel_unheard_watch()
+        await asyncio.sleep(_settings.hangup_after_close_seconds)
+        outcome = self.brain.outcome.value if self.brain.outcome else "open"
+        logger.info("HANGUP → the call is finished (%s); ending the room", outcome)
+        try:
+            await self._ctx.delete_room()
+        except Exception as exc:  # noqa: BLE001 - the caller can still hang up themselves
+            logger.warning("could not end the room: %s", exc)
+
+    async def _follow_on(self) -> None:
+        """The second half of the agent's turn, spoken with no caller turn in
+        between — the load's requirements right after the load. See
+        `CarrierSalesAgent.continue_turn`."""
+        if not self.brain.pending_followup:
+            return
+        more = await asyncio.to_thread(self.brain.continue_turn)
+        if not more:
+            return
+        logger.info("AGENT reply (continued) → %s", more)
+        try:
+            speech = self.session.say(more)
+            await speech
+            if getattr(speech, "interrupted", False):
+                logger.info("PLAYBACK CUT by caller → %s", more)
+                await asyncio.to_thread(self.brain.note_playback_cut, more)
+        except RuntimeError as e:
+            logger.info("Could not speak (session closing): %s", e)
 
     def _next_filler(self) -> Clip:
         """A filler that isn't the one just used — the same 'one sec' twice in a
@@ -923,6 +1091,7 @@ class CarrierAgent(Agent):
         if getattr(speech, "interrupted", False):
             logger.info("PLAYBACK CUT by caller → %s", greeting)
             await asyncio.to_thread(self.brain.note_playback_cut, greeting)
+        self._arm_idle_watch()
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (getattr(new_message, "text_content", None) or "").strip()
@@ -938,6 +1107,7 @@ class CarrierAgent(Agent):
         self._turn_seq += 1
         self._last_stt = None
         self._cancel_unheard_watch()
+        self._cancel_idle_watch()
         self._turn_in_flight = True
         try:
             reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
@@ -969,10 +1139,15 @@ class CarrierAgent(Agent):
                     await asyncio.to_thread(self.brain.note_playback_cut, reply)
                 # "Transferring you to X" has been said; now put them through.
                 await self._transfer_if_pending()
+                await self._follow_on()
             except RuntimeError as e:  # e.g. caller hung up mid-turn
                 logger.info("Could not speak (session closing): %s", e)
         finally:
             self._turn_in_flight = False
+        if self.brain.state.value == "done":
+            await self._hang_up()
+        else:
+            self._arm_idle_watch()
         raise StopResponse()   # we answered this turn ourselves; skip the LLM node
 
 
@@ -1056,7 +1231,15 @@ async def entrypoint(ctx: JobContext):
         # The freight vocabulary, applied wherever the recogniser takes a term
         # list. Only offered on the Inference path: the batch Whisper plugin has
         # no such capability and the framework would only log that it skipped it.
-        session_kwargs["stt_context_options"] = {"keyterms": _stt_keyterms(_settings)}
+        # `forward_chat_context` OFF: for models that take it (u3-rt-pro), the
+        # framework would push every agent reply to the recogniser as context the
+        # moment it is spoken — a mid-call settings update the plugin itself warns
+        # "may reconnect upstream", i.e. a deaf moment right where the caller's
+        # answer lands. Recognition was measured without it; turn it on only with
+        # a feed dump in hand to prove nothing is lost.
+        session_kwargs["stt_context_options"] = {
+            "keyterms": ud.get("keyterms") or _stt_keyterms(_settings),
+            "forward_chat_context": False}
     session = AgentSession(
         vad=ud["vad"],
         stt=ud["stt"],
@@ -1067,7 +1250,11 @@ async def entrypoint(ctx: JobContext):
     session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
                          fillers=ud.get("fillers"), greeting=ud.get("greeting"),
-                         reask=ud.get("reask"), ctx=ctx)
+                         reask=ud.get("reask"), ctx=ctx,
+                         hearing_trouble=ud.get("hearing_trouble"),
+                         still_there=ud.get("still_there"),
+                         idle_close=ud.get("idle_close"))
+    _CALL_ID.set(agent.brain.call_id)
     session.on("user_input_transcribed", agent.on_user_input_transcribed)
     session.on("user_state_changed", agent.on_user_state_changed)
 

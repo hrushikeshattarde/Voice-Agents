@@ -215,6 +215,18 @@ _WANTS_PERSON_RE = re.compile(
     r"(?:a|the|your|sales) rep\b|representative|real person|"
     r"(?:a|the) person\b|human|agent please|manager|someone else)"
 )
+# A caller who reached carrier sales with something that is not carrier sales:
+# an invoice, a payment, a claim, tracking on a load they are already hauling.
+# Asking them for a load number three times and closing is how a desk loses a
+# carrier who only wanted to be pointed at the right person. Checked only before
+# a load is engaged — mid-negotiation, "detention" is a question, not a topic.
+_OFF_TOPIC_RE = re.compile(
+    r"\b(?:invoic(?:e|ing)|billing|accounts? payable|payment (?:status|on)|"
+    r"get(?:ting)? paid|paid yet|factoring|quick ?pay|claims?\b|check call|"
+    r"tracking|already (?:booked|dispatched|hauling|loaded)|my dispatcher|"
+    r"reschedul|detention (?:pay|check)|lumper (?:fee|receipt|check)|"
+    r"rate con(?:firmation)? (?:for|on))"
+)
 # The carrier calls their number their best. A rep stops asking at that point and
 # either closes it or lets it go — pressing a fourth time just burns the call.
 # Deliberately narrow: "final" and "firm" only count when they're attached to the
@@ -523,6 +535,13 @@ class CarrierSalesAgent:
         # (a SIP transfer) once the handoff line has been spoken. None means the
         # caller was promised a callback instead — see `_transfer_and_say`.
         self.pending_transfer: Rep | None = None
+        # Set when the agent's turn has a second half it speaks on its own, with
+        # no caller turn in between — the load's requirements right after the
+        # load itself. See `continue_turn`.
+        self.pending_followup = False
+        self._empty_state_only: str | None = None  # "Indiana": a state, not a place
+        self._empty_place: str | None = None       # the table's name for where they are
+        self._asked_state = False                  # one "which state?" per call
         self._levers_used = 0                    # non-price pitches already spent
         self._empty_location: str | None = None  # where their truck frees up
         self._empty_when: str | None = None      # and when
@@ -840,6 +859,10 @@ class CarrierSalesAgent:
                 # says is free, or a callback. Never talk them out of it.
                 self._note("Caller asked to be transferred to a rep.")
                 return self._transfer_and_say(reason="carrier_request")
+            if self.load is None and _OFF_TOPIC_RE.search(user_text.lower()):
+                self._note(f"Caller's request is not carrier sales ({user_text.strip()!r}) "
+                           "— routed to a person for a callback.")
+                return self._transfer_and_say(reason="not_carrier_sales")
             return handler(user_text)
         except SourceUnavailable as exc:
             # The board, the carrier file or the contact list is unreachable. Not
@@ -1271,7 +1294,8 @@ class CarrierSalesAgent:
                 f"{list(result.risk_flags)} — routed to a rep, no rate discussed."
             )
             resolution = self._transfer(reason="verification_review")
-            if resolution.rep is None or self.pending_transfer is None:
+            if (resolution.rep is None or self.pending_transfer is None
+                    or not self._settings.sip_transfer_enabled):
                 # Nobody in the rep directory is free (or the directory is empty):
                 # promising to put them through to someone would be a lie followed
                 # by silence. A callback is the honest version.
@@ -1310,16 +1334,66 @@ class CarrierSalesAgent:
         callers routinely give one — so we follow up on the half we missed rather
         than re-asking the whole question."""
         self._empty_raw.append(text.strip())
-        self._empty_location = self._empty_location or parsing.extract_empty_location(text)
+        heard_place = parsing.extract_empty_location(text)
+        if (self._empty_location and heard_place and geo.state_only(heard_place)
+                and not geo._split(self._empty_location)[1]):
+            # "Which state?" has just been answered: pin it to the city they gave.
+            self._empty_location = f"{self._empty_location}, {heard_place}"
+        else:
+            self._empty_location = self._empty_location or heard_place
         self._empty_when = self._empty_when or parsing.extract_empty_when(text)
+        if self._empty_location and (state := geo.state_only(self._empty_location)):
+            # "Indiana at 10 am" — a state is not somewhere a truck can be empty.
+            # Observed live when the recogniser dropped "Fort Wayne" off the front.
+            self._empty_state_only = state
+            self._empty_location = None
+        elif (self._empty_location and self._empty_state_only
+                and not geo._split(self._empty_location)[1]):
+            # The city arrived on its own after the state did: put them together.
+            self._empty_location = f"{self._empty_location}, {self._empty_state_only}"
+        if self._empty_location and not self._empty_place:
+            # Pin the place on the map now, steered by the pickup: "Columbia City"
+            # on a Fort Wayne load is the Indiana town, not the Washington one.
+            # The table's own name is what gets read back and written down.
+            near = None
+            if (self.load is not None and self.load.origin_lat is not None
+                    and self.load.origin_lon is not None):
+                near = (self.load.origin_lat, self.load.origin_lon)
+            placed = geo.locate(self._empty_location, near=near)
+            if placed is not None:
+                self._empty_place = placed.label
+            elif (not geo._split(self._empty_location)[1] and not self._asked_state
+                    and self._empty_followups < 2):
+                # A city with no state that the table cannot place: one question
+                # settles it, and the rep's note gets a location worth having.
+                self._asked_state = True
+                self._empty_followups += 1
+                return self._say(
+                    f"They said the truck empties in {self._empty_location}, and you're "
+                    "not sure which state that is. Ask which state — one short question, "
+                    "no guessing at it yourself. Nothing about the load or the rate yet.",
+                    amounts=set(),
+                )
 
         if self._empty_followups < 2 and not (self._empty_location and self._empty_when):
             self._empty_followups += 1
+            if self._empty_state_only and not self._empty_location:
+                return self._say(
+                    f"They named only the state — {self._empty_state_only} — not the "
+                    f"city. Ask which city in {self._empty_state_only} the truck is "
+                    "getting empty in"
+                    + ("" if self._empty_when else ", and when")
+                    + ". Do not repeat the state back as if it were an answer. Nothing "
+                    "about the load or the rate yet.",
+                    amounts=set(),
+                )
             if self._empty_location:
                 return self._say(
                     "They told you WHERE the truck empties but not WHEN. Acknowledge the "
                     "place in two or three words and ask when it's going to be empty. Do "
                     "not ask where again. Nothing about the load or the rate yet.",
+                    facts=(f"Their truck empties in: {self._empty_place}"
+                           if self._empty_place else ""),
                     amounts=set(),
                 )
             if self._empty_when:
@@ -1338,18 +1412,21 @@ class CarrierSalesAgent:
 
         self._note(
             f"Empty call for {self.load.load_id}: "
-            f"where={self._empty_location or 'NOT CAPTURED'}, "
-            f"when={self._empty_when or 'NOT CAPTURED'} "
-            f"(raw: {' | '.join(self._empty_raw)!r})",
+            f"where={self._empty_place or self._empty_location or 'NOT CAPTURED'}, "
+            f"when={self._empty_when or 'NOT CAPTURED'}"
+            + (f", deadhead to the pickup {deadhead}"
+               if (deadhead := self._deadhead_phrase()) else "")
+            + f" (raw: {' | '.join(self._empty_raw)!r})",
         )
         return self._reveal_load()
 
     def _empty_summary(self) -> str:
         """What we know about their truck, for the phrasing context."""
-        if self._empty_location and self._empty_when:
-            return f"Their truck is empty in {self._empty_location} {self._empty_when}."
-        if self._empty_location:
-            return f"Their truck is empty in {self._empty_location}."
+        where = self._empty_place or self._empty_location
+        if where and self._empty_when:
+            return f"Their truck is empty in {where} {self._empty_when}."
+        if where:
+            return f"Their truck is empty in {where}."
         if self._empty_when:
             return f"Their truck is empty {self._empty_when}."
         return ""
@@ -1360,6 +1437,12 @@ class CarrierSalesAgent:
         self._load_revealed = True       # from here the composer may quote the load
         if self.load.notes:
             self.state = CallState.CHECK_REQUIREMENTS
+            # The requirements follow as the agent's OWN next turn (`continue_turn`),
+            # not after a caller acknowledgement: the "sure" that pause invites is
+            # short, quiet and right after a long read-out — the exact profile the
+            # recogniser loses — and it cost a re-ask on every live call that got
+            # this far, with one "sure" heard as "Sheila".
+            self.pending_followup = True
             return self._say(
                 "Give them the load, SHORT — the way a rep rattles it off, not the way a "
                 "screen lists it. THREE SENTENCES AT MOST, and under about twelve seconds "
@@ -1440,8 +1523,15 @@ class CarrierSalesAgent:
         # what keeps either turn short enough to follow: read together they ran to
         # 25 seconds of speech and hit the token limit mid-sentence.
         if not self._requirements_read:
-            self._requirements_read = True
-            return self._say(
+            return self._read_requirements()
+        return self._after_requirements(text)
+
+    def _read_requirements(self) -> str:
+        """The load's requirements, read out and asked about — kept as its own
+        turn (with the pitch, it ran to 25 seconds and hit the token limit)."""
+        self._requirements_read = True
+        self.pending_followup = False
+        return self._say(
                 "Now cover this load's requirements from FACTS and ask outright whether "
                 "they can do it. TWO SENTENCES, then the question.\n"
                 "SAY every CONDITION THEY HAVE TO MEET — the trailer spec, tracking, "
@@ -1462,6 +1552,7 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
 
+    def _after_requirements(self, text: str) -> str:
         # Neither a yes nor a no. Historically this counted as agreement, which is
         # how "Hello." ended up on the record as a carrier confirming a food-grade
         # trailer. Consent has to be given, not merely not-withheld.
@@ -1761,6 +1852,15 @@ class CarrierSalesAgent:
         # long call a rep may have added the address while we were talking.
         on_file = self._repo.carrier_emails(self.carrier.usdot_number)
 
+        if not spoken or spoken.strip().lower() not in on_file:
+            # An address SAID rather than typed rarely survives the recogniser
+            # intact ("Dispatch, circle delivers.com"). Match it by sound against
+            # the account's own addresses — the gate is unchanged, since only an
+            # address already on the account can come back from this.
+            by_sound = parsing.match_spoken_email(text, on_file)
+            if by_sound:
+                return self._book_rate_con(
+                    by_sound, "matched the carrier's account by sound", text)
         if spoken:
             if spoken.strip().lower() in on_file:
                 return self._book_rate_con(
@@ -1962,9 +2062,22 @@ class CarrierSalesAgent:
 
     def _transfer_and_say(self, reason: str) -> str:
         resolution = self._transfer(reason)
-        # "Putting you through to X" is only true when X can be dialled. Every
-        # branch below says callback instead when they cannot.
-        can_dial = self.pending_transfer is not None
+        # "Putting you through to X" is only true when X can be dialled — a rep
+        # with a number AND a trunk that moves the call (SIP_TRANSFER_ENABLED).
+        # Every branch below says callback instead when they cannot; the worker
+        # still records the transfer as not performed, naming the rep.
+        can_dial = self.pending_transfer is not None and self._settings.sip_transfer_enabled
+        if reason == "not_carrier_sales":
+            # Wrong desk, not a wrong caller. No load, no number, no verdict: the
+            # right person rings them back about what they actually asked.
+            return self._say(
+                "What they're asking about isn't something carrier sales handles — "
+                "invoices, payments, claims, tracking and the like sit with another "
+                "desk. Tell them plainly that you'll have the right person call them "
+                "back about it, and close warmly. Two short sentences. Do NOT ask for a "
+                "load number, do NOT ask for an MC, and name no dollar figure.",
+                amounts=set(),
+            )
         if reason == "above_agent_authority":
             # Don't hand the carrier a "no" — hand them to someone who can say yes.
             who = resolution.rep.name if (resolution.rep and can_dial) else None
@@ -2099,6 +2212,43 @@ class CarrierSalesAgent:
             # rep is the worker's to report — see `note_transfer_result`.
             self._repo.log_transfer(self.call_id, rep_id, "requested")
 
+    def continue_turn(self) -> str | None:
+        """The second half of a turn the agent finishes on its own.
+
+        The worker calls this after the reply has been spoken. Today it carries
+        exactly one thing: the load's requirements straight after the load, with
+        no caller acknowledgement in between (see `_reveal_load`). None when
+        there is nothing to add.
+        """
+        if not self.pending_followup:
+            return None
+        self.pending_followup = False
+        if self.state is CallState.CHECK_REQUIREMENTS and not self._requirements_read:
+            return self._read_requirements()
+        return None
+
+    def give_up_unheard(self, spoken: str) -> None:
+        """The line could be heard but nothing said on it could be transcribed,
+        re-ask after re-ask. The worker has told the caller a rep will ring back;
+        this puts that on the record as a callback, with the number."""
+        self.transcript.append(("agent", spoken))
+        self._note("Caller could be heard speaking but nothing they said could be "
+                   "transcribed, repeatedly — told them a rep will call back. CALLBACK "
+                   f"NEEDED at {self.caller_number or 'the number on the call record'}.")
+        if self.state is not CallState.DONE:
+            self._finish(CallOutcome.TRANSFERRED)
+        self._sync_transcript()
+
+    def close_idle(self, spoken: str) -> None:
+        """Nothing from the caller after the agent's question, prompt included —
+        the worker has said goodbye; record the call as abandoned."""
+        self.transcript.append(("agent", spoken))
+        self._note("Caller went quiet after the agent's question — asked once whether "
+                   "they were still there, heard nothing, and closed the call.")
+        if self.state is not CallState.DONE:
+            self._finish(CallOutcome.ABANDONED)
+        self._sync_transcript()
+
     def note_unheard(self) -> None:
         """The caller spoke and nothing was transcribed; the worker asked them to
         say it again. Recorded so a reviewer reading a transcript with an odd
@@ -2167,6 +2317,8 @@ class CarrierSalesAgent:
         empty = self._empty_summary()
         if empty:
             lines.append(f"Truck: {empty}")
+            if (deadhead := self._deadhead_phrase()):
+                lines.append(f"Deadhead to the pickup: {deadhead} (estimate)")
         offers = self._repo.offers_for_call(self.call_id)
         if offers:
             trail = " -> ".join(f"{'Alex' if party == 'agent' else 'carrier'} ${int(amount)}"

@@ -400,7 +400,7 @@ def test_the_truck_becomes_standing_context_for_later_turns(repo):
     a = _to_rate(repo)
     a.handle("I need 2500")
     facts = " ".join(t["facts"] for t in a._composer.turns)
-    assert "Dallas, Texas" in facts
+    assert "Dallas, TX" in facts                 # the table's own name for the place
     # And the discovery probe knows not to ask where they're coming out of.
     assert "do NOT ask where they're coming out of" in \
         a._composer.turns[-1]["directive"]

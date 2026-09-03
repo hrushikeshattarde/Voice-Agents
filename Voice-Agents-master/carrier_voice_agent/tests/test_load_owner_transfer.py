@@ -82,8 +82,10 @@ def test_an_unreadable_user_costs_the_named_handoff_not_the_call(repo):
     assert repository(fake, repo).get_rep("4507") is None
 
 
-def _tp_agent(fake, repo) -> CarrierSalesAgent:
-    settings = tp_settings()
+def _tp_agent(fake, repo, **overrides) -> CarrierSalesAgent:
+    # The trunk moves calls in these tests: the wording under test is the one a
+    # caller hears when the transfer is actually going to happen.
+    settings = tp_settings().model_copy(update={"sip_transfer_enabled": True, **overrides})
     return CarrierSalesAgent(repository(fake, repo), StubComposer(), settings)
 
 
