@@ -536,10 +536,53 @@ def prerender_clips(settings: Settings, texts: list[str], live_tts: lk_tts.TTS) 
 
 
 # --------------------------------------------------------------------------- #
+# How many calls at once
+# --------------------------------------------------------------------------- #
+def call_load(active_calls: int, max_calls: int) -> float:
+    """This worker's load as LiveKit understands it: 0.0 idle, 1.0 full.
+
+    The framework's default is CPU use, which says nothing until the calls are
+    already suffering. Calls in progress over the cap is the number a desk would
+    actually set — "four lines" — and it lets LiveKit send the fifth caller to
+    another worker (or, with none, leave the call unanswered rather than let it
+    degrade the four in progress).
+    """
+    if max_calls <= 0:
+        return 0.0
+    return min(1.0, active_calls / max_calls)
+
+
+def full_threshold(max_calls: int) -> float:
+    """The load at which the worker is full: half a call short of the cap, so
+    `max_calls` calls read as full and one fewer as still available."""
+    return 1.0 - 0.5 / max(1, max_calls)
+
+
+_was_full = False
+
+
+def _report_call_load(server) -> float:
+    global _was_full
+    active = len(getattr(server, "active_jobs", ()))
+    load = call_load(active, _settings.max_concurrent_calls)
+    full = load >= full_threshold(_settings.max_concurrent_calls)
+    if full != _was_full:
+        _was_full = full
+        if full:
+            logger.warning("worker FULL: %d of %d calls in progress — LiveKit will route new "
+                           "callers elsewhere until one ends", active,
+                           _settings.max_concurrent_calls)
+        else:
+            logger.info("worker taking calls again: %d of %d in progress", active,
+                        _settings.max_concurrent_calls)
+    return load
+
+
+# --------------------------------------------------------------------------- #
 # Call recording
 # --------------------------------------------------------------------------- #
 def save_call_recording(session_dir: Path, call_id: str,
-                        db_path: str | Path) -> Path | None:
+                        db_path: str | Path, *, warn: bool = True) -> Path | None:
     """Copy the session recorder's finished file out of the job's temp dir.
 
     livekit-agents records to `<session_dir>/audio.ogg` and DELETES that whole
@@ -548,10 +591,29 @@ def save_call_recording(session_dir: Path, call_id: str,
     framework guarantees is after the recorder finalized the file and before
     the temp dir is removed. Best-effort like everything else in shutdown: a
     failed copy costs the replay, never the audit trail.
+
+    Observed live: with two calls in one worker process, the second call's
+    recording was not saved and nothing was logged, because a missing file
+    returned None in silence. Now any `.ogg` in the directory is taken, and a
+    directory with none is logged with its contents, so the next occurrence is
+    diagnosable. `warn=False` for the retries that precede the final attempt.
     """
-    source = Path(session_dir) / "audio.ogg"
+    folder = Path(session_dir)
+    source = folder / "audio.ogg"
     if not source.is_file():
-        return None
+        candidates = sorted(folder.glob("*.ogg"), key=lambda p: p.stat().st_mtime) \
+            if folder.is_dir() else []
+        if candidates:
+            source = candidates[-1]
+            logger.info("recording for call %s found as %s rather than audio.ogg",
+                        call_id, source.name)
+        else:
+            if warn:
+                contents = sorted(p.name for p in folder.iterdir()) if folder.is_dir() else "no dir"
+                logger.warning("no recording file for call %s in %s (contents: %s) — the "
+                               "recorder had not written one when the job shut down",
+                               call_id, folder, contents)
+            return None
     try:
         dest_dir = Path(db_path).parent / "call_recordings"
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1271,9 +1333,16 @@ async def entrypoint(ctx: JobContext):
         except Exception:  # noqa: BLE001 - shutdown must never raise
             logger.exception("could not finalize call %s", agent.brain.call_id)
         if _settings.record_calls:
-            saved = await asyncio.to_thread(
-                save_call_recording, ctx.session_directory,
-                agent.brain.call_id, _settings.db_path)
+            # The recorder closes its file on its own thread; give it a moment
+            # before concluding there is nothing to copy.
+            saved = None
+            for attempt in range(4):
+                saved = await asyncio.to_thread(
+                    save_call_recording, ctx.session_directory,
+                    agent.brain.call_id, _settings.db_path, warn=(attempt == 3))
+                if saved:
+                    break
+                await asyncio.sleep(0.5)
             if saved:
                 logger.info("call %s recording saved: %s", agent.brain.call_id, saved)
 
@@ -1311,9 +1380,19 @@ def main() -> None:
             f"{_settings.llm_key_name}. Set it in .env, switch provider, or set "
             "USE_LLM=false to drive the flow with the offline stub."
         )
+    capacity: dict[str, Any] = {}
+    if _settings.max_concurrent_calls > 0:
+        # The worker's "load" is calls in progress over the cap, and it is full
+        # at the cap — see `call_load`. Passed as plain numbers so it applies in
+        # dev mode too, where the framework's own threshold is infinite.
+        capacity = {"load_fnc": _report_call_load,
+                    "load_threshold": full_threshold(_settings.max_concurrent_calls)}
+        logger.info("capacity: up to %d calls at once on this machine",
+                    _settings.max_concurrent_calls)
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         prewarm_fnc=prewarm,
+        **capacity,
         # Keep one process warm from boot. The dev-mode default is ZERO, which
         # made the first caller pay the whole cold start — Transport Pro auth,
         # the VAD model, TTS warmup — as 8-15 seconds of ringing into silence.

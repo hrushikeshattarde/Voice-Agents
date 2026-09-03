@@ -456,6 +456,14 @@ class Settings(BaseSettings):
     stt_region_keyterms_miles: float = Field(
         default=150.0, validation_alias="STT_REGION_KEYTERMS_MILES")
     stt_region_keyterms_max: int = Field(default=60, validation_alias="STT_REGION_KEYTERMS_MAX")
+    # How many calls this worker takes at once. Each call runs its own voice
+    # detector, noise cancellation and audio encoding, and on Windows every call
+    # shares one Python process, so a fifth caller degrades the first four rather
+    # than waiting. At the cap the worker tells LiveKit it is full and new calls
+    # are routed elsewhere (or ring unanswered if there is no other worker —
+    # honest, and visible). 0 hands the decision back to the framework's CPU
+    # measure, which in dev mode means no limit at all.
+    max_concurrent_calls: int = Field(default=4, validation_alias="MAX_CONCURRENT_CALLS")
 
     # VAD: how confidently (threshold) and how long (seconds) someone must speak
     # before it counts as speech at all. The Silero defaults (0.5 / 0.05s) are
