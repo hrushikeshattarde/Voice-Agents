@@ -588,6 +588,14 @@ class CarrierSalesAgent:
         # The leak check reads the directive and FACTS only — never the dialogue,
         # or the model could recycle an old number as if it were a fresh offer.
         source = f"{directive} {facts}"
+        if (amounts == set() and self.state is CallState.IDENTIFY_LOAD
+                and self.transcript and self.transcript[-1][0] == "carrier"):
+            # No money is in play while a load is being identified, and the
+            # figures in the air are the caller's own digits. Reading them back
+            # ("I got 256 4177 — is that the whole number?") is what a rep does
+            # with a half-heard number, not an invented rate. Observed live: the
+            # guard rejected exactly that three times and the call was handed off.
+            source = f"{source} {self.transcript[-1][1]}"
         speakable = _speakable(amounts)
         correction = ""
 
@@ -632,8 +640,8 @@ class CarrierSalesAgent:
                 self.transcript.append(("agent", spoken))
                 return spoken
             why = breach
-            logger.warning("rejected composed turn in state %s — %s",
-                           self.state.value, breach)
+            logger.warning("rejected composed turn in state %s — %s | it said: %r",
+                           self.state.value, breach, spoken[:200])
             correction = breach
 
         return self._cannot_compose(why)

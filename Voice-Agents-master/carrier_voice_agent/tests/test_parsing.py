@@ -254,3 +254,14 @@ def test_one_figure_gets_exactly_one_reading():
     # A genuine bare abbreviation is still caught: "the 26" is not $2600, and the
     # voice would say "twenty-six".
     assert 26 in _numbers("what's driving the 26 on this one?")
+
+
+def test_a_load_number_paused_in_the_middle_is_one_number():
+    """"Two five six … four one seven seven" reaches the agent as two transcripts
+    joined by a sentence break — "256. 4177." — and that is one seven-digit load,
+    not a four-digit fragment. Commas still keep figures apart (weights)."""
+    assert parsing.extract_load_id("256. 4177.", numeric=True) == "2564177"
+    assert parsing.extract_load_id("load 256. 4177", numeric=True) == "2564177"
+    # Two separate numbers do not get glued into an eleven-digit one.
+    assert parsing.extract_load_id("2563425. 4177.", numeric=True) == "2563425"
+    assert parsing.extract_load_id("about 42,000 lbs", numeric=True) is None

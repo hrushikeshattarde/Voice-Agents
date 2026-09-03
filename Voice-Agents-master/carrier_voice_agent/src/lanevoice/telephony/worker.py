@@ -716,15 +716,43 @@ class CarrierAgent(Agent):
         STT_COMFORT_NOISE_DBFS=0 turns it off.
         """
         dbfs = _settings.stt_comfort_noise_dbfs
-        if dbfs >= 0:
-            source = audio
-        else:
-            async def dithered():
-                rng = np.random.default_rng()
-                async for frame in audio:
-                    yield with_comfort_noise(frame, rng, dbfs)
-            source = dithered()
-        async for event in Agent.default.stt_node(self, source, model_settings):
+        logger.info("STT feed: comfort noise %s", f"{dbfs:.0f} dBFS" if dbfs < 0 else "off")
+
+        async def probed():
+            # What the recogniser was HANDED while the VAD heard the caller. A
+            # transcript missing its first words with a healthy peak here means
+            # the recogniser dropped them; digital-zero frames here mean the
+            # framework substituted silence before this point. Observed live:
+            # "Can you transfer me to a person?" whole in the recording, "To a
+            # person." from the recogniser, 1.5s after the agent stopped talking.
+            rng = np.random.default_rng()
+            speaking = False
+            frames = zeros = 0
+            peak = 0
+            seconds = 0.0
+            async for frame in audio:
+                try:
+                    now_speaking = self.session.user_state == "speaking"
+                except RuntimeError:          # no session yet
+                    now_speaking = False
+                if now_speaking:
+                    if not speaking:
+                        speaking, frames, zeros, peak, seconds = True, 0, 0, 0, 0.0
+                    samples = np.frombuffer(frame.data, dtype=np.int16)
+                    top = int(np.abs(samples).max()) if samples.size else 0
+                    frames += 1
+                    seconds += frame.duration
+                    zeros += top == 0
+                    peak = max(peak, top)
+                elif speaking:
+                    speaking = False
+                    logger.info("STT feed during caller speech → %.1fs of audio, peak %s, "
+                                "%d of %d frames digital zero", seconds,
+                                f"{20 * np.log10(peak / 32767):.0f} dBFS" if peak else "silence",
+                                zeros, frames)
+                yield with_comfort_noise(frame, rng, dbfs) if dbfs < 0 else frame
+
+        async for event in Agent.default.stt_node(self, probed(), model_settings):
             yield event
 
     async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings):

@@ -56,3 +56,31 @@ def test_comfort_noise_is_a_whisper_under_the_speech():
 def test_the_clock_fallback_does_not_invent_times():
     assert parsing.extract_empty_when("I'm in Lexington") is None
     assert parsing.extract_empty_when("about 42,000 pounds") is None
+
+
+class _ReadsBackWhatItHeard:
+    """A composer that does what a rep does with half a number: says it back."""
+
+    def __init__(self):
+        self.turns: list[dict] = []
+
+    def compose(self, directive, facts="", dialogue="", speakable="", correction=""):
+        self.turns.append({"directive": directive, "correction": correction})
+        if "4177" not in str(dialogue):
+            return "Circle Logistics, this is Alex, what can I help you with?"
+        return "I got 4177 there — is that the whole number?"
+
+
+def test_reading_back_the_callers_own_digits_is_not_a_money_leak(repo):
+    """A caller gave a fragment ("4177"), the model read it back, and the reply
+    guard rejected the read-back as money the turn was not given — three times,
+    then handed the call off. The caller's own figures are not invented rates
+    while a load is being identified."""
+    settings = get_settings().model_copy(update={"numeric_load_ids": True})
+    composer = _ReadsBackWhatItHeard()
+    agent = CarrierSalesAgent(repo, composer, settings=settings)
+    agent.greeting()
+    agent.handle("it's 4177")
+    assert agent.outcome is None                          # not handed off
+    assert composer.turns[-1]["correction"] == ""         # accepted first time
+    assert agent.state.value == "identify_load"

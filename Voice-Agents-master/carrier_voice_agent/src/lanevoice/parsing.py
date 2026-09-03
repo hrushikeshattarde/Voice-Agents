@@ -108,8 +108,12 @@ def extract_load_id(text: str, *, numeric: bool = False) -> str | None:
         # figures deliberately stay apart — "42,000 lbs" is a weight, and gluing
         # it would invent a five-digit load. Observed live: "255 6951" extracted
         # as nothing at all, and the agent asked for the number a caller had
-        # just given, twice.
-        for match in re.finditer(r"\d+(?:[ -]+\d+)+", spaced):
+        # just given, twice. A sentence break counts as a separator too: a caller
+        # who pauses inside the number ("two five six … four one seven seven")
+        # gets two transcripts from the streaming recogniser, and they arrive
+        # joined as "256. 4177." — observed live, extracted as nothing, and the
+        # call ended in a handoff over a number that had been said perfectly.
+        for match in re.finditer(r"\d+(?:(?:[ -]+|\.\s+)\d+)+", spaced):
             digits = re.sub(r"\D", "", match.group())
             if 5 <= len(digits) <= 9 and not _labelled_as_carrier_id(
                     spaced, match.start()):
