@@ -2272,6 +2272,11 @@ class CarrierSalesAgent:
             self.transcript,
             self.carrier.legal_name if self.carrier else None,
             self.carrier.mc_number if self.carrier else None,
+            # Same label/one-line reason as the note on the load — computed
+            # here, now that `outcome` and `_end_reason` are both set, so the
+            # dashboard can show why a call ended without opening it.
+            self._call_label(),
+            self._call_summary_line(),
         )
         if rep_id and outcome == CallOutcome.TRANSFERRED:
             # Requested, not connected: whether the caller actually reached the
@@ -2363,17 +2368,18 @@ class CarrierSalesAgent:
             return "Carrier not qualified"
         return "Other"
 
-    def _call_summary_line(self, stage: str) -> str:
+    def _call_summary_line(self) -> str:
         """The one line of "why" under the label — see `_END_REASON_SUMMARIES`
-        for the wording rules. `stage` is what `_call_summary` already computed
-        for "Got as far as", reused here for the one case with no reason and no
-        note to fall back on: a caller who hung up before anything happened."""
+        for the wording rules. Self-contained (computes its own stage name) so
+        `_finish` can call it to persist the reason on the call row, not only
+        `_call_summary` building the note text."""
         if self.outcome == CallOutcome.BOOKED:
             return "Booking link sent — not confirmed until the carrier signs."
         if self._end_reason and self._end_reason in _END_REASON_SUMMARIES:
             return _END_REASON_SUMMARIES[self._end_reason]
         if self._end_summary_note:
             return self._end_summary_note[:200]
+        stage = _STAGE_NAMES.get(self._final_state or self.state, "the start of the call")
         return f"Caller hung up during {stage}."
 
     def _call_summary(self) -> str:
@@ -2432,7 +2438,7 @@ class CarrierSalesAgent:
                 if self._booking_link else
                 f"confirmation to {self._booking_email}"))
         lines.append(f"Callback: {who}" + (f" — {self.carrier.legal_name}" if self.carrier else ""))
-        lines.append(f"Summary: {self._call_summary_line(stage)}")
+        lines.append(f"Summary: {self._call_summary_line()}")
         return "\n".join(lines)[:_SUMMARY_MAX_CHARS]
 
     def _post_call_summary(self) -> None:

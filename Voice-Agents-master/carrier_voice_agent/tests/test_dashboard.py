@@ -84,6 +84,28 @@ def test_calls_list_row_shape(dash):
     assert row["duration_secs"] is not None
     # Driven straight through the agent, no session manager -> a phone call.
     assert row["source"] == "phone"
+    # Same label/reason as the note the load gets — set the moment `_finish`
+    # runs, so it is on the row even without a session manager to call
+    # `abandon()` afterward.
+    assert row["label"] == "Success"
+    assert row["reason"] == "Booking link sent — not confirmed until the carrier signs."
+
+
+def test_calls_can_be_filtered_by_the_reason_label(dash):
+    repo, queries = dash
+    booked = _drive(repo)                        # books L1001 — leave it for this one
+    declined = CarrierSalesAgent(repo, StubComposer(), settings=get_settings())
+    declined.greeting()
+    declined.handle("about L1002")                # a different, still-open load
+    declined.handle("MC 555444")                 # Dormant Transport — inactive
+    declined.handle("yeah, that's us")
+    assert declined.summary()["outcome"] == "rejected"
+
+    assert [r["call_id"] for r in queries.calls(label="Success")] == [booked.call_id]
+    reason = "Carrier not qualified"
+    assert [r["call_id"] for r in queries.calls(label=reason)] == [declined.call_id]
+    assert queries.calls(label="Rate too high") == []
+    assert {r["call_id"] for r in queries.calls()} == {booked.call_id, declined.call_id}
 
 
 def test_the_carrier_name_survives_without_a_local_carriers_table(dash):

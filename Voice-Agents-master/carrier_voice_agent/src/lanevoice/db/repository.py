@@ -260,12 +260,14 @@ class Repository:
 
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
                  outcome: str, transcript: list | str, carrier_name: str | None = None,
-                 carrier_mc: str | None = None) -> None:
+                 carrier_mc: str | None = None, end_label: str | None = None,
+                 end_reason: str | None = None) -> None:
         payload = transcript if isinstance(transcript, str) else json.dumps(transcript)
         self._execute(
             "UPDATE calls SET load_id=?, carrier_dot=?, end_time=?, outcome=?, transcript=?,"
-            " carrier_name=?, carrier_mc=? WHERE call_id=?",
-            (load_id, carrier_dot, _now(), outcome, payload, carrier_name, carrier_mc, call_id),
+            " carrier_name=?, carrier_mc=?, end_label=?, end_reason=? WHERE call_id=?",
+            (load_id, carrier_dot, _now(), outcome, payload, carrier_name, carrier_mc,
+             end_label, end_reason, call_id),
         )
 
     def set_caller_number(self, call_id: str, number: str) -> None:

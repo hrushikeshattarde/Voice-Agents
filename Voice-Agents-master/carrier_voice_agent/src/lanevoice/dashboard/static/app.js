@@ -97,6 +97,10 @@ const OUTCOME_META = {
   incomplete:  { label: "Incomplete",  color: "var(--s-none)" },
 };
 const outcomeKey = (o) => o || "incomplete";
+/* The exact set `CarrierSalesAgent._call_label` can return — see agent.py's
+   `_END_REASON_LABELS`. Kept in this fixed order for the filter dropdown. */
+const REASON_LABELS = ["Success", "Rate too high", "Carrier not qualified",
+  "Ask for transfer to human", "Alternate dates", "User declined load", "Other"];
 function outcomeChip(outcome) {
   const key = outcomeKey(outcome);
   const meta = OUTCOME_META[key] || { label: key };
@@ -378,8 +382,8 @@ function runsTable(rows, { compact = false } = {}) {
       "Take a test call in the playground — it runs the same agent the phone line does.");
   }
   const head = compact
-    ? ["Started", "Caller", "Lane", "Carrier", "Outcome", "Final rate"]
-    : ["Started", "Run", "Caller", "Lane", "Carrier", "Outcome", "Rounds", "Final rate", "Duration"];
+    ? ["Started", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Final rate"]
+    : ["Started", "Run", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Rounds", "Final rate", "Duration"];
   const table = el("table", {},
     el("thead", {}, el("tr", {}, head.map((h) =>
       el("th", { class: ["Rounds", "Final rate", "Duration"].includes(h) ? "num" : "" }, h)))),
@@ -392,6 +396,13 @@ function runsTable(rows, { compact = false } = {}) {
       const carrier = el("td", {},
         el("div", {}, r.carrier_name || (r.carrier_dot ? r.carrier_dot : el("span", { class: "dim" }, "—"))),
         r.carrier_mc ? el("div", { class: "dim mono" }, r.carrier_mc) : null);
+      // Why the call ended, one tier finer than the Outcome chip next to it —
+      // "Rate too high" / "Carrier not qualified" / "Other", with the one-line
+      // reason underneath so "Other" is never a dead end. Null on a call still
+      // in progress or finished before this existed.
+      const reason = el("td", { style: "max-width:220px" },
+        r.label ? el("div", { class: "strong" }, r.label) : el("span", { class: "dim" }, "—"),
+        r.reason ? el("div", { class: "dim", style: "white-space:normal" }, r.reason) : null);
       const runId = el("td", { class: "mono" }, r.call_id,
         r.source === "playground"
           ? el("div", { class: "dim", style: "font-family:system-ui; font-size:11px" }, "▶ playground")
@@ -400,11 +411,13 @@ function runsTable(rows, { compact = false } = {}) {
         ? [el("td", { class: "dim", title: fmtDateTime(r.start_time) }, timeAgo(r.start_time)),
            caller, lane, carrier,
            el("td", {}, statusChip(r)),
+           reason,
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—")]
         : [el("td", { class: "dim", title: r.start_time || "" }, fmtDateTime(r.start_time)),
            runId,
            caller, lane, carrier,
            el("td", {}, statusChip(r)),
+           reason,
            el("td", { class: "num" }, r.rounds ?? "—"),
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—"),
            el("td", { class: "num" }, fmtDur(r.duration_secs))];
@@ -414,12 +427,13 @@ function runsTable(rows, { compact = false } = {}) {
 }
 
 async function renderRuns(root) {
-  const state = { outcome: "", q: "", rendered: "" };
+  const state = { outcome: "", label: "", q: "", rendered: "" };
   const listWrap = el("div", { class: "card", style: "padding: 6px 4px" });
 
   async function refresh(force = false) {
     const params = new URLSearchParams({ limit: "200" });
     if (state.outcome) params.set("outcome", state.outcome);
+    if (state.label) params.set("label", state.label);
     if (state.q) params.set("q", state.q);
     const rows = await api(`/api/calls?${params}`);
     // Re-render only on actual change — a poll that rebuilds identical rows
@@ -434,12 +448,15 @@ async function renderRuns(root) {
     el("option", { value: "" }, "All outcomes"),
     Object.entries(OUTCOME_META).map(([key, meta]) =>
       el("option", { value: key }, meta.label)));
+  const reasonSelect = el("select", { onchange: (e) => { state.label = e.target.value; refresh(); } },
+    el("option", { value: "" }, "Any reason"),
+    REASON_LABELS.map((label) => el("option", { value: label }, label)));
   let debounce;
   const search = el("input", { type: "search", placeholder: "Search runs, loads, carriers…",
     oninput: (e) => { state.q = e.target.value.trim(); clearTimeout(debounce); debounce = setTimeout(refresh, 250); } });
 
   root.append(
-    el("div", { class: "filters" }, select, search,
+    el("div", { class: "filters" }, select, reasonSelect, search,
       el("button", { class: "btn", onclick: refresh }, "Refresh")),
     listWrap);
   await refresh();
@@ -519,7 +536,9 @@ async function openCallDrawer(callId) {
           metaItem("Carrier", d.carrier_name || d.carrier_dot || "—",
             d.carrier_mc ? el("div", { class: "dim" }, `${d.carrier_mc} · ${d.carrier_dot}`) : null),
           metaItem("Final rate", d.final_rate ? fmtMoney(d.final_rate) : "—",
-            d.rounds !== null && d.rounds !== undefined ? el("div", { class: "dim" }, `${d.rounds} rounds`) : null)),
+            d.rounds !== null && d.rounds !== undefined ? el("div", { class: "dim" }, `${d.rounds} rounds`) : null),
+          metaItem("Reason", d.label || "—",
+            d.reason ? el("div", { class: "dim" }, d.reason) : null)),
         d.has_recording ? recordingPlayer(
           `/api/calls/${encodeURIComponent(d.call_id)}/recording`) : null,
         tabBar),

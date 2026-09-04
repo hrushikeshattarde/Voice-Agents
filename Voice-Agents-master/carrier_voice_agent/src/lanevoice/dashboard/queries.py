@@ -78,7 +78,7 @@ class DashboardQueries:
     _CALL_SELECT = """
         SELECT c.call_id, c.load_id, c.carrier_dot, c.caller_number,
                c.start_time, c.end_time,
-               c.outcome, c.transcript,
+               c.outcome, c.transcript, c.end_label, c.end_reason,
                c.carrier_name   AS call_carrier_name,
                c.carrier_mc     AS call_carrier_mc,
                ca.legal_name    AS carrier_name,
@@ -120,6 +120,12 @@ class DashboardQueries:
             "end_time": row["end_time"],
             "duration_secs": _duration_secs(row["start_time"], row["end_time"]),
             "outcome": row["outcome"],
+            # Why the call ended, in a rep's own words — see
+            # `CarrierSalesAgent._call_label`/`_call_summary_line`. Null on a
+            # call still in progress, and on anything finished before this
+            # existed.
+            "label": row["end_label"],
+            "reason": row["end_reason"],
             "turns": len(transcript) or None,
             "rounds": row["rounds"],
             "final_rate": row["last_offer"],
@@ -132,11 +138,13 @@ class DashboardQueries:
             out["transcript"] = transcript
         return out
 
-    def calls(self, outcome: str | None = None, q: str | None = None,
-              limit: int = 100, offset: int = 0) -> list[dict]:
+    def calls(self, outcome: str | None = None, label: str | None = None,
+              q: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
         """Newest first. `outcome` filters exactly ('incomplete' = no outcome
-        yet — a dropped or still-open call); `q` matches call id, load id,
-        carrier DOT/MC/name, or the caller's phone number."""
+        yet — a dropped or still-open call); `label` filters the reason a call
+        ended on (see `_call_row`'s "label" — "Rate too high", "Other", and so
+        on) exactly; `q` matches call id, load id, carrier DOT/MC/name, or the
+        caller's phone number."""
         sql, params = self._CALL_SELECT, []
         where = []
         if outcome == "incomplete":
@@ -144,6 +152,9 @@ class DashboardQueries:
         elif outcome:
             where.append("c.outcome = ?")
             params.append(outcome)
+        if label:
+            where.append("c.end_label = ?")
+            params.append(label)
         if q:
             where.append("(c.call_id LIKE ? OR c.load_id LIKE ? OR "
                          "c.carrier_dot LIKE ? OR c.caller_number LIKE ? OR "

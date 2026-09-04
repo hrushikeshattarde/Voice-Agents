@@ -244,6 +244,14 @@ class Database:
             conn.execute("ALTER TABLE calls ADD COLUMN carrier_name TEXT")
         if call_columns and "carrier_mc" not in call_columns:
             conn.execute("ALTER TABLE calls ADD COLUMN carrier_mc TEXT")
+        # `calls.end_label`/`end_reason`: the same short label and one-line
+        # reason a rep reads on the load's CALL SUMMARY note (see
+        # `CarrierSalesAgent._call_label`/`_call_summary_line`), so the
+        # dashboard can show why a call ended without opening it.
+        if call_columns and "end_label" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN end_label TEXT")
+        if call_columns and "end_reason" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN end_reason TEXT")
 
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}

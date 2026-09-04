@@ -12,7 +12,7 @@ browser, not the internet. It binds to 127.0.0.1 unless told otherwise.
 
 Routes:
     GET  /api/overview                KPIs, outcome split, calls per day
-    GET  /api/calls                   run list (?outcome=&q=&limit=&offset=)
+    GET  /api/calls                   run list (?outcome=&label=&q=&limit=&offset=)
     GET  /api/calls/<id>              transcript, offers, notes, transfers
     GET  /api/calls/<id>/recording    the call audio (RECORD_CALLS=true), OGG
     GET  /api/loads                   the local board (seed data offline;
@@ -256,6 +256,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/calls":
             return self._send_json(self.app.queries.calls(
                 outcome=qs.get("outcome", [None])[0] or None,
+                label=qs.get("label", [None])[0] or None,
                 q=qs.get("q", [None])[0] or None,
                 limit=int(qs.get("limit", ["100"])[0]),
                 offset=int(qs.get("offset", ["0"])[0]),
