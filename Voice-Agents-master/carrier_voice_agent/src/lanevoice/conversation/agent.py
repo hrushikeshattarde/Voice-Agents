@@ -480,6 +480,54 @@ _OUTCOME_NAMES = {
     CallOutcome.NO_DEAL: "no deal",
     CallOutcome.ABANDONED: "caller hung up",
 }
+
+# One label a rep can scan for, per the specific reason a call ended (set by
+# `_finish`) — a fixed vocabulary rather than the reason code itself, which is
+# a variable name, not something to read at a glance. Reasons not listed here
+# (a booking write failure, Highway fraud flag, an off-topic caller, and every
+# other rarer path) read as "Other" — the one-line summary alongside it still
+# says exactly what happened; the label is for sorting, not for the full story.
+_END_REASON_LABELS = {
+    "above_max_buy": "Rate too high",
+    "declined_requirements": "User declined load",
+    "inactive_authority": "Carrier not qualified",
+    "not_approved": "Carrier not qualified",
+    "carrier_request": "Ask for transfer to human",
+    "pickup_issue": "Alternate dates",
+}
+
+# The one line of "why" next to the label. Short and precise on purpose: the
+# figures and names it might be tempted to repeat — the rate, the MC, the load
+# id — are already their own lines above it in the summary, so this says only
+# what happened, not the numbers behind it. Every reason `_finish` can be given
+# has an entry; a reason added later without one falls back to the decision
+# note it was written next to, trimmed, rather than going blank.
+_END_REASON_SUMMARIES = {
+    "above_max_buy": "Carrier's number stayed above what we could pay.",
+    "declined_requirements": "Carrier couldn't meet the load's requirements.",
+    "inactive_authority": "Carrier's authority is not active.",
+    "not_approved": "Carrier is not approved to work with this brokerage.",
+    "carrier_request": "Carrier asked to speak with a rep.",
+    "pickup_issue": "Rate agreed, but the carrier couldn't confirm the pickup.",
+    "no_more_numbers": "No sellable load number was given.",
+    "out_of_scope": "Load belongs to a different office.",
+    "covered": "Load is already covered by another carrier.",
+    "no_published_rate": "Load has no published rate to open at.",
+    "mc_not_captured": "Could not get a clear MC/USDOT number from the caller.",
+    "verification_review": "Carrier needs a manual review before clearing.",
+    "requirements_unconfirmed": "Carrier never confirmed the load's requirements.",
+    "fraud_review": "Carrier's offer looked too low — flagged for review.",
+    "ceiling_guard": "The rate would have gone above the load's ceiling.",
+    "email_not_verified": "Could not verify an email address on the carrier's account.",
+    "booking_link_failed": "Rate agreed, but the booking link could not be issued.",
+    "booking_write_failed": "Rate agreed, but it could not be recorded in the system.",
+    "above_agent_authority": "Rate is in budget but above what the agent can approve alone.",
+    "source_unavailable": "The load or carrier system was unreachable.",
+    "not_carrier_sales": "Call wasn't about booking a load — routed to the right desk.",
+    "unheard": "Could not understand the caller after repeated tries.",
+    "went_quiet": "Caller stopped responding.",
+    "compose_failed": "Could not produce a safe reply — handed to a rep.",
+}
 # Transport Pro takes the note as one form field; keep it readable in the load's
 # note panel rather than exhaustive — the full transcript is in the call record.
 _SUMMARY_MAX_CHARS = 4000
@@ -522,6 +570,13 @@ class CarrierSalesAgent:
         # wants to know who called. The summary is posted there when `self.load`
         # was never set.
         self._asked_load_id: str | None = None
+        # A short code for WHY the call ended (see `_finish` and `_call_label`),
+        # and the last `_note()` written before it did — frozen at `_finish` time
+        # so a later note (a transfer that then failed, say) cannot overwrite the
+        # reason the call actually ended on.
+        self._end_reason: str | None = None
+        self._end_summary_note: str | None = None
+        self._last_note: str | None = None
         self._email_asks = 0                     # re-asks when we didn't catch one
         self._mc_asks = 0                        # re-asks for an unheard MC/USDOT
         self._load_asks = 0                      # load numbers that didn't work out
@@ -713,16 +768,16 @@ class CarrierSalesAgent:
         """
         logger.error("handing call %s to a rep: could not compose a turn in state "
                      "%s (%s)", self.call_id, self.state.value, why)
-        self._repo.log_note(
-            self.call_id,
-            f"Could not compose a compliant turn in state {self.state.value} "
-            f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
-            f"Last failure: {why}",
-        )
+        note = (f"Could not compose a compliant turn in state {self.state.value} "
+               f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
+               f"Last failure: {why}")
+        self._repo.log_note(self.call_id, note)
+        self._last_note = note        # not through `_note()`: this failure mode
+                                       # does not also try a TMS post
         # A call can break before it has a load — `resolve` takes that.
         resolution = self._transfers.resolve(self.load)
         rep_id = resolution.rep.rep_id if resolution.rep else None
-        self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id)
+        self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id, reason="compose_failed")
         rep = resolution.rep
         self.pending_transfer = rep if (rep is not None and rep.phone) else None
         self.transcript.append(("agent", _LAST_RESORT))
@@ -748,6 +803,7 @@ class CarrierSalesAgent:
         `flush_notes` collects the queue at call end.
         """
         self._repo.log_note(self.call_id, note)
+        self._last_note = note
         target = self.load.load_id if self.load is not None else self._asked_load_id
         if target and self._settings.post_load_notes:
             args = (target, f"[Voice AI call {self.call_id}] {note}")
@@ -895,7 +951,7 @@ class CarrierSalesAgent:
                 # us (observed live). Thank them and end it.
                 self._note("Caller declined to continue at load lookup — "
                            "thanked them and closed the call.")
-                self._finish(CallOutcome.NO_DEAL)
+                self._finish(CallOutcome.NO_DEAL, reason="no_more_numbers")
                 return self._say(
                     "They're all set — nothing else they want looked up. Thank "
                     "them for calling and close the call warmly. One short "
@@ -932,7 +988,7 @@ class CarrierSalesAgent:
                 f"Load {load_id} belongs to another office — outside this desk's "
                 "scope. Thanked the caller and closed without offering alternatives."
             )
-            self._finish(CallOutcome.NO_DEAL)
+            self._finish(CallOutcome.NO_DEAL, reason="out_of_scope")
             return self._say(
                 f"Load {load_id} is real but it's handled by a different Circle "
                 f"desk, not this one, so you can't book it or transfer them to it. "
@@ -969,7 +1025,7 @@ class CarrierSalesAgent:
                     f"Load {load_id} is covered ({result.load.status.value}); told the "
                     "caller and closed the call without offering alternatives."
                 )
-                self._finish(CallOutcome.NO_DEAL)
+                self._finish(CallOutcome.NO_DEAL, reason="covered")
                 return self._say(
                     f"Load {load_id} is already covered — somebody else has taken it. "
                     f"Tell them that plainly, thank them for calling, and close warmly. "
@@ -1033,7 +1089,7 @@ class CarrierSalesAgent:
                 f"{self._load_asks} load numbers in a row could not be sold — closed "
                 "the call without offering alternatives."
             )
-            self._finish(CallOutcome.NO_DEAL)
+            self._finish(CallOutcome.NO_DEAL, reason="no_more_numbers")
             return self._say(
                 f"{what_to_say} That is the third number that hasn't worked, so wrap "
                 f"the call up: say you can't get them on anything today, thank them "
@@ -1259,7 +1315,7 @@ class CarrierSalesAgent:
                     f"{result.carrier.authority_status.value}, not ACTIVE. Told they "
                     "do not meet the requirements. No load detail or rate discussed."
                 )
-                self._finish(CallOutcome.REJECTED)
+                self._finish(CallOutcome.REJECTED, reason="inactive_authority")
                 return self._say(
                     "Their company does not currently meet the requirements to work with "
                     "your brokerage, so you cannot go any further on this load with them — "
@@ -1276,7 +1332,7 @@ class CarrierSalesAgent:
                 f"Carrier {who} (USDOT {result.carrier.usdot_number}) is not approved "
                 "to work with Circle Logistics — declined."
             )
-            self._finish(CallOutcome.REJECTED)
+            self._finish(CallOutcome.REJECTED, reason="not_approved")
             return self._say(
                 "Your brokerage isn't set up to work with their company, so you can't book "
                 "this one with them. Tell them briefly and politely and close the call. Do "
@@ -1510,7 +1566,7 @@ class CarrierSalesAgent:
                 + ("" if self._requirements_read
                    else " Declined before the requirements were read out."),
             )
-            self._finish(CallOutcome.NO_DEAL)
+            self._finish(CallOutcome.NO_DEAL, reason="declined_requirements")
             return self._say(
                 "They've said they can't meet this load's requirements, so you can't book "
                 "it with them. Say that without making them feel bad about it, leave the "
@@ -2052,7 +2108,7 @@ class CarrierSalesAgent:
     def _transfer(self, reason: str) -> object:
         resolution = self._transfers.resolve(self.load)
         self._finish(CallOutcome.TRANSFERRED, rep_id=resolution.rep.rep_id
-                     if resolution.rep else None)
+                     if resolution.rep else None, reason=reason)
         # Only a rep with a number can actually be dialled. The worker performs
         # the transfer after the line below has been spoken; a rep without a
         # number is named, and the caller is promised a callback instead.
@@ -2185,7 +2241,7 @@ class CarrierSalesAgent:
             f"${int(result.final_offer)} (offers: {offers}) over {self.neg.round} "
             "rounds. Call ended by agent.",
         )
-        self._finish(CallOutcome.NO_DEAL)
+        self._finish(CallOutcome.NO_DEAL, reason=result.reason)
         return self._say(
             "You've come up as far as you can and you're still apart, so this one isn't "
             "happening today. Say so, then leave the door properly open — you run freight "
@@ -2195,9 +2251,17 @@ class CarrierSalesAgent:
         )
 
     # -- persistence -------------------------------------------------------- #
-    def _finish(self, outcome: CallOutcome, rep_id: str | None = None) -> None:
+    def _finish(self, outcome: CallOutcome, rep_id: str | None = None,
+               reason: str | None = None) -> None:
         if self.state is not CallState.DONE:
             self._final_state = self.state       # how far the call got, for the summary
+            self._end_reason = reason
+            # Whatever `_note()` said last explains why THIS finish is happening
+            # (every call site above writes its note immediately before or after
+            # calling this) — frozen here so a note written later for a different
+            # reason (a transfer attempt that then failed, say) cannot quietly
+            # become "the" reason in the summary.
+            self._end_summary_note = self._last_note
         self.state = CallState.DONE
         self.outcome = outcome
         self._repo.end_call(
@@ -2238,7 +2302,7 @@ class CarrierSalesAgent:
                    "transcribed, repeatedly — told them a rep will call back. CALLBACK "
                    f"NEEDED at {self.caller_number or 'the number on the call record'}.")
         if self.state is not CallState.DONE:
-            self._finish(CallOutcome.TRANSFERRED)
+            self._finish(CallOutcome.TRANSFERRED, reason="unheard")
         self._sync_transcript()
 
     def close_idle(self, spoken: str) -> None:
@@ -2248,7 +2312,7 @@ class CarrierSalesAgent:
         self._note("Caller went quiet after the agent's question — asked once whether "
                    "they were still there, heard nothing, and closed the call.")
         if self.state is not CallState.DONE:
-            self._finish(CallOutcome.ABANDONED)
+            self._finish(CallOutcome.ABANDONED, reason="went_quiet")
         self._sync_transcript()
 
     def note_unheard(self) -> None:
@@ -2284,21 +2348,56 @@ class CarrierSalesAgent:
         self.caller_number = number
         self._repo.set_caller_number(self.call_id, number)
 
+    def _call_label(self) -> str:
+        """One label from a fixed, short vocabulary — see `_END_REASON_LABELS` —
+        so a rep can scan a list of calls for the ones that need attention
+        without opening each one. The one-line Summary next to it still carries
+        the specific reason; the label is for sorting, not the full story."""
+        if self.outcome == CallOutcome.BOOKED:
+            return "Success"
+        if self._end_reason and self._end_reason in _END_REASON_LABELS:
+            return _END_REASON_LABELS[self._end_reason]
+        if self.outcome == CallOutcome.REJECTED:
+            # Every reject path means this, even a future one not yet in the
+            # dict above — never "Other" for a carrier the desk turned away.
+            return "Carrier not qualified"
+        return "Other"
+
+    def _call_summary_line(self, stage: str) -> str:
+        """The one line of "why" under the label — see `_END_REASON_SUMMARIES`
+        for the wording rules. `stage` is what `_call_summary` already computed
+        for "Got as far as", reused here for the one case with no reason and no
+        note to fall back on: a caller who hung up before anything happened."""
+        if self.outcome == CallOutcome.BOOKED:
+            return "Booking link sent — not confirmed until the carrier signs."
+        if self._end_reason and self._end_reason in _END_REASON_SUMMARIES:
+            return _END_REASON_SUMMARIES[self._end_reason]
+        if self._end_summary_note:
+            return self._end_summary_note[:200]
+        return f"Caller hung up during {stage}."
+
     def _call_summary(self) -> str:
         """One note a rep can read instead of a dashboard: who called, how far it
-        got, what money was said, and every word of the conversation.
+        got, what money was said, and a one-line reason under a label they can
+        scan for. Written for EVERY call that reached a load — the carrier who
+        verified and hung up at the empty-truck question left nothing on the
+        load before this existed, and that caller is exactly the one the rep
+        wants to ring.
 
-        The decision notes written during the call are still there for the
-        moments that needed a reason; this is the whole call in one place, and it
-        is written for EVERY call that reached a load — the carrier who verified
-        and hung up at the empty-truck question left nothing on the load before
-        this existed, and that caller is exactly the one the rep wants to ring.
+        The full turn-by-turn conversation used to be pasted in here too; it
+        made the note long without making it any faster to act on, and it was
+        never the only copy — the dashboard's Transcript tab reads the same
+        `calls.transcript` this call already writes to. A label plus one line
+        of why is what a rep actually needs at a glance; the whole exchange is
+        still one click away for anyone who wants it.
         """
         seconds = max(0, int(time.time() - self._started_at))
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(self._started_at))
         who = self.caller_number or "number not available"
+        stage = _STAGE_NAMES.get(self._final_state or self.state, "the start of the call")
         lines = [
             f"[Voice AI call {self.call_id}] CALL SUMMARY",
+            f"Label: {self._call_label()}",
             f"When: {when} ({seconds // 60} min {seconds % 60} s) — Caller: {who}",
         ]
         if self.carrier is not None:
@@ -2312,8 +2411,7 @@ class CarrierSalesAgent:
             lines.append(f"Load: {self.load.load_id}")
         elif self._asked_load_id:
             lines.append(f"Load asked about: {self._asked_load_id} (not sold on this call — "
-                         "see the note above for why)")
-        stage = _STAGE_NAMES.get(self._final_state or self.state, "the start of the call")
+                         "see the summary below for why)")
         outcome = _OUTCOME_NAMES.get(self.outcome, "still open") if self.outcome else "still open"
         lines.append(f"Got as far as: {stage} — Outcome: {outcome}")
         empty = self._empty_summary()
@@ -2334,20 +2432,8 @@ class CarrierSalesAgent:
                 if self._booking_link else
                 f"confirmation to {self._booking_email}"))
         lines.append(f"Callback: {who}" + (f" — {self.carrier.legal_name}" if self.carrier else ""))
-        lines.append("Conversation:")
-        body = "\n".join(lines)
-        budget = _SUMMARY_MAX_CHARS - len(body) - 80
-        shown = 0
-        for speaker, text in self.transcript:
-            line = f"  {'Alex' if speaker == 'agent' else 'Caller'}: {text.strip()[:300]}"
-            if len(line) + 1 > budget:
-                break
-            body += "\n" + line
-            budget -= len(line) + 1
-            shown += 1
-        if shown < len(self.transcript):
-            body += f"\n  (... {len(self.transcript) - shown} more turns in the call record)"
-        return body
+        lines.append(f"Summary: {self._call_summary_line(stage)}")
+        return "\n".join(lines)[:_SUMMARY_MAX_CHARS]
 
     def _post_call_summary(self) -> None:
         """Once per call, at the very end: onto the call record, and onto the load
