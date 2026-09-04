@@ -1021,8 +1021,10 @@ class TransportProRepository:
         self._loads.clear()
 
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
-                 outcome: str, transcript: list | str) -> None:
-        self._audit.end_call(call_id, load_id, carrier_dot, outcome, transcript)
+                 outcome: str, transcript: list | str, carrier_name: str | None = None,
+                 carrier_mc: str | None = None) -> None:
+        self._audit.end_call(call_id, load_id, carrier_dot, outcome, transcript,
+                             carrier_name, carrier_mc)
 
     def update_transcript(self, call_id: str, transcript: list | str) -> None:
         self._audit.update_transcript(call_id, transcript)

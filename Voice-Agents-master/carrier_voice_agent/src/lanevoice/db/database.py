@@ -232,6 +232,18 @@ class Database:
                         conn.execute("PRAGMA table_info(calls)").fetchall()}
         if call_columns and "caller_number" not in call_columns:
             conn.execute("ALTER TABLE calls ADD COLUMN caller_number TEXT")
+        # `calls.carrier_name`/`carrier_mc`: a snapshot of who the carrier said
+        # they were AT THE TIME of this call. The dashboard used to read the
+        # name via a join to the local `carriers` table, which only exists in
+        # the offline demo — a live Transport Pro deployment keeps carriers in
+        # Transport Pro, not here, so that join was always empty and every real
+        # call showed a bare DOT number. Recorded straight from `self.carrier`
+        # when the call ends, so it survives whatever the carrier's record
+        # looks like today.
+        if call_columns and "carrier_name" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN carrier_name TEXT")
+        if call_columns and "carrier_mc" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN carrier_mc TEXT")
 
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}

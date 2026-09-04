@@ -2206,6 +2206,8 @@ class CarrierSalesAgent:
             self.carrier.usdot_number if self.carrier else None,
             outcome.value,
             self.transcript,
+            self.carrier.legal_name if self.carrier else None,
+            self.carrier.mc_number if self.carrier else None,
         )
         if rep_id and outcome == CallOutcome.TRANSFERRED:
             # Requested, not connected: whether the caller actually reached the

@@ -76,8 +76,11 @@ class DashboardQueries:
 
     # -- calls ---------------------------------------------------------------- #
     _CALL_SELECT = """
-        SELECT c.call_id, c.load_id, c.carrier_dot, c.start_time, c.end_time,
+        SELECT c.call_id, c.load_id, c.carrier_dot, c.caller_number,
+               c.start_time, c.end_time,
                c.outcome, c.transcript,
+               c.carrier_name   AS call_carrier_name,
+               c.carrier_mc     AS call_carrier_mc,
                ca.legal_name    AS carrier_name,
                ca.mc_number     AS carrier_mc,
                l.origin         AS load_origin,
@@ -105,9 +108,14 @@ class DashboardQueries:
             "call_id": row["call_id"],
             "load_id": row["load_id"],
             "lane": lane,
+            "caller_number": row["caller_number"],
             "carrier_dot": row["carrier_dot"],
-            "carrier_name": row["carrier_name"],
-            "carrier_mc": row["carrier_mc"],
+            # `c.carrier_name`/`carrier_mc` is what was recorded on the CALL —
+            # the only source in a live Transport Pro deployment, where carriers
+            # live in Transport Pro and the local `carriers` table (joined below)
+            # is only ever populated by the offline demo seed.
+            "carrier_name": row["call_carrier_name"] or row["carrier_name"],
+            "carrier_mc": row["call_carrier_mc"] or row["carrier_mc"],
             "start_time": row["start_time"],
             "end_time": row["end_time"],
             "duration_secs": _duration_secs(row["start_time"], row["end_time"]),
@@ -128,7 +136,7 @@ class DashboardQueries:
               limit: int = 100, offset: int = 0) -> list[dict]:
         """Newest first. `outcome` filters exactly ('incomplete' = no outcome
         yet — a dropped or still-open call); `q` matches call id, load id,
-        carrier number or carrier name."""
+        carrier DOT/MC/name, or the caller's phone number."""
         sql, params = self._CALL_SELECT, []
         where = []
         if outcome == "incomplete":
@@ -138,9 +146,10 @@ class DashboardQueries:
             params.append(outcome)
         if q:
             where.append("(c.call_id LIKE ? OR c.load_id LIKE ? OR "
-                         "c.carrier_dot LIKE ? OR ca.legal_name LIKE ? OR "
-                         "ca.mc_number LIKE ?)")
-            params.extend([f"%{q}%"] * 5)
+                         "c.carrier_dot LIKE ? OR c.caller_number LIKE ? OR "
+                         "c.carrier_name LIKE ? OR c.carrier_mc LIKE ? OR "
+                         "ca.legal_name LIKE ? OR ca.mc_number LIKE ?)")
+            params.extend([f"%{q}%"] * 8)
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY c.start_time DESC LIMIT ? OFFSET ?"

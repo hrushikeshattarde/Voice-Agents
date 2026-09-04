@@ -378,12 +378,14 @@ function runsTable(rows, { compact = false } = {}) {
       "Take a test call in the playground — it runs the same agent the phone line does.");
   }
   const head = compact
-    ? ["Started", "Lane", "Carrier", "Outcome", "Final rate"]
-    : ["Started", "Run", "Lane", "Carrier", "Outcome", "Rounds", "Final rate", "Duration"];
+    ? ["Started", "Caller", "Lane", "Carrier", "Outcome", "Final rate"]
+    : ["Started", "Run", "Caller", "Lane", "Carrier", "Outcome", "Rounds", "Final rate", "Duration"];
   const table = el("table", {},
     el("thead", {}, el("tr", {}, head.map((h) =>
       el("th", { class: ["Rounds", "Final rate", "Duration"].includes(h) ? "num" : "" }, h)))),
     el("tbody", {}, rows.map((r) => {
+      const caller = el("td", { class: "mono" },
+        r.caller_number || el("span", { class: "dim" }, "—"));
       const lane = el("td", {},
         el("div", { class: "strong" }, r.lane || (r.load_id ? `Load ${r.load_id}` : "—")),
         r.lane && r.load_id ? el("div", { class: "dim mono" }, r.load_id) : null);
@@ -396,12 +398,12 @@ function runsTable(rows, { compact = false } = {}) {
           : null);
       const cells = compact
         ? [el("td", { class: "dim", title: fmtDateTime(r.start_time) }, timeAgo(r.start_time)),
-           lane, carrier,
+           caller, lane, carrier,
            el("td", {}, statusChip(r)),
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—")]
         : [el("td", { class: "dim", title: r.start_time || "" }, fmtDateTime(r.start_time)),
            runId,
-           lane, carrier,
+           caller, lane, carrier,
            el("td", {}, statusChip(r)),
            el("td", { class: "num" }, r.rounds ?? "—"),
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—"),
@@ -511,6 +513,7 @@ async function openCallDrawer(callId) {
           metaItem("Started", fmtDateTime(d.start_time)),
           metaItem("Duration", fmtDur(d.duration_secs)),
           metaItem("Source", d.source === "playground" ? "Playground (test)" : "Phone line"),
+          metaItem("Caller", d.caller_number || "—"),
           metaItem("Turns", d.turns ?? "—"),
           metaItem("Load", d.load_id || "—", d.lane ? el("div", { class: "dim" }, d.lane) : null),
           metaItem("Carrier", d.carrier_name || d.carrier_dot || "—",

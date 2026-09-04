@@ -86,6 +86,31 @@ def test_calls_list_row_shape(dash):
     assert row["source"] == "phone"
 
 
+def test_the_carrier_name_survives_without_a_local_carriers_table(dash):
+    """A live Transport Pro deployment keeps carriers in Transport Pro, not in
+    this database's `carriers` table — that table only exists for the offline
+    demo. Before the name was recorded on the call itself, the dashboard's join
+    to `carriers` was the only source, so every real call showed a bare DOT
+    number and never a name. Deleting the row here reproduces a live
+    deployment's empty table; the call must still show the name."""
+    repo, queries = dash
+    agent = _drive(repo)
+
+    conn = repo._db.connect()
+    try:
+        conn.execute("DELETE FROM carriers")
+        conn.commit()
+    finally:
+        conn.close()
+
+    row = queries.calls()[0]
+    assert row["carrier_name"] == "Blue Sky Logistics LLC"
+    assert row["carrier_mc"] == "MC123456"
+
+    # And it is searchable by that name, not only by DOT number.
+    assert [r["call_id"] for r in queries.calls(q="Blue Sky")] == [agent.call_id]
+
+
 def test_calls_filters(dash):
     repo, queries = dash
     _drive(repo)
