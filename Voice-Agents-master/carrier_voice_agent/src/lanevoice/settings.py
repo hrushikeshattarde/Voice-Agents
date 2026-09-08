@@ -343,9 +343,17 @@ class Settings(BaseSettings):
     # Wait this long after the caller stops before replying. Higher = fewer
     # cut-offs / fragment replies on a noisy phone line.
     #
-    # MIN applies when the turn detector is CONFIDENT the caller finished; MAX
-    # when it is not. The gap between them is the single largest thing the caller
-    # waits on — bigger than the model, bigger than the voice.
+    # MIN applies when the turn detector (TURN_DETECTOR, below) reads the caller
+    # as finished; MAX when it reads them as mid-thought. The gap between them is
+    # the single largest thing the caller waits on — bigger than the model,
+    # bigger than the voice. WITHOUT a turn detector MAX never applies at all:
+    # the framework commits every turn MIN seconds after the VAD hears silence,
+    # as soon as the recogniser has produced any final. That was this worker's
+    # state until 2026-09-08 — no detector had ever been wired in — and the calls
+    # of 09-04 show what it costs: "Looking for" answered as a whole turn, the
+    # load number arriving as the next one; one answer to the empty-call question
+    # chopped into three ("Oh yeah." / "It's getting empty." / "Somewhere in
+    # Indiana...") and each met with "didn't catch that".
     #
     # MAX was 8.0, and on a measured live call 5 turns out of 11 spent every one
     # of those seconds. In all five the caller had plainly finished ("Okay.", at
@@ -374,6 +382,17 @@ class Settings(BaseSettings):
     # this first.
     min_endpointing_delay: float = Field(default=1.0, validation_alias="MIN_ENDPOINTING_DELAY")
     max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
+    # Whether a turn detector reads the transcript before a turn is committed.
+    # LiveKit's hosted `turn-detector-v1` — same Inference credentials as the STT
+    # and TTS — returns an end-of-turn probability for the words so far. Under the
+    # English threshold (0.36) the framework waits MAX_ENDPOINTING_DELAY for the
+    # rest of the sentence; above it MIN applies, so a finished answer stays quick
+    # and "Looking for..." gets its load number. It is what makes MAX mean
+    # anything — see above. Degrades on its own: if the hosted model is refused
+    # or unreachable the framework falls back to a local mini model, and if that
+    # fails too it commits after MIN as before, with one warning in the log. Off
+    # = the pre-09-08 behaviour, every turn committed MIN after silence.
+    turn_detector_enabled: bool = Field(default=True, validation_alias="TURN_DETECTOR")
 
     # Dead-air filler: when a reply takes longer than this to compose, the agent
     # immediately speaks a short pre-synthesized acknowledgment ("Alright, one

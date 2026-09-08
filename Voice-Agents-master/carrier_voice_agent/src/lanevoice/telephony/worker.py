@@ -2,7 +2,8 @@
 LiveKit worker — connects the deterministic brain to real phone calls.
 
 Pipeline:  phone -> LiveKit SIP -> this worker
-           Silero VAD -> streaming STT -> CarrierSalesAgent -> streaming TTS
+           Silero VAD + hosted turn detector -> streaming STT
+                     -> CarrierSalesAgent -> streaming TTS
 
 Speech runs on LiveKit Inference by default: transcription streams in WHILE the
 caller talks and the voice streams out as it is generated, both over WebSockets
@@ -349,6 +350,34 @@ def build_tts(settings: Settings) -> lk_tts.TTS:
 
 
 # --------------------------------------------------------------------------- #
+# Turn detection: has the caller finished, or only paused?
+# --------------------------------------------------------------------------- #
+def build_turn_detector(settings: Settings) -> inference.TurnDetector | None:
+    """The model that reads the transcript so far and says whether the caller is
+    done, or None when TURN_DETECTOR is off.
+
+    Without it the session commits a turn MIN_ENDPOINTING_DELAY after the VAD
+    hears silence, whatever the words were, and MAX_ENDPOINTING_DELAY is never
+    used — that is how "Looking for" became a whole turn on a live call and the
+    load number arrived as the next one. With it, a transcript that reads as
+    mid-thought waits out MAX for the rest of the sentence.
+
+    `version="v1"` pins the hosted model. Left to choose, the framework runs
+    the local mini model outside dev mode, and a production worker would
+    quietly run a weaker detector than the one tested. The framework still falls
+    back to the mini model by itself if the hosted one fails, and to a plain MIN
+    commit if that fails too — a call never waits on the detector.
+    """
+    if not settings.turn_detector_enabled:
+        return None
+    return inference.TurnDetector(
+        version="v1",
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Pre-rendered clips: the greeting and the dead-air fillers
 # --------------------------------------------------------------------------- #
 # Composing a reply measures ~3.4s on the shipped model (tools/measure_latency.py),
@@ -658,6 +687,16 @@ def prewarm(proc):
                 f"{_settings.tts_inference_model} voice {_settings.tts_inference_voice}"
                 if _settings.tts_on_inference
                 else f"{_settings.tts_model} voice {_settings.tts_voice}")
+    # What decides that the caller has finished — see `build_turn_detector`.
+    proc.userdata["turn_detector"] = build_turn_detector(_settings)
+    if proc.userdata["turn_detector"] is not None:
+        logger.info("turn detector: livekit %s (hosted) — a mid-thought transcript waits "
+                    "up to %.1fs for the rest of the sentence, a finished one %.1fs",
+                    proc.userdata["turn_detector"].model,
+                    _settings.max_endpointing_delay, _settings.min_endpointing_delay)
+    else:
+        logger.info("turn detector: OFF (TURN_DETECTOR=0) — every turn commits %.1fs after "
+                    "silence, whatever the words were", _settings.min_endpointing_delay)
 
     # The agent has no scripted lines, so the composer is what lets it talk at all.
     # `build_composer` picks the provider from LLM_PROVIDER and falls back to the
@@ -1285,11 +1324,16 @@ def _log_end_of_turn(new_message) -> None:
                 metrics["end_of_turn_delay"])
 
 
-async def entrypoint(ctx: JobContext):
-    await ctx.connect()
-    ud = ctx.proc.userdata
-    session_kwargs: dict[str, Any] = {}
-    if _settings.stt_on_inference:
+def session_kwargs(ud: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """The per-call extras for `AgentSession`, from what `prewarm` built.
+
+    Split out of `entrypoint` so a test can see what the session is handed
+    without a room: chiefly that the turn detector the worker built actually
+    reaches it, since a detector that is constructed and then not passed is
+    exactly the silent failure that left MAX_ENDPOINTING_DELAY dead for months.
+    """
+    kwargs: dict[str, Any] = {}
+    if settings.stt_on_inference:
         # The freight vocabulary, applied wherever the recogniser takes a term
         # list. Only offered on the Inference path: the batch Whisper plugin has
         # no such capability and the framework would only log that it skipped it.
@@ -1299,15 +1343,26 @@ async def entrypoint(ctx: JobContext):
         # "may reconnect upstream", i.e. a deaf moment right where the caller's
         # answer lands. Recognition was measured without it; turn it on only with
         # a feed dump in hand to prove nothing is lost.
-        session_kwargs["stt_context_options"] = {
-            "keyterms": ud.get("keyterms") or _stt_keyterms(_settings),
+        kwargs["stt_context_options"] = {
+            "keyterms": ud.get("keyterms") or _stt_keyterms(settings),
             "forward_chat_context": False}
+    if (detector := ud.get("turn_detector")) is not None:
+        # Passed only when built. The framework reads an explicit None as "no
+        # detector" too, but leaving the key out keeps TURN_DETECTOR=0 identical
+        # to the sessions that ran before the detector existed.
+        kwargs["turn_detection"] = detector
+    return kwargs
+
+
+async def entrypoint(ctx: JobContext):
+    await ctx.connect()
+    ud = ctx.proc.userdata
     session = AgentSession(
         vad=ud["vad"],
         stt=ud["stt"],
         tts=ud["tts"],
         turn_handling=turn_handling(_settings),
-        **session_kwargs,
+        **session_kwargs(ud, _settings),
     )
     session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
