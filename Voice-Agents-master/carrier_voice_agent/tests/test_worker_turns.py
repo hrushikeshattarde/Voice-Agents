@@ -41,12 +41,21 @@ class _Speech:
     the framework aligned to the audio that actually played."""
 
     def __init__(self, interrupted: bool = False, heard: str | None = None,
-                 blocking: bool = False):
+                 blocking: bool = False, text=None):
         self.interrupted = interrupted
         self.chat_items = [SimpleNamespace(text_content=heard)] if heard is not None else []
         self.interrupt_calls = 0
         # A blocking handle "plays" until it is interrupted — a long pitch.
         self._release = asyncio.Event() if blocking else None
+        # A streamed line: the pieces the session was fed, as they arrived.
+        self.streamed: list[str] = []
+        self._drained = None
+        if text is not None and not isinstance(text, str):
+            self._drained = asyncio.get_running_loop().create_task(self._drain(text))
+
+    async def _drain(self, pieces):
+        async for piece in pieces:
+            self.streamed.append(piece)
 
     def interrupt(self):
         self.interrupt_calls += 1
@@ -59,6 +68,8 @@ class _Speech:
         async def _done():
             if self._release is not None:
                 await self._release.wait()
+            if self._drained is not None:
+                await self._drained
         return _done().__await__()
 
 
@@ -73,8 +84,8 @@ class _Session:
         self.interrupt_next = False
 
     def say(self, text, **_kw):
-        self.said.append(text)
-        speech = _Speech(interrupted=self.interrupt_next)
+        self.said.append(text if isinstance(text, str) else "<streamed>")
+        speech = _Speech(interrupted=self.interrupt_next, text=text)
         self.interrupt_next = False
         self.handles.append(speech)
         return speech
@@ -306,6 +317,71 @@ def test_a_committed_turn_clears_what_was_pending(agent):
     with pytest.raises(worker.StopResponse):
         asyncio.run(agent.on_user_turn_completed(None, SimpleNamespace(text_content="you")))
     assert agent._pending_final is None
+
+
+# --------------------------------------------------------------------------- #
+# A whole turn, streamed: caller text in, sentences out as the model writes them
+# --------------------------------------------------------------------------- #
+class _StreamingComposer:
+    """Plays one scripted reply delta by delta; records whether it was asked to."""
+
+    def __init__(self, deltas):
+        self.deltas = deltas
+        self.streamed_calls = 0
+        self.whole_calls = 0
+        self.last_truncated = False
+        self.turns: list[dict] = []
+
+    def compose(self, directive, facts="", dialogue="", speakable="", correction=""):
+        self.whole_calls += 1
+        self.turns.append({"directive": directive})
+        return "".join(self.deltas)
+
+    def compose_stream(self, directive, facts="", dialogue="", speakable="", correction="",
+                       already_said=""):
+        self.streamed_calls += 1
+        self.turns.append({"directive": directive})
+        yield from self.deltas
+
+    def read(self, dialogue, fields):
+        return dict.fromkeys(fields)
+
+
+def test_a_turn_is_spoken_sentence_by_sentence_while_the_brain_is_still_writing(
+        repo, monkeypatch):
+    _settings(monkeypatch, idle_prompt_seconds=0, filler_delay=0)
+    composer = _StreamingComposer(["Got it, L1001. ", "Before we go on, can I ", "get your MC?"])
+    session = _Session()
+    monkeypatch.setattr(worker.CarrierAgent, "session", property(lambda self: session))
+    a = worker.CarrierAgent(repo, composer, tts=None)
+    a.brain.greet_with("Circle Logistics, this is Alex.")
+
+    with pytest.raises(worker.StopResponse):
+        asyncio.run(a.on_user_turn_completed(
+            None, SimpleNamespace(text_content="calling about load L1001")))
+
+    assert composer.streamed_calls == 1 and composer.whole_calls == 0
+    assert session.said == ["<streamed>"]                    # one utterance, fed live
+    assert session.handles[0].streamed == ["Got it, L1001. ",
+                                           "Before we go on, can I get your MC? "]
+    assert a.brain.transcript[-1] == ("agent", "Got it, L1001. Before we go on, can I get your MC?")
+    assert a.brain.speech_sink is None                       # handed back after the turn
+
+
+def test_with_the_switch_off_the_reply_is_said_whole(repo, monkeypatch):
+    _settings(monkeypatch, idle_prompt_seconds=0, filler_delay=0, stream_compose=False)
+    composer = _StreamingComposer(["Got it, L1001. ", "Can I get your MC?"])
+    session = _Session()
+    monkeypatch.setattr(worker.CarrierAgent, "session", property(lambda self: session))
+    a = worker.CarrierAgent(repo, composer, tts=None)
+    a.brain.greet_with("Circle Logistics, this is Alex.")
+
+    with pytest.raises(worker.StopResponse):
+        asyncio.run(a.on_user_turn_completed(
+            None, SimpleNamespace(text_content="calling about load L1001")))
+
+    assert composer.streamed_calls == 0 and composer.whole_calls == 1
+    assert session.said == ["Got it, L1001. Can I get your MC?"]
 
 
 # --------------------------------------------------------------------------- #

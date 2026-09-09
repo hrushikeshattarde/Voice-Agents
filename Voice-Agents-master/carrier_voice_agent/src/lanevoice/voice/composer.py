@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Iterator
 from typing import Protocol, runtime_checkable
 
 from lanevoice.logging_config import get_logger
@@ -170,6 +171,9 @@ class _ChatComposer:
         # (prompt tokens, completion tokens) of the last `_chat`, when the provider
         # reported them. Set by the subclass; read by `_timed_chat` for the log.
         self._last_usage: tuple[int, int] | None = None
+        # Whether the last `compose_stream` ran out of tokens mid-sentence. Set
+        # once the stream ends; the caller reads it before trusting the tail.
+        self.last_truncated = False
 
     def _timed_chat(self, what: str, *args, **kwargs) -> tuple[str, bool]:
         """`_chat`, with one log line per call: how long, and how many tokens.
@@ -238,9 +242,19 @@ class _ChatComposer:
         """
         raise NotImplementedError
 
+    def _chat_stream(self, system: str, user: str, *, max_tokens: int,
+                     temperature: float | None) -> Iterator[str]:
+        """Yield the reply's text as the model writes it.
+
+        Must set `_last_usage` and `last_truncated` once the stream is exhausted.
+        A provider that cannot stream may simply yield `_chat(...)[0]` once.
+        """
+        raise NotImplementedError
+
     # -- shared behaviour -------------------------------------------------- #
-    def compose(self, directive: str, facts: str = "", dialogue: str = "",
-                speakable: str = "", correction: str = "") -> str:
+    @staticmethod
+    def _prompt(directive: str, facts: str, dialogue: str, speakable: str,
+                correction: str, already_said: str = "") -> str:
         parts = []
         if dialogue:
             parts.append(f"DIALOGUE SO FAR:\n{dialogue}")
@@ -254,9 +268,20 @@ class _ChatComposer:
             # A previous attempt broke a hard rule. Naming the specific breach
             # beats re-sending the same prompt and hoping for a different roll.
             parts.append(f"YOUR LAST ATTEMPT WAS REJECTED: {correction}")
+        if already_said:
+            # A streamed turn was cut off after some of it had already reached
+            # the caller's ear: the retry has to carry on from there, not start
+            # the turn again.
+            parts.append("YOU HAVE ALREADY SAID THIS, and the caller heard it: "
+                         f"\"{already_said}\"\nContinue from exactly there. Do not repeat "
+                         "any of it, do not start over, and do not greet them again.")
         parts.append("Say your next turn out loud now. Speech only — no labels, "
                      "no quotation marks around it, no stage directions.")
-        prompt = "\n\n".join(parts)
+        return "\n\n".join(parts)
+
+    def compose(self, directive: str, facts: str = "", dialogue: str = "",
+                speakable: str = "", correction: str = "") -> str:
+        prompt = self._prompt(directive, facts, dialogue, speakable, correction)
         text, truncated = self._timed_chat(
             "compose", _SYSTEM, prompt,
             max_tokens=self._settings.llm_max_tokens,
@@ -287,6 +312,38 @@ class _ChatComposer:
                     self._settings.llm_max_tokens)
                 return ""
         return text.strip().strip('"')
+
+    def compose_stream(self, directive: str, facts: str = "", dialogue: str = "",
+                       speakable: str = "", correction: str = "",
+                       already_said: str = "") -> Iterator[str]:
+        """`compose`, yielded as the model writes it.
+
+        Same prompt, same guardrail text, no retry inside: the caller decides
+        sentence by sentence what may be spoken, and reads `last_truncated` when
+        the stream ends to know whether the tail is a finished thought. The
+        timing line records the number that matters for a caller on the line —
+        when the FIRST text arrived — beside the total.
+        """
+        prompt = self._prompt(directive, facts, dialogue, speakable, correction, already_said)
+        self._last_usage = None
+        self.last_truncated = False
+        started = time.monotonic()
+        first: float | None = None
+        try:
+            for delta in self._chat_stream(_SYSTEM, prompt,
+                                           max_tokens=self._settings.llm_max_tokens,
+                                           temperature=self._temperature):
+                if first is None and delta:
+                    first = time.monotonic() - started
+                yield delta
+        finally:
+            elapsed = time.monotonic() - started
+            tokens = (f"; {self._last_usage[0]:,} in / {self._last_usage[1]:,} out tokens"
+                      if self._last_usage is not None else "")
+            logger.info("TIMING compose (streamed) → first text %s, done %.2fs on %s%s%s",
+                        f"{first:.2f}s" if first is not None else "never", elapsed,
+                        self._model, tokens,
+                        " (cut off at the token limit)" if self.last_truncated else "")
 
     def read(self, dialogue: str, fields: dict[str, str]) -> dict:
         """Extract `fields` ({name: what to look for}) from the dialogue."""
@@ -365,6 +422,40 @@ class OpenRouterComposer(_ChatComposer):
         return ((choice.message.content or "").strip(),
                 choice.finish_reason == "length")
 
+    def _chat_stream(self, system: str, user: str, *, max_tokens: int,
+                     temperature: float | None) -> Iterator[str]:
+        kwargs = {"temperature": temperature} if temperature is not None else {}
+        stream = self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            stream=True,
+            **kwargs,
+        )
+        truncated = False
+        usage = None
+        for chunk in stream:
+            # OpenRouter can put an upstream failure into the stream as a body
+            # field on a normal chunk; that is a failed turn, never silence.
+            error = getattr(chunk, "error", None)
+            if error:
+                raise RuntimeError(f"OpenRouter returned an error mid-stream: {error}")
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage                 # rides the final chunk
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if choice.finish_reason == "length":
+                truncated = True
+            text = getattr(choice.delta, "content", None) if choice.delta else None
+            if text:
+                yield text
+        self.last_truncated = truncated
+        self._last_usage = self._usage(getattr(usage, "prompt_tokens", None),
+                                       getattr(usage, "completion_tokens", None))
+
 
 class AnthropicComposer(_ChatComposer):
     """Claude via the official Anthropic SDK — the first-party path.
@@ -415,6 +506,22 @@ class AnthropicComposer(_ChatComposer):
         ).strip()
         return text, message.stop_reason == "max_tokens"
 
+    def _chat_stream(self, system: str, user: str, *, max_tokens: int,
+                     temperature: float | None) -> Iterator[str]:
+        with self._client.messages.stream(
+            model=self._model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            **({} if temperature is None else {"temperature": temperature}),
+        ) as stream:
+            yield from stream.text_stream
+            message = stream.get_final_message()
+        usage = getattr(message, "usage", None)
+        self._last_usage = self._usage(getattr(usage, "input_tokens", None),
+                                       getattr(usage, "output_tokens", None))
+        self.last_truncated = message.stop_reason == "max_tokens"
+
 
 _PROVIDERS = {
     "openrouter": OpenRouterComposer,
@@ -461,6 +568,7 @@ class StubComposer:
 
     def __init__(self, settings: Settings | None = None):
         self.turns: list[dict] = []
+        self.last_truncated = False
 
     def compose(self, directive: str, facts: str = "", dialogue: str = "",
                 speakable: str = "", correction: str = "") -> str:
@@ -468,6 +576,12 @@ class StubComposer:
                            "speakable": speakable, "correction": correction})
         money = f"[{speakable}] " if speakable else ""
         return f"{money}{' '.join(directive.split())}"
+
+    def compose_stream(self, directive: str, facts: str = "", dialogue: str = "",
+                       speakable: str = "", correction: str = "",
+                       already_said: str = "") -> Iterator[str]:
+        self.last_truncated = False
+        yield self.compose(directive, facts, dialogue, speakable, correction)
 
     def read(self, dialogue: str, fields: dict[str, str]) -> dict:
         return dict.fromkeys(fields)

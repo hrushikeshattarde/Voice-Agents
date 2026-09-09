@@ -781,6 +781,89 @@ def prewarm(proc):
         logger.warning("noise cancellation unavailable (%s); continuing without", e)
 
 
+def _interrupted(speech) -> bool:
+    """Whether the caller cut a line off — one speech handle or a list of them."""
+    speeches = speech if isinstance(speech, list) else [speech]
+    return any(getattr(s, "interrupted", False) for s in speeches)
+
+
+class _TurnSpeech:
+    """The bridge from the brain's thread to the caller's ear for one turn.
+
+    The brain composes on a worker thread and, when a turn can be streamed,
+    hands over each sentence as the model finishes it (`chunk`) and `end` when
+    that line is done. On the event loop the first sentence starts a
+    `session.say()` fed by an async iterator, and the sentences that follow go
+    into the same utterance — so the voice is already speaking while the model
+    is still writing. Measured before this existed: composing was 2.7-5.0s per
+    turn and the caller heard nothing until the last word of it.
+
+    A brain that never streams — a money turn, the stub composer, STREAM_COMPOSE
+    off — produces no chunks, `first_text` resolves False when the turn is done,
+    and the worker says the finished reply as one piece, exactly as before.
+    """
+
+    def __init__(self, session, loop: asyncio.AbstractEventLoop):
+        self._session = session
+        self._loop = loop
+        self._items: asyncio.Queue = asyncio.Queue()
+        self._current: asyncio.Queue | None = None
+        self._closed = False
+        self.speeches: list = []
+        # True the moment a sentence is on its way to the voice; False when the
+        # turn finished without one. The filler waits on this, not on the reply.
+        self.first_text: asyncio.Future = loop.create_future()
+        self.sentences = 0
+
+    # -- the brain's side: any thread ---------------------------------------- #
+    def begin(self) -> None:
+        pass                               # nothing to do until the first sentence
+
+    def chunk(self, text: str) -> None:
+        self._loop.call_soon_threadsafe(self._items.put_nowait, ("chunk", text))
+
+    def end(self) -> None:
+        self._loop.call_soon_threadsafe(self._items.put_nowait, ("end", None))
+
+    # -- the loop's side ------------------------------------------------------ #
+    def finished(self) -> None:
+        """The brain has returned; nothing more is coming for this turn."""
+        self._items.put_nowait(("done", None))
+
+    async def pump(self) -> None:
+        while True:
+            kind, text = await self._items.get()
+            if kind == "chunk":
+                if self._current is None and not self._closed:
+                    queue: asyncio.Queue = asyncio.Queue()
+                    try:
+                        self.speeches.append(self._session.say(self._sentences(queue)))
+                        self._current = queue
+                    except RuntimeError:  # session closing: the rest is unspoken
+                        self._closed = True
+                if self._current is not None:
+                    self._current.put_nowait(text)
+                    self.sentences += 1
+                if not self.first_text.done():
+                    self.first_text.set_result(True)
+            elif kind == "end":
+                if self._current is not None:
+                    self._current.put_nowait(None)
+                    self._current = None
+            else:                          # done
+                if self._current is not None:
+                    self._current.put_nowait(None)
+                    self._current = None
+                if not self.first_text.done():
+                    self.first_text.set_result(False)
+                return
+
+    @staticmethod
+    async def _sentences(queue: asyncio.Queue) -> AsyncIterable[str]:
+        while (text := await queue.get()) is not None:
+            yield text + " "
+
+
 class CarrierAgent(Agent):
     def __init__(self, repo: Repository, composer, tts: lk_tts.TTS,
                  fillers: list[Clip] | None = None,
@@ -1028,7 +1111,7 @@ class CarrierAgent(Agent):
         more = await asyncio.to_thread(self.brain.continue_turn)
         if not more:
             return None
-        if getattr(after, "interrupted", False):
+        if _interrupted(after):
             logger.info("FOLLOW-ON withdrawn: the caller cut in while it was being composed "
                         "→ %s", more)
             return more, None
@@ -1057,9 +1140,11 @@ class CarrierAgent(Agent):
         then settles any short caller transcript the framework held back while
         it was playing.
         """
-        await speech
-        if getattr(speech, "interrupted", False):
-            heard = self._heard_text(speech)
+        speeches = speech if isinstance(speech, list) else [speech]
+        for one in speeches:
+            await one
+        if _interrupted(speeches):
+            heard = " ".join(h for h in (self._heard_text(s) for s in speeches) if h)
             logger.info("PLAYBACK CUT by caller → %s (heard: %s)", text,
                         repr(heard) if heard else "none of it")
             await asyncio.to_thread(self.brain.note_playback_cut, text, heard)
@@ -1079,13 +1164,15 @@ class CarrierAgent(Agent):
         told the line was never heard, so it is read on the next turn. The
         handoff is dialled whether or not they cut in — they asked for a person.
         """
-        follow = (asyncio.create_task(self._compose_follow_on(speech))
+        speeches = speech if isinstance(speech, list) else [speech]
+        follow = (asyncio.create_task(self._compose_follow_on(speeches))
                   if self.brain.pending_followup else None)
-        await speech
+        for one in speeches:
+            await one
         # The brain is single-threaded by convention: let the follow-on finish
         # composing before the cut is written into its record.
         queued = await follow if follow is not None else None
-        interrupted = await self._speech_finished(speech, reply, more_coming=queued is not None)
+        interrupted = await self._speech_finished(speeches, reply, more_coming=queued is not None)
         await self._transfer_if_pending()
         if queued is None:
             return
@@ -1324,16 +1411,18 @@ class CarrierAgent(Agent):
         except RuntimeError:
             pass                           # session closing; the caller is gone
 
-    async def _acknowledge_if_slow(self, reply_task: asyncio.Task) -> None:
+    async def _acknowledge_if_slow(self, ready: asyncio.Future) -> None:
         """Fill the composing gap with a spoken acknowledgment, never silence.
 
-        Waits FILLER_DELAY for the reply; if it isn't ready, plays a cached clip
-        while composition keeps running in its thread. The say() is awaited so a
-        ready reply queues naturally behind it instead of colliding with it.
+        Waits FILLER_DELAY for `ready` — the reply's first sentence on its way
+        to the voice, or the whole reply when the turn is not streamed. If it
+        isn't there, plays a cached clip while composition keeps running in its
+        thread. The say() is awaited so the reply queues naturally behind it
+        instead of colliding with it.
         """
         if not self._fillers or _settings.filler_delay <= 0 or not self._filler_due():
             return
-        done, _ = await asyncio.wait({reply_task}, timeout=_settings.filler_delay)
+        done, _ = await asyncio.wait({ready}, timeout=_settings.filler_delay)
         if done:
             return
         text, pcm, rate = self._next_filler()
@@ -1449,16 +1538,26 @@ class CarrierAgent(Agent):
         self._cancel_unheard_watch()
         self._cancel_idle_watch()
         self._turn_in_flight = True
+        # The voice starts on the reply's first sentence: the brain hands each
+        # one over as the model finishes it, and `turn` feeds them to one
+        # utterance while the rest is still being written. See `_TurnSpeech`.
+        turn = _TurnSpeech(self.session, asyncio.get_running_loop())
+        self.brain.speech_sink = turn if _settings.stream_compose else None
+        pump = asyncio.create_task(turn.pump())
         try:
             reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
+            reply_task.add_done_callback(lambda _t: turn.finished())
             # Every filler promises work is coming ("Alright, let me check that."),
             # and in front of a goodbye that promise is nonsense — observed live, a
             # caller's "No. Thank you." was answered with a filler and THEN the
             # close. A beat of silence before a goodbye is fine; skip the filler.
             if not is_closing_turn(user_text):
-                await self._acknowledge_if_slow(reply_task)
+                await self._acknowledge_if_slow(turn.first_text)
             reply = await reply_task
-            logger.info("AGENT reply → %s", reply)
+            await pump
+            logger.info("AGENT reply → %s%s", reply,
+                        f" (streamed, {turn.sentences} sentence"
+                        f"{'' if turn.sentences == 1 else 's'})" if turn.speeches else "")
             timing = self.brain.last_turn_timing
             if timing:
                 logger.info(
@@ -1468,11 +1567,17 @@ class CarrierAgent(Agent):
                     "" if timing["compose_calls"] == 1 else "s", timing["other"],
                     timing["state"])
             try:
-                await self._after_reply(self.session.say(reply), reply)
+                # Streamed: the utterance(s) are already playing. Not streamed
+                # (a money turn, the switch off): say the finished reply whole.
+                speeches = turn.speeches or [self.session.say(reply)]
+                await self._after_reply(speeches, reply)
             except RuntimeError as e:  # e.g. caller hung up mid-turn
                 logger.info("Could not speak (session closing): %s", e)
         finally:
+            self.brain.speech_sink = None
             self._turn_in_flight = False
+            if not pump.done():
+                pump.cancel()
         if self.brain.state.value == "done":
             await self._hang_up()
         else:

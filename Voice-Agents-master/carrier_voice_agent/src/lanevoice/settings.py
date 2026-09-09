@@ -339,6 +339,15 @@ class Settings(BaseSettings):
     # miles, rate) in one turn; short turns simply come back short.
     llm_max_tokens: int = Field(default=220, validation_alias="LLM_MAX_TOKENS")
     llm_read_max_tokens: int = Field(default=120, validation_alias="LLM_READ_MAX_TOKENS")
+    # Start the voice on the reply's first sentence while the model is still
+    # writing the rest, instead of after the last word. Composing measured
+    # 2.7-5.0s per turn on Sonnet 5 and was the whole of the gap the caller sat
+    # through; with this on, the wait is the model's first sentence (~1-2s) and
+    # the rest is written under cover of speech. Only turns with no REQUIRED
+    # dollar figure stream (a rate the turn must state can only be checked once
+    # the whole reply exists); every streamed sentence is still checked against
+    # SPEAKABLE before it is spoken. 0 = compose the whole reply first, as before.
+    stream_compose: bool = Field(default=True, validation_alias="STREAM_COMPOSE")
     allow_interruptions: bool = Field(default=True, validation_alias="ALLOW_INTERRUPTIONS")
     # Wait this long after the caller stops before replying. Higher = fewer
     # cut-offs / fragment replies on a noisy phone line.

@@ -63,6 +63,7 @@ from lanevoice.services import (
 )
 from lanevoice.settings import Settings, get_settings
 from lanevoice.voice.composer import TurnComposer
+from lanevoice.voice.sentences import split_sentences
 
 # The one written line in the system. Reached only when the composer cannot
 # produce a turn that respects the engine's numbers — see `_cannot_compose`.
@@ -606,6 +607,10 @@ class CarrierSalesAgent:
         # no caller turn in between — the load's requirements right after the
         # load itself. See `continue_turn`.
         self.pending_followup = False
+        # Where a streamed turn's sentences go as the model finishes them — the
+        # worker sets this for the duration of `handle()`; None means every
+        # reply is composed whole before it is spoken. See `_say_streaming`.
+        self.speech_sink = None
         self._empty_state_only: str | None = None  # "Indiana": a state, not a place
         self._empty_place: str | None = None       # the table's name for where they are
         self._asked_state = False                  # one "which state?" per call
@@ -727,6 +732,14 @@ class CarrierSalesAgent:
         speakable = _speakable(amounts)
         correction = ""
 
+        if (self.speech_sink is not None and must_say is None
+                and hasattr(self._composer, "compose_stream")):
+            # A required figure can only be checked once the whole reply exists;
+            # everything else is checked a sentence at a time and spoken as it
+            # comes. Negotiation counters therefore wait for the last word, the
+            # pitch and the questions do not.
+            return self._say_streaming(directive, facts, amounts, source, speakable)
+
         attempts = max(1, self._settings.llm_attempts)
         why = "no attempt was made"
         for attempt in range(1, attempts + 1):
@@ -773,6 +786,114 @@ class CarrierSalesAgent:
             correction = breach
 
         return self._cannot_compose(why)
+
+    def _say_streaming(self, directive: str, facts: str, amounts: set[int] | None,
+                       source: str, speakable: str) -> str:
+        """`_say`, with the voice starting on the first sentence instead of the last.
+
+        The composer yields text as the model writes it; each complete sentence
+        is checked against the money guard and, if clean, handed to
+        `speech_sink` for the voice while the model is still writing. What the
+        guard rejects never reaches the sink — but the sentences before it have
+        already been heard, so the retry is told what was said and continues from
+        there rather than starting the turn again. A reply that hits the token
+        limit keeps its complete sentences and drops the unfinished tail; if
+        nothing complete came out, the whole-reply path (which knows how to ask
+        for something shorter) takes over.
+
+        Every attempt's sentences are one utterance to the caller: `begin` and
+        `end` bracket the whole of this line, however many attempts it took.
+        """
+        sink = self.speech_sink
+        spoken: list[str] = []
+        correction = ""
+        attempts = max(1, self._settings.llm_attempts)
+        why = "no attempt was made"
+        sink.begin()
+        try:
+            for attempt in range(1, attempts + 1):
+                started = time.monotonic()
+                buffer = ""
+                breach: str | None = None
+                try:
+                    for delta in self._composer.compose_stream(
+                            directive=directive, facts=facts, dialogue=self._dialogue(),
+                            speakable=speakable, correction=correction,
+                            already_said=" ".join(spoken)):
+                        buffer += delta
+                        sentences, buffer = split_sentences(buffer)
+                        for sentence in sentences:
+                            breach = _breach(sentence, amounts, None, source, speakable)
+                            if breach is not None:
+                                break
+                            sink.chunk(sentence)
+                            spoken.append(sentence)
+                        if breach is not None:
+                            break
+                except Exception as exc:  # noqa: BLE001 - a flaky API must not drop the call
+                    self._compose_seconds += time.monotonic() - started
+                    self._compose_calls += 1
+                    why = f"{type(exc).__name__}: {exc}"
+                    logger.warning("composer failed mid-stream (attempt %d/%d) in state %s — %s",
+                                   attempt, attempts, self.state.value, why)
+                    if _UNRETRYABLE.search(str(exc)) or _UNRETRYABLE.search(
+                            type(exc).__name__):
+                        logger.error(
+                            "composer cannot be reached and retrying will not help. "
+                            "Check %s and LLM_MODEL in your .env, or set "
+                            "USE_LLM=false to drive the flow with the offline stub.",
+                            self._settings.llm_key_name)
+                        break
+                    continue
+                self._compose_seconds += time.monotonic() - started
+                self._compose_calls += 1
+                if breach is not None:
+                    why = correction = breach
+                    logger.warning("rejected a streamed sentence in state %s — %s | it said: %r; "
+                                   "what was already spoken stands, the rest is recomposed",
+                                   self.state.value, breach, buffer[:200])
+                    continue
+                tail = buffer.strip()
+                if tail and getattr(self._composer, "last_truncated", False):
+                    # The model ran out of tokens mid-sentence. The finished
+                    # sentences stand; the fragment is never spoken.
+                    logger.warning("streamed turn hit the %d-token limit; dropping the "
+                                   "unfinished tail %r", self._settings.llm_max_tokens, tail[:120])
+                    if not spoken:
+                        # Nothing whole was said yet, so the whole-reply path —
+                        # which retries with an explicit length instruction — is
+                        # the right way to get this turn out.
+                        tail = self._composer.compose(
+                            directive=directive, facts=facts, dialogue=self._dialogue(),
+                            speakable=speakable, correction=correction).strip()
+                        self._compose_calls += 1
+                    else:
+                        tail = ""
+                if tail:
+                    breach = _breach(tail, amounts, None, source, speakable)
+                    if breach is not None:
+                        why = correction = breach
+                        logger.warning("rejected the end of a streamed turn in state %s — %s | "
+                                       "it said: %r", self.state.value, breach, tail[:200])
+                        continue
+                    sink.chunk(tail)
+                    spoken.append(tail)
+                if not spoken:
+                    why = "the composer returned nothing"
+                    correction = "You returned nothing at all. Say your turn out loud."
+                    continue
+                text = " ".join(spoken)
+                self._log_turn("agent", text)
+                return text
+            if spoken:
+                # The caller heard this much before the attempts ran out; the
+                # record has to show it in front of the handoff line.
+                self._log_turn("agent", " ".join(spoken))
+            line = self._cannot_compose(why)
+            sink.chunk(line)
+            return " ".join([*spoken, line])
+        finally:
+            sink.end()
 
     def _cannot_compose(self, why: str) -> str:
         """We could not produce a turn we're allowed to speak, or the model is down.
