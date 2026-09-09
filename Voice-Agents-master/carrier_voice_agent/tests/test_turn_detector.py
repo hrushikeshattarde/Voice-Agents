@@ -39,10 +39,16 @@ def test_the_session_receives_the_detector_the_worker_built():
     settings = _settings(stt_provider="inference")
     detector = build_turn_detector(settings)
     kwargs = session_kwargs({"turn_detector": detector, "keyterms": ["load"]}, settings)
-    assert kwargs["turn_detection"] is detector
+    # INSIDE turn_handling. As its own `turn_detection=` argument beside
+    # turn_handling= the framework ignores it and builds a default detector
+    # (the local mini model outside dev mode) — verified on 1.6.6, and how the
+    # worker ran from 09-08 to 09-09.
+    assert kwargs["turn_handling"]["turn_detection"] is detector
+    assert "turn_detection" not in kwargs
+    assert kwargs["turn_handling"]["endpointing"]["min_delay"] == settings.min_endpointing_delay
     assert kwargs["stt_context_options"]["keyterms"] == ["load"]      # untouched by the split
 
-    # Off = the exact session that ran before the detector existed: no key at all,
-    # rather than an explicit None the framework would have to interpret.
+    # Off = an EXPLICIT None: the framework's documented switch. Leaving the key
+    # out means "use the default detector", which is not off at all.
     off = session_kwargs({"turn_detector": None, "keyterms": ["load"]}, settings)
-    assert "turn_detection" not in off
+    assert off["turn_handling"]["turn_detection"] is None

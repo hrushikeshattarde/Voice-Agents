@@ -24,3 +24,7 @@ dist/
 # test / tooling caches
 .pytest_cache/
 .ruff_cache/
+
+# Console logs from the worker and dashboard launchers (tee'd there). They carry
+# caller numbers and transcripts: local data, never repository content.
+KMS/logs/

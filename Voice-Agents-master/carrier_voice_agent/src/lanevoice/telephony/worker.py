@@ -29,6 +29,7 @@ import logging
 import random
 import shutil
 import threading
+import time
 from collections.abc import AsyncIterable, Coroutine
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,7 @@ class _CallIdFilter(logging.Filter):
 _CALL_ID_FILTER = _CallIdFilter()
 
 _SPEECH_PROVIDERS = ("inference", "openrouter")
+_INTERRUPTION_MODES = ("vad", "adaptive")
 
 
 # --------------------------------------------------------------------------- #
@@ -421,6 +423,11 @@ TRANSFER_FAILED_LINE = ("Looks like I can't get them on the line right now. A re
                         "call you straight back on this one.")
 # How long to let the rep's phone ring before the transfer counts as failed.
 _TRANSFER_TIMEOUT = 60.0
+# A caller's final transcript that arrived while the agent was still talking is
+# treated as the answer to what the agent was saying only if it landed within
+# this many seconds of the agent finishing — see `_settle_withheld_transcript`.
+# Older than that it was a "yeah" under the pitch, and is dropped.
+_WITHHELD_ANSWER_WINDOW = 2.5
 
 
 # --------------------------------------------------------------------------- #
@@ -697,6 +704,13 @@ def prewarm(proc):
     else:
         logger.info("turn detector: OFF (TURN_DETECTOR=0) — every turn commits %.1fs after "
                     "silence, whatever the words were", _settings.min_endpointing_delay)
+    logger.info("barge-in: %s mode — %.1fs of caller speech and %d word%s cut the agent off; "
+                "echo warm-up %s; fillers at most every %.0fs",
+                _settings.interruption_mode.strip().lower(),
+                _settings.min_interruption_duration, _settings.min_interruption_words,
+                "" if _settings.min_interruption_words == 1 else "s",
+                f"{_settings.aec_warmup_seconds:.1f}s" if _settings.aec_warmup_seconds > 0
+                else "off", _settings.filler_min_gap_seconds)
 
     # The agent has no scripted lines, so the composer is what lets it talk at all.
     # `build_composer` picks the provider from LLM_PROVIDER and falls back to the
@@ -796,6 +810,11 @@ class CarrierAgent(Agent):
         self._unheard_task: asyncio.Task | None = None
         self._reasks = 0
         self._last_stt: str | None = None  # last text the recogniser produced this turn
+        # The last FINAL the recogniser produced since the previous committed
+        # turn, with when it arrived — see `_commit_withheld_answer`.
+        self._pending_final: tuple[str, float] | None = None
+        # When the last dead-air filler was played — see `_filler_due`.
+        self._last_filler_at: float | None = None
 
     # -- what the recogniser produced, before any filtering ------------------ #
     def on_user_input_transcribed(self, ev) -> None:
@@ -808,6 +827,8 @@ class CarrierAgent(Agent):
             self._last_stt = ev.transcript
         if ev.is_final:
             logger.info("STT final → %r", ev.transcript)
+            if ev.transcript.strip():
+                self._pending_final = (ev.transcript, time.monotonic())
         else:
             logger.debug("STT interim → %r", ev.transcript)
 
@@ -858,6 +879,16 @@ class CarrierAgent(Agent):
                 or self.session.current_speech is not None
                 or self.session.user_state == "speaking"):
             return  # a turn landed, a reply is under way, or they are talking again
+        # Right after the pitch the only answer that fits is "go ahead": read the
+        # requirements rather than ask them to say it again. That re-ask is what
+        # made the requirements a no-pause follow-on from 09-03 to 09-09.
+        more = await asyncio.to_thread(self.brain.proceed_without_answer)
+        if more:
+            logger.info("UNHEARD → the caller answered the pitch but nothing was transcribed "
+                        "(recogniser's last output %r); taking it as 'go ahead' and reading "
+                        "the requirements", self._last_stt)
+            await self._speak_line(more)
+            return
         if self._reasks >= _MAX_REASKS:
             # The re-asks are spent and they are still not coming through. Say
             # so, promise the callback, put it on the record, and end the call —
@@ -877,6 +908,23 @@ class CarrierAgent(Agent):
         await asyncio.to_thread(self.brain.note_unheard)
         await self._say_clip(self._reask, REASK_LINE)
         self._arm_idle_watch()
+
+    async def _speak_line(self, text: str) -> None:
+        """A brain line spoken outside a caller turn — the requirements, when the
+        caller's go-ahead was heard but not transcribed. Marked in flight so the
+        watchdogs stand down while it plays; the idle watch is re-armed after."""
+        self._turn_in_flight = True
+        try:
+            logger.info("AGENT reply → %s", text)
+            await self._speech_finished(self.session.say(text), text)
+        except RuntimeError as e:
+            logger.info("Could not speak (session closing): %s", e)
+        finally:
+            self._turn_in_flight = False
+        if self.brain.state.value == "done":
+            await self._hang_up()
+        else:
+            self._arm_idle_watch()
 
     async def _say_clip(self, clip: Clip | None, text: str) -> None:
         """A pre-rendered line, or the same words through the voice when the clip
@@ -926,6 +974,7 @@ class CarrierAgent(Agent):
             logger.info("IDLE → nothing from the caller for %.0fs; asking if they're there",
                         _settings.idle_prompt_seconds)
             await self._say_clip(self._still_there, STILL_THERE_LINE)
+            await self._settle_withheld_transcript(more_coming=False)
             await asyncio.sleep(_settings.idle_close_seconds)
             if self._caller_is_back(seq):
                 return
@@ -959,24 +1008,156 @@ class CarrierAgent(Agent):
         except Exception as exc:  # noqa: BLE001 - the caller can still hang up themselves
             logger.warning("could not end the room: %s", exc)
 
-    async def _follow_on(self) -> None:
-        """The second half of the agent's turn, spoken with no caller turn in
-        between — the load's requirements right after the load. See
-        `CarrierSalesAgent.continue_turn`."""
-        if not self.brain.pending_followup:
-            return
+    async def _compose_follow_on(self, after) -> tuple[str, Any] | None:
+        """Compose the second half of the agent's turn WHILE the first half plays,
+        and queue it to play straight after — the load's requirements right
+        behind the load. See `CarrierSalesAgent.continue_turn`.
+
+        It used to be composed only after the first half had finished, which
+        left three to five seconds of silence between "got a couple of
+        requirements to run through" and the requirements. Observed live on
+        09-09: the caller filled that silence with "Okay.", the framework took
+        the words as a barge-in on the line that was about to start, the
+        requirements were never heard, and "Okay." was then read as agreeing to
+        them. Queued behind the first half there is no silence to fill.
+
+        Returns (text, handle); (text, None) when the first half was cut off
+        before this was ready — composed, never spoken; None when there was
+        nothing to add.
+        """
         more = await asyncio.to_thread(self.brain.continue_turn)
         if not more:
-            return
+            return None
+        if getattr(after, "interrupted", False):
+            logger.info("FOLLOW-ON withdrawn: the caller cut in while it was being composed "
+                        "→ %s", more)
+            return more, None
         logger.info("AGENT reply (continued) → %s", more)
         try:
-            speech = self.session.say(more)
-            await speech
-            if getattr(speech, "interrupted", False):
-                logger.info("PLAYBACK CUT by caller → %s", more)
-                await asyncio.to_thread(self.brain.note_playback_cut, more)
-        except RuntimeError as e:
-            logger.info("Could not speak (session closing): %s", e)
+            return more, self.session.say(more)
+        except RuntimeError:
+            return more, None              # session closing
+
+    @staticmethod
+    def _heard_text(speech) -> str:
+        """What the caller actually heard of a line: the framework records the
+        text aligned to the audio that played, and nothing when none did."""
+        return " ".join(
+            (getattr(item, "text_content", None) or "")
+            for item in (getattr(speech, "chat_items", None) or [])).strip()
+
+    async def _speech_finished(self, speech, text: str, *, more_coming: bool = False) -> bool:
+        """Wait out one of our lines; True if the caller cut it off.
+
+        Barge-in cuts our audio mid-word. The transcript records what was
+        composed, so the brain is told what was HEARD — nothing, when the cut
+        came before the first word — and it corrects the record and, for the
+        requirements or the pitch, its own state (see
+        `CarrierSalesAgent.note_playback_cut`). A line that played to the end
+        then settles any short caller transcript the framework held back while
+        it was playing.
+        """
+        await speech
+        if getattr(speech, "interrupted", False):
+            heard = self._heard_text(speech)
+            logger.info("PLAYBACK CUT by caller → %s (heard: %s)", text,
+                        repr(heard) if heard else "none of it")
+            await asyncio.to_thread(self.brain.note_playback_cut, text, heard)
+            return True
+        await self._settle_withheld_transcript(more_coming=more_coming)
+        return False
+
+    async def _after_reply(self, speech, reply: str) -> None:
+        """Everything that follows the reply to a caller's turn.
+
+        The follow-on (the requirements after the load) is composed while the
+        reply plays and queued to play right behind it. If the caller cuts the
+        reply, the follow-on is withdrawn: whatever they said is their next
+        turn, the framework holds it until this handler returns, and reading
+        the follow-on first would mean a caller who asked "what's it paying?"
+        hears the whole requirements list and then the answer. The brain is
+        told the line was never heard, so it is read on the next turn. The
+        handoff is dialled whether or not they cut in — they asked for a person.
+        """
+        follow = (asyncio.create_task(self._compose_follow_on(speech))
+                  if self.brain.pending_followup else None)
+        await speech
+        # The brain is single-threaded by convention: let the follow-on finish
+        # composing before the cut is written into its record.
+        queued = await follow if follow is not None else None
+        interrupted = await self._speech_finished(speech, reply, more_coming=queued is not None)
+        await self._transfer_if_pending()
+        if queued is None:
+            return
+        more, handle = queued
+        if handle is None:                       # composed after the cut; never spoken
+            await asyncio.to_thread(self.brain.note_playback_cut, more, "")
+            return
+        if interrupted:
+            handle.interrupt()                   # queued behind a line they cut: withdraw it
+        await self._speech_finished(handle, more)
+
+    async def _settle_withheld_transcript(self, *, more_coming: bool) -> None:
+        """Deal with a short caller transcript the framework held while we spoke.
+
+        MIN_INTERRUPTION_WORDS has a second effect inside the framework: a final
+        transcript under that many words is not COMMITTED as a turn while the
+        agent's audio is still playing — it is held and glued to whatever the
+        caller says next. Two live failures came out of that:
+
+        * "Yes." given as we finished asking "can you handle both of those?" was
+          held, the question stood unanswered, the unheard watchdog did not arm
+          (a speech was still active), and the caller repeated themselves
+          twelve seconds later — "Yes. Yes." on the 09-04 call.
+        * A one-word "9." heard fourteen seconds into the pitch was glued onto
+          the caller's later "Okay." — two words, so it counted as a barge-in on
+          the line that was about to play, and that line was never heard (09-09).
+
+        So once our audio has finished and the caller is quiet: a final that
+        arrived in the last stretch of our line, with nothing more of ours
+        queued behind it, is committed as their turn. Anything older — or
+        anything said under the first half of a two-part turn — was a
+        backchannel and is dropped, so it cannot inflate or corrupt their next
+        words.
+        """
+        pending = self._pending_final
+        if pending is None or _settings.min_interruption_words <= 0:
+            return
+        if self.session.user_state == "speaking":
+            return                         # they are talking; the normal path owns it
+        text, heard_at = pending
+        age = time.monotonic() - heard_at
+        if age <= _WITHHELD_ANSWER_WINDOW and not more_coming:
+            # `say()` resolves a moment before the framework releases the speech
+            # handle, and until it has, the commit would be refused as a barge-in.
+            for _ in range(10):
+                if self.session.current_speech is None:
+                    break
+                await asyncio.sleep(0.05)
+            if self.session.current_speech is not None or self.session.user_state == "speaking":
+                return
+            self._pending_final = None
+            logger.info("WITHHELD → %r arrived while we were speaking; committing it as the "
+                        "caller's turn", text)
+            try:
+                self.session.commit_user_turn(transcript_timeout=0.3)
+            except RuntimeError:
+                pass                       # session closing
+            return
+        self._pending_final = None
+        logger.info("BACKCHANNEL → %r heard under our line %.0fs ago; dropped so it is not "
+                    "glued onto their next words", text, age)
+        try:
+            self.session.clear_user_turn()
+        except RuntimeError:
+            pass                           # session closing
+
+    def _filler_due(self) -> bool:
+        """Whether a filler may play on this turn — see FILLER_MIN_GAP_SECONDS."""
+        gap = _settings.filler_min_gap_seconds
+        if gap <= 0 or self._last_filler_at is None:
+            return True
+        return time.monotonic() - self._last_filler_at >= gap
 
     def _next_filler(self) -> Clip:
         """A filler that isn't the one just used — the same 'one sec' twice in a
@@ -1150,12 +1331,13 @@ class CarrierAgent(Agent):
         while composition keeps running in its thread. The say() is awaited so a
         ready reply queues naturally behind it instead of colliding with it.
         """
-        if not self._fillers or _settings.filler_delay <= 0:
+        if not self._fillers or _settings.filler_delay <= 0 or not self._filler_due():
             return
         done, _ = await asyncio.wait({reply_task}, timeout=_settings.filler_delay)
         if done:
             return
         text, pcm, rate = self._next_filler()
+        self._last_filler_at = time.monotonic()
         try:
             await self.session.say(
                 text,
@@ -1165,6 +1347,62 @@ class CarrierAgent(Agent):
         except RuntimeError:
             pass                          # session closing; the reply say() will report
 
+    def _log_sip_state(self, when: str) -> None:
+        """What LiveKit knows about the caller's leg: the SIP call status, which
+        trunk took the call, and whether their audio track is published and
+        subscribed. A call that connects with no audio in either direction is
+        otherwise invisible from inside the agent."""
+        room = self._ctx.room if self._ctx is not None else None
+        if room is None:
+            return
+        for participant in getattr(room, "remote_participants", {}).values():
+            attrs = {k: v for k, v in dict(getattr(participant, "attributes", {}) or {}).items()
+                     if k.startswith("sip.")}
+            tracks = []
+            for pub in getattr(participant, "track_publications", {}).values():
+                tracks.append(f"{getattr(pub, 'source', '?')}:"
+                              f"{'muted' if getattr(pub, 'muted', False) else 'live'}/"
+                              f"{'subscribed' if getattr(pub, 'subscribed', False) else 'unsub'}")
+            logger.info("SIP %s → %s kind=%s attrs=%s tracks=%s", when, participant.identity,
+                        getattr(participant, "kind", "?"), attrs, tracks)
+
+    async def _wait_for_caller_media(self) -> None:
+        """Hold the greeting until the caller's leg is actually connected.
+
+        LiveKit adds the SIP participant to the room while the call is still
+        RINGING and flips `sip.callStatus` to "active" once media is up. Observed
+        live: 'ringing' at pickup, 'active' six seconds later — and the greeting,
+        played at once from its pre-rendered clip, went into a leg nobody was
+        connected to. Five callers in a row heard silence and hung up.
+
+        Sessions with no SIP participant (the dashboard, tests) return at once. A
+        status that never turns active gives up after SIP_MEDIA_WAIT_SECONDS and
+        greets anyway, which is what the agent did before this existed.
+        """
+        room = self._ctx.room if self._ctx is not None else None
+        timeout = _settings.sip_media_wait_seconds
+        if room is None or timeout <= 0:
+            return
+        started = time.monotonic()
+        statuses: list[str] = []
+        while time.monotonic() - started < timeout:
+            participants = list(getattr(room, "remote_participants", {}).values())
+            statuses = [
+                str(status) for status in (
+                    dict(getattr(p, "attributes", {}) or {}).get("sip.callStatus")
+                    for p in participants)
+                if status]
+            if participants and not statuses:
+                return                     # not a phone call — nothing to wait for
+            if statuses and all(status == "active" for status in statuses):
+                waited = time.monotonic() - started
+                if waited >= 0.3:
+                    logger.info("SIP leg active after %.1fs — greeting now", waited)
+                return
+            await asyncio.sleep(0.1)
+        logger.warning("SIP leg still %s after %.0fs — greeting anyway",
+                       statuses or "absent", timeout)
+
     async def on_enter(self):
         # Who is calling, from the SIP leg (`sip_+12602649808`): recorded on the
         # call and repeated in the summary note the rep reads on the load.
@@ -1173,6 +1411,8 @@ class CarrierAgent(Agent):
             number = identity.removeprefix("sip_")
             logger.info("CALLER number → %s", number)
             await asyncio.to_thread(self.brain.set_caller, number)
+        self._log_sip_state("at pickup")
+        await self._wait_for_caller_media()
         if self._greeting is not None:
             # Composed and rendered at process start: the caller hears a voice the
             # moment the line connects. `greet_with` only records the line, but
@@ -1188,14 +1428,13 @@ class CarrierAgent(Agent):
             greeting = await asyncio.to_thread(self.brain.greeting)
             logger.info("GREETING → %s", greeting)
             speech = self.session.say(greeting)
-        await speech
-        if getattr(speech, "interrupted", False):
-            logger.info("PLAYBACK CUT by caller → %s", greeting)
-            await asyncio.to_thread(self.brain.note_playback_cut, greeting)
+        await self._speech_finished(speech, greeting)
         self._arm_idle_watch()
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (getattr(new_message, "text_content", None) or "").strip()
+        # Whatever the recogniser produced is in this turn now; nothing is held.
+        self._pending_final = None
         # Ignore empty fragments and transcriber hallucinations ("Thank you.",
         # "you", "so"…) so the agent waits for real speech instead of replying to a phantom.
         if len(user_text) < 2 or parsing.is_probably_noise(user_text):
@@ -1229,18 +1468,7 @@ class CarrierAgent(Agent):
                     "" if timing["compose_calls"] == 1 else "s", timing["other"],
                     timing["state"])
             try:
-                speech = self.session.say(reply)
-                await speech
-                # Barge-in cuts our audio mid-word. The transcript records what was
-                # composed, so without this note the record shows a line the caller
-                # may never have heard — observed live when a caller's "hello?"
-                # (filling dead air) killed the very answer they were waiting on.
-                if getattr(speech, "interrupted", False):
-                    logger.info("PLAYBACK CUT by caller → %s", reply)
-                    await asyncio.to_thread(self.brain.note_playback_cut, reply)
-                # "Transferring you to X" has been said; now put them through.
-                await self._transfer_if_pending()
-                await self._follow_on()
+                await self._after_reply(self.session.say(reply), reply)
             except RuntimeError as e:  # e.g. caller hung up mid-turn
                 logger.info("Could not speak (session closing): %s", e)
         finally:
@@ -1270,6 +1498,9 @@ def turn_handling(settings: Settings) -> TurnHandlingOptions:
         },
         "interruption": {
             "enabled": settings.allow_interruptions,
+            # Pinned: left out, the framework picks a different strategy in dev
+            # and in production — see INTERRUPTION_MODE in settings.
+            "mode": settings.interruption_mode.strip().lower(),
             "min_duration": settings.min_interruption_duration,
             "min_words": settings.min_interruption_words,
             "resume_false_interruption": settings.resume_false_interruption,
@@ -1330,7 +1561,8 @@ def session_kwargs(ud: dict[str, Any], settings: Settings) -> dict[str, Any]:
     Split out of `entrypoint` so a test can see what the session is handed
     without a room: chiefly that the turn detector the worker built actually
     reaches it, since a detector that is constructed and then not passed is
-    exactly the silent failure that left MAX_ENDPOINTING_DELAY dead for months.
+    exactly the silent failure that left MAX_ENDPOINTING_DELAY dead for months —
+    and, until 09-09, passed in a way the framework ignored.
     """
     kwargs: dict[str, Any] = {}
     if settings.stt_on_inference:
@@ -1346,11 +1578,22 @@ def session_kwargs(ud: dict[str, Any], settings: Settings) -> dict[str, Any]:
         kwargs["stt_context_options"] = {
             "keyterms": ud.get("keyterms") or _stt_keyterms(settings),
             "forward_chat_context": False}
-    if (detector := ud.get("turn_detector")) is not None:
-        # Passed only when built. The framework reads an explicit None as "no
-        # detector" too, but leaving the key out keeps TURN_DETECTOR=0 identical
-        # to the sessions that ran before the detector existed.
-        kwargs["turn_detection"] = detector
+    # The detector rides INSIDE turn_handling. Passed as its own argument next
+    # to turn_handling= it is silently ignored (one deprecation warning, then the
+    # framework builds its own default detector — the local mini model outside
+    # dev mode), which is what the 09-08 wiring did until 09-09: the hosted
+    # model the log announced never reached the session. An explicit None is the
+    # framework's documented off switch; leaving the key out means "default
+    # detector", so TURN_DETECTOR=0 must send None.
+    handling = turn_handling(settings)
+    handling["turn_detection"] = ud.get("turn_detector")
+    kwargs["turn_handling"] = handling
+    # The framework's echo warm-up feeds the recogniser SILENCE for the first
+    # seconds the agent speaks — the whole greeting, on a phone call — so a
+    # caller talking over "what can I do for you?" lost the head of their
+    # sentence. Off by default here; a phone leg has no echo path for it to
+    # guard. None is how the framework spells off. See AEC_WARMUP_SECONDS.
+    kwargs["aec_warmup_duration"] = settings.aec_warmup_seconds or None
     return kwargs
 
 
@@ -1361,8 +1604,7 @@ async def entrypoint(ctx: JobContext):
         vad=ud["vad"],
         stt=ud["stt"],
         tts=ud["tts"],
-        turn_handling=turn_handling(_settings),
-        **session_kwargs(ud, _settings),
+        **session_kwargs(ud, _settings),     # turn_handling (with the detector) included
     )
     session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
@@ -1423,6 +1665,10 @@ def main() -> None:
         if value.strip().lower() not in _SPEECH_PROVIDERS:
             raise RuntimeError(
                 f"{name}={value!r} is not one of: {', '.join(_SPEECH_PROVIDERS)}.")
+    if _settings.interruption_mode.strip().lower() not in _INTERRUPTION_MODES:
+        raise RuntimeError(
+            f"INTERRUPTION_MODE={_settings.interruption_mode!r} is not one of: "
+            f"{', '.join(_INTERRUPTION_MODES)}.")
     # LiveKit is always required — it carries the call and, by default, the
     # speech. OpenRouter is required only while some AI hop still runs there.
     required = ["livekit_url", "livekit_api_key", "livekit_api_secret"]

@@ -590,6 +590,10 @@ class CarrierSalesAgent:
         self._load_asks = 0                      # load numbers that didn't work out
         self._requirements_read = False          # have the board notes been spoken?
         self._requirement_asks = 0               # asks with no yes and no no
+        # The exact pitch and requirements lines as composed — so a cut-off line
+        # can be recognised and taken back (see `note_playback_cut`).
+        self._pitch_line: str | None = None
+        self._requirements_line: str | None = None
         self._mc_digits = ""                     # digits heard so far, across turns
         self._mc_narrowed = None                 # partial that matched one carrier
         self._identity_confirmed_for: str | None = None  # number whose company they affirmed
@@ -1522,23 +1526,29 @@ class CarrierSalesAgent:
         self._load_revealed = True       # from here the composer may quote the load
         if self.load.notes:
             self.state = CallState.CHECK_REQUIREMENTS
-            # The requirements follow as the agent's OWN next turn (`continue_turn`),
-            # not after a caller acknowledgement: the "sure" that pause invites is
-            # short, quiet and right after a long read-out — the exact profile the
-            # recogniser loses — and it cost a re-ask on every live call that got
-            # this far, with one "sure" heard as "Sheila".
-            self.pending_followup = True
-            return self._say(
+            # The requirements are read on the caller's NEXT turn, once they have
+            # answered the pitch — the desk wants the caller consulted before the
+            # list starts (09-09). The pitch ends on a question that invites a "go
+            # ahead", and `_check_requirements` reads them on whatever comes back
+            # short of a decline. From 09-03 to 09-09 they followed with no pause
+            # at all, because the short, quiet "sure" that pause invites is the
+            # exact profile the recogniser loses (one came back as "Sheila") and
+            # every lost one became a "didn't catch that". That failure is met
+            # differently now: an answer the VAD heard but the recogniser did not
+            # is taken as "go ahead" (`proceed_without_answer`), never re-asked.
+            self._pitch_line = spoken = self._say(
                 "Give them the load, SHORT — the way a rep rattles it off, not the way a "
                 "screen lists it. THREE SENTENCES AT MOST, and under about twelve seconds "
                 "of speech.\n"
                 + _PITCH_ESSENTIALS +
-                "Do NOT read them the special requirements yet — that is the very next "
-                "thing you will do. Finish by telling them there are a couple of specific "
-                "requirements you need to run through. Say NOTHING about rate yet; that "
-                "comes only once they have said they can meet those requirements.",
+                "Do NOT read them the special requirements yet. Finish by asking whether "
+                "it's alright to run through a couple of specific requirements on this one "
+                "— one short question that invites a yes, then stop and wait for it. Say "
+                "NOTHING about rate yet; that comes only once they have said they can meet "
+                "those requirements.",
                 amounts=set(),
             )
+            return spoken
         return self._present_offer(with_details=True)
 
     def _present_offer(self, with_details: bool = False) -> str:
@@ -1603,6 +1613,12 @@ class CarrierSalesAgent:
                 amounts=set(),
             )
 
+        if not self._load_revealed:
+            # The pitch was cut off before they heard it (`note_playback_cut` took
+            # it back): whatever they said over it is answered by giving them
+            # the load again, requirements to follow as before.
+            return self._reveal_load()
+
         # The pitch turn deliberately stops before the requirements, so the FIRST
         # time through here is where they are actually read. Splitting them off is
         # what keeps either turn short enough to follow: read together they ran to
@@ -1616,7 +1632,7 @@ class CarrierSalesAgent:
         turn (with the pitch, it ran to 25 seconds and hit the token limit)."""
         self._requirements_read = True
         self.pending_followup = False
-        return self._say(
+        self._requirements_line = spoken = self._say(
                 "Now cover this load's requirements from FACTS and ask outright whether "
                 "they can do it. TWO SENTENCES, then the question.\n"
                 "SAY every CONDITION THEY HAVE TO MEET — the trailer spec, tracking, "
@@ -1636,6 +1652,7 @@ class CarrierSalesAgent:
                 "Then stop and let them answer. No rate yet.",
                 amounts=set(),
             )
+        return spoken
 
     def _after_requirements(self, text: str) -> str:
         # Neither a yes nor a no. Historically this counted as agreement, which is
@@ -2316,16 +2333,37 @@ class CarrierSalesAgent:
     def continue_turn(self) -> str | None:
         """The second half of a turn the agent finishes on its own.
 
-        The worker calls this after the reply has been spoken. Today it carries
-        exactly one thing: the load's requirements straight after the load, with
-        no caller acknowledgement in between (see `_reveal_load`). None when
-        there is nothing to add.
+        The worker calls this after the reply has been spoken, when
+        `pending_followup` is set. Nothing sets it today: the requirements used
+        to follow the pitch this way, with no caller acknowledgement in between,
+        and since 09-09 they wait for the caller's answer instead (see
+        `_reveal_load`). Kept so a future two-part turn has the mechanism. None
+        when there is nothing to add.
         """
         if not self.pending_followup:
             return None
         self.pending_followup = False
         if self.state is CallState.CHECK_REQUIREMENTS and not self._requirements_read:
             return self._read_requirements()
+        return None
+
+    def proceed_without_answer(self) -> str | None:
+        """The line to speak when the caller answered but nothing was transcribed.
+
+        Right after the pitch the only answer that fits is "go ahead", so instead
+        of "sorry, didn't catch that" — which on the 09-03 calls turned every lost
+        "sure" into a re-ask, once with "sure" heard as "Sheila" — the requirements
+        are simply read. Anywhere else the caller's words matter, and None sends
+        the worker back to asking them to repeat.
+        """
+        if (self.state is CallState.CHECK_REQUIREMENTS and self.load is not None
+                and self._load_revealed and not self._requirements_read):
+            self._note("Caller answered the pitch but nothing they said could be transcribed "
+                       "— read the requirements rather than asking them to repeat an "
+                       "acknowledgement.")
+            spoken = self._read_requirements()
+            self._sync_transcript()
+            return spoken
         return None
 
     def give_up_unheard(self, spoken: str) -> None:
@@ -2360,19 +2398,56 @@ class CarrierSalesAgent:
             "Caller spoke but nothing was transcribed (a short or quiet utterance "
             "the recogniser returned empty) — asked them to say it again.")
 
-    def note_playback_cut(self, spoken_line: str) -> None:
+    def note_playback_cut(self, spoken_line: str, heard: str = "") -> None:
         """The caller spoke over this line and its audio stopped mid-play.
 
-        The transcript records what was COMPOSED; barge-in means the caller may
-        have heard none of it. Observed live: a caller filling dead air with
-        "hello?" cut off the very answer they were waiting for, and the record
-        showed a line they never heard. The note keeps the audit honest without
-        polluting the dialogue the composer reads.
+        `heard` is the text the framework aligned to the audio that actually
+        played — empty when the cut came before the first word. Three things
+        follow from it:
+
+        * The dialogue the composer reads is corrected to what they HEARD: the
+          line is replaced by its spoken part, marked, or removed outright when
+          none of it played. Observed live: a caller filling dead air with
+          "hello?" cut off the very answer they were waiting for, and the record
+          showed a line they never heard — and the composer, reading it, would
+          not say it again.
+        * The requirements read-out, if that is what was cut and most of it
+          went unheard, is UN-read: `_requirements_read` goes back to False so
+          the next turn reads them again before any rate is discussed. Observed
+          live on 09-09: the line was cancelled before a byte played, the
+          caller's "Okay." (said to the pitch) was then taken as agreeing to
+          requirements they never heard, and the call went straight to a rate.
+        * The pitch, likewise, is un-revealed so it is given again.
+
+        A note keeps the audit honest either way.
         """
+        heard = " ".join(heard.split())
+        composed_words = len(spoken_line.split())
+        heard_words = len(heard.split())
+        mostly_unheard = heard_words * 2 < composed_words
+        if self.transcript and self.transcript[-1] == ("agent", spoken_line):
+            if heard:
+                self.transcript[-1] = ("agent", f"{heard} [cut off by the caller]")
+            else:
+                self.transcript.pop()
+                if self._turn_meta:
+                    self._turn_meta.pop()
+        if mostly_unheard and self._requirements_read and spoken_line == self._requirements_line:
+            self._requirements_read = False
+            self._requirements_line = None
+            self._note("The load's requirements were cut off before the carrier heard them"
+                       + (f" (they heard: {heard!r})" if heard else "")
+                       + " — they will be read again before any rate is discussed.")
+        elif (mostly_unheard and self._load_revealed and spoken_line == self._pitch_line
+              and self.state is CallState.CHECK_REQUIREMENTS and not self._requirements_read):
+            self._load_revealed = False
+            self._pitch_line = None
         self._repo.log_note(
             self.call_id,
             f'Caller spoke over this line — its audio was cut off mid-play, so '
-            f'they may not have heard it: "{spoken_line}"')
+            f'they may not have heard it: "{spoken_line}"'
+            + (f' (they heard up to: "{heard}")' if heard else " (none of it played)"))
+        self._sync_transcript()
 
     def set_caller(self, number: str | None) -> None:
         """The number this call came from, as the phone leg reports it. Recorded

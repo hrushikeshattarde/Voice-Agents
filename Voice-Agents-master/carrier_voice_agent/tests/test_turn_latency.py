@@ -173,6 +173,8 @@ def test_turn_handling_is_built_from_settings():
     options = turn_handling(settings)
     assert options["endpointing"] == {"min_delay": 0.6, "max_delay": 2.5}
     assert options["interruption"] == {
-        "enabled": True, "min_duration": 0.8, "min_words": 3,
+        # `mode` is always present: left out, the framework picks adaptive in dev
+        # and vad in production, and a worker tested in one ships with the other.
+        "enabled": True, "mode": "vad", "min_duration": 0.8, "min_words": 3,
         "resume_false_interruption": True, "false_interruption_timeout": 1.5,
     }

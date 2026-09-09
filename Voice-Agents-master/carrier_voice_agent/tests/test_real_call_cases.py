@@ -28,17 +28,40 @@ def _directive(a) -> str:
     return a._composer.turns[-1]["directive"]
 
 
-def test_requirements_follow_the_load_without_waiting_for_a_sure(repo):
+def test_requirements_wait_for_the_callers_go_ahead(repo):
+    """The pitch ends on a question and STOPS; the requirements are the reply to
+    whatever the caller says next. Between 09-03 and 09-09 they followed the
+    pitch with no pause, and the desk heard the list start over the caller."""
     a = _agent(repo)
     a.handle("load L1002")                       # seeded with requirements
     a.handle("MC 123456")
     a.handle("empty in Chicago Illinois tomorrow morning")
-    assert a.pending_followup is True
-    assert "requirements" in _directive(a).lower()          # the pitch says they are coming
-    more = a.continue_turn()
-    assert more and a._requirements_read is True and a.pending_followup is False
-    assert "cover this load's requirements" in _directive(a)
+    assert a.pending_followup is False           # nothing queued behind the pitch
+    assert a._requirements_read is False
+    directive = _directive(a).lower()
+    assert "requirements" in directive and "asking whether" in directive
     assert a.continue_turn() is None
+    a.handle("sure, go ahead")
+    assert a._requirements_read is True
+    assert "cover this load's requirements" in _directive(a)
+
+
+def test_an_answer_heard_but_not_transcribed_after_the_pitch_reads_the_requirements(repo):
+    """The lost "sure": the VAD heard the caller, the recogniser returned nothing.
+    Right after the pitch that can only have been a go-ahead, so the requirements
+    are read instead of "didn't catch that" — the re-ask that, on 09-03, made
+    the requirements a no-pause follow-on in the first place."""
+    a = _agent(repo)
+    assert a.proceed_without_answer() is None                # nowhere else
+    a.handle("load L1002")
+    a.handle("MC 123456")
+    assert a.proceed_without_answer() is None                # not before the pitch
+    a.handle("empty in Chicago Illinois tomorrow morning")
+    spoken = a.proceed_without_answer()
+    assert spoken and a._requirements_read is True
+    assert "cover this load's requirements" in _directive(a)
+    assert a.proceed_without_answer() is None                # once
+    assert any("nothing they said could be transcribed" in n for n in _notes(repo))
 
 
 def test_a_state_alone_is_not_a_place(repo):

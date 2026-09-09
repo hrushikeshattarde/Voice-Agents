@@ -403,6 +403,15 @@ class Settings(BaseSettings):
     # numbers, and are deliberately NOT part of the transcript record. 0 turns
     # the feature off.
     filler_delay: float = Field(default=0.8, validation_alias="FILLER_DELAY")
+    # How often a filler may play at all. Composing takes longer than FILLER_DELAY
+    # on nearly every turn of the shipped model, so a filler ran in front of
+    # nearly every reply and the same four lines became the most repeated thing on
+    # the call — the desk's word for it was "irritating". A filler now waits at
+    # least this many seconds after the previous one; the turns in between get a
+    # beat of silence instead, which is what a rep pausing to think sounds like.
+    # 0 = a filler on every slow turn, as before.
+    filler_min_gap_seconds: float = Field(
+        default=30.0, validation_alias="FILLER_MIN_GAP_SECONDS")
 
     # Barge-in: how much CONTINUOUS caller speech cancels the agent's audio
     # mid-play. The library default (0.5s) meant a caller's "hello?" — spoken to
@@ -428,6 +437,24 @@ class Settings(BaseSettings):
     # "no wait", "hang on". 0 disables the check.
     min_interruption_words: int = Field(
         default=2, validation_alias="MIN_INTERRUPTION_WORDS")
+    # Which strategy decides that the caller is talking OVER the agent. "vad" is
+    # the plain rule above: MIN_INTERRUPTION_DURATION of speech and
+    # MIN_INTERRUPTION_WORDS of transcript. "adaptive" is LiveKit's hosted
+    # overlapping-speech model: one more WebSocket per call, every transcript
+    # HELD while the agent is speaking, and the ones it classes as backchannel
+    # dropped. Left unset, the framework picks adaptive under `lanevoice-worker
+    # dev` and vad under `lanevoice-worker start` — so a worker tested in dev
+    # shipped with barge-in rules it had never run under. Pinned to the rule every
+    # number above was tuned against.
+    interruption_mode: str = Field(default="vad", validation_alias="INTERRUPTION_MODE")
+    # Seconds after the agent FIRST speaks during which the framework treats the
+    # caller's audio as echo of the agent's own voice: the recogniser is fed
+    # silence and barge-in is off for as long as the agent is talking. Meant for a
+    # browser microphone hearing the speakers. A phone leg has no such echo path,
+    # and the framework's default of 3.0 covered the whole greeting — a caller who
+    # started talking over "what can I do for you?" lost the head of their sentence
+    # and the load number arrived as a fragment. 0 = off.
+    aec_warmup_seconds: float = Field(default=0.0, validation_alias="AEC_WARMUP_SECONDS")
     # The caller spoke — the VAD heard them — but no transcript ever arrived, so
     # no turn happened and the agent said nothing. Observed on the first live call
     # of the streaming pipeline: four half-second, quiet "10 AM"s in a row, each
@@ -467,6 +494,14 @@ class Settings(BaseSettings):
     # minutes and leaves the caller wondering. 0 keeps the line open.
     hangup_after_close_seconds: float = Field(
         default=1.5, validation_alias="HANGUP_AFTER_CLOSE_SECONDS")
+    # How long to hold the greeting for the caller's SIP leg to report
+    # `sip.callStatus` = active. Observed live: the participant is in the room
+    # while the call is still RINGING and turns active ~6s later, and a greeting
+    # played at once from its clip went into a leg nobody was connected to — five
+    # callers in a row heard silence and hung up. A leg that never reports active
+    # is greeted anyway after this many seconds. 0 = greet immediately.
+    sip_media_wait_seconds: float = Field(
+        default=15.0, validation_alias="SIP_MEDIA_WAIT_SECONDS")
     # Where this desk is, as a place the city table knows ("Fort Wayne, IN"). The
     # towns around it become recogniser vocabulary (`geo.region_keyterms`): a
     # caller's "Columbia City" is then a word the recogniser expects rather than
