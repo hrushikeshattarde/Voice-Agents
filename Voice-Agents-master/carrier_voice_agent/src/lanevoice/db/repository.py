@@ -222,6 +222,27 @@ class Repository:
             (call_id, note, _now()),
         )
 
+    def log_event(self, call_id: str, kind: str, detail: str,
+                  data: dict | None = None) -> None:
+        """A typed event on the call — see `call_events` in database.py. `kind`
+        is what the dashboard flags and filters on; `detail` is the sentence a
+        reviewer reads; `data` carries any numbers behind it."""
+        self._execute(
+            "INSERT INTO call_events (call_id, kind, detail, data, timestamp) "
+            "VALUES (?,?,?,?,?)",
+            (call_id, kind, detail, json.dumps(data) if data else None, _now()),
+        )
+
+    def record_worker_status(self, worker_id: str, *, started_at: str, build: str,
+                             calls_live: int, settings: dict) -> None:
+        """The phone worker's heartbeat — see `worker_status` in database.py."""
+        self._execute(
+            "INSERT OR REPLACE INTO worker_status "
+            "(worker_id, started_at, last_seen, build, calls_live, settings_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (worker_id, started_at, _now(), build, calls_live, json.dumps(settings)),
+        )
+
     def record_rep_summary_email(self, call_id: str, *, emailed_to: str | None = None,
                                  error: str | None = None) -> None:
         """How the post-call summary email to the load's assigned rep actually

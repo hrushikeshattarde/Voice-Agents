@@ -25,9 +25,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import datetime as _dt
 import logging
+import os
 import random
 import shutil
+import socket
+import subprocess
 import threading
 import time
 from collections.abc import AsyncIterable, Coroutine
@@ -66,7 +70,7 @@ from lanevoice import geo, parsing
 from lanevoice.conversation import CarrierSalesAgent, is_closing_turn
 from lanevoice.conversation.agent import compose_greeting
 from lanevoice.datasource import build_repository
-from lanevoice.db import Repository
+from lanevoice.db import Database, Repository
 from lanevoice.env import load_env
 from lanevoice.logging_config import TRACE_LEVEL, get_logger, setup_logging
 from lanevoice.settings import Settings, get_settings
@@ -611,7 +615,82 @@ def _report_call_load(server) -> float:
         else:
             logger.info("worker taking calls again: %d of %d in progress", active,
                         _settings.max_concurrent_calls)
+    _heartbeat(active)
     return load
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeat: the dashboard's answer to "is the worker up, and on what?"
+# --------------------------------------------------------------------------- #
+# Twice on 09-09 the worker's console window was closed after a test call and
+# nothing anywhere said so until the next call rang out. The framework polls
+# `load_fnc` every few seconds in the worker's main process, so that is where a
+# heartbeat costs nothing: a row in the audit database, rewritten every
+# HEARTBEAT_SECONDS, carrying the build and the turn-taking settings in force.
+HEARTBEAT_SECONDS = 30.0
+_STARTED_AT = _dt.datetime.now(_dt.UTC).isoformat()
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+_last_heartbeat = 0.0
+_status_repo: Repository | None = None
+
+
+def build_hash() -> str:
+    """The short git hash of the code this worker runs, or 'unknown'. Read once,
+    at import — a deployment without git on the path still starts."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, timeout=3, cwd=Path(__file__).resolve().parent)
+        return out.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+_BUILD = build_hash()
+
+
+def settings_summary(settings: Settings) -> dict[str, Any]:
+    """The turn-taking settings a call runs under, for the heartbeat row — the
+    ones that decide what the caller hears and when, not the credentials."""
+    return {
+        "min_endpointing_delay": settings.min_endpointing_delay,
+        "max_endpointing_delay": settings.max_endpointing_delay,
+        "turn_detector": settings.turn_detector_enabled,
+        "interruption_mode": settings.interruption_mode.strip().lower(),
+        "min_interruption_duration": settings.min_interruption_duration,
+        "min_interruption_words": settings.min_interruption_words,
+        "stream_compose": settings.stream_compose,
+        "aec_warmup_seconds": settings.aec_warmup_seconds,
+        "filler_delay": settings.filler_delay,
+        "filler_min_gap_seconds": settings.filler_min_gap_seconds,
+        "llm": settings.resolved_llm_model,
+        "stt": settings.stt_inference_model if settings.stt_on_inference else settings.stt_model,
+        "tts": settings.tts_inference_model if settings.tts_on_inference else settings.tts_model,
+        "max_concurrent_calls": settings.max_concurrent_calls,
+    }
+
+
+def write_heartbeat(active: int, settings: Settings, *, repo: Repository | None = None) -> None:
+    """One heartbeat row, now. Best effort: a locked or missing database costs
+    the dashboard a heartbeat, never the worker a call."""
+    global _status_repo
+    try:
+        if repo is None:
+            if _status_repo is None:
+                _status_repo = Repository(Database(settings.db_path))
+            repo = _status_repo
+        repo.record_worker_status(_WORKER_ID, started_at=_STARTED_AT, build=_BUILD,
+                                  calls_live=active, settings=settings_summary(settings))
+    except Exception as exc:  # noqa: BLE001 - the heartbeat must never take the worker down
+        logger.debug("heartbeat not written: %s", exc)
+
+
+def _heartbeat(active: int) -> None:
+    global _last_heartbeat
+    now = time.monotonic()
+    if now - _last_heartbeat < HEARTBEAT_SECONDS:
+        return
+    _last_heartbeat = now
+    write_heartbeat(active, _settings)
 
 
 # --------------------------------------------------------------------------- #
@@ -898,6 +977,28 @@ class CarrierAgent(Agent):
         self._pending_final: tuple[str, float] | None = None
         # When the last dead-air filler was played — see `_filler_due`.
         self._last_filler_at: float | None = None
+        # The voice's measurements for the reply in flight — see `on_metrics_collected`.
+        self._voice_metrics: list[tuple[float, float, bool]] = []
+
+    # -- the framework's measurements ---------------------------------------- #
+    def on_metrics_collected(self, ev) -> None:
+        """Log every measurement as before, and keep the voice's for the reply
+        in flight so they can be written beside that line of the transcript."""
+        _log_metrics(ev)
+        metrics = ev.metrics
+        if getattr(metrics, "type", "") == "tts_metrics" and self._turn_in_flight:
+            self._voice_metrics.append((float(metrics.ttfb or 0.0),
+                                        float(metrics.audio_duration or 0.0),
+                                        bool(metrics.cancelled)))
+
+    def _turn_voice(self) -> dict[str, Any]:
+        """The reply's voice numbers: first audio of its first piece, how long it
+        spoke in all, whether any piece was cut."""
+        if not self._voice_metrics:
+            return {}
+        return {"ttfb": round(self._voice_metrics[0][0], 2),
+                "speech": round(sum(d for _t, d, _c in self._voice_metrics), 1),
+                "cut": True if any(c for _t, _d, c in self._voice_metrics) else None}
 
     # -- what the recogniser produced, before any filtering ------------------ #
     def on_user_input_transcribed(self, ev) -> None:
@@ -1179,9 +1280,13 @@ class CarrierAgent(Agent):
         more, handle = queued
         if handle is None:                       # composed after the cut; never spoken
             await asyncio.to_thread(self.brain.note_playback_cut, more, "")
+            await asyncio.to_thread(self.brain.record_event, "followon_withdrawn",
+                                    "the caller cut in; the second half was never spoken")
             return
         if interrupted:
             handle.interrupt()                   # queued behind a line they cut: withdraw it
+            await asyncio.to_thread(self.brain.record_event, "followon_withdrawn",
+                                    "the caller cut in; the queued second half was withdrawn")
         await self._speech_finished(handle, more)
 
     async def _settle_withheld_transcript(self, *, more_coming: bool) -> None:
@@ -1230,6 +1335,10 @@ class CarrierAgent(Agent):
                 self.session.commit_user_turn(transcript_timeout=0.3)
             except RuntimeError:
                 pass                       # session closing
+            await asyncio.to_thread(
+                self.brain.record_event, "withheld_committed",
+                f"{text!r} arrived under our last words and was committed as the caller's "
+                f"turn once we stopped", age=round(age, 1))
             return
         self._pending_final = None
         logger.info("BACKCHANNEL → %r heard under our line %.0fs ago; dropped so it is not "
@@ -1238,6 +1347,9 @@ class CarrierAgent(Agent):
             self.session.clear_user_turn()
         except RuntimeError:
             pass                           # session closing
+        await asyncio.to_thread(
+            self.brain.record_event, "backchannel_dropped",
+            f"{text!r} heard under our line {age:.0f}s earlier was dropped", age=round(age, 1))
 
     def _filler_due(self) -> bool:
         """Whether a filler may play on this turn — see FILLER_MIN_GAP_SECONDS."""
@@ -1487,6 +1599,10 @@ class CarrierAgent(Agent):
                 waited = time.monotonic() - started
                 if waited >= 0.3:
                     logger.info("SIP leg active after %.1fs — greeting now", waited)
+                    await asyncio.to_thread(
+                        self.brain.record_event, "sip_wait",
+                        f"the greeting waited {waited:.1f}s for the SIP leg to turn active",
+                        seconds=round(waited, 1))
                 return
             await asyncio.sleep(0.1)
         logger.warning("SIP leg still %s after %.0fs — greeting anyway",
@@ -1531,6 +1647,7 @@ class CarrierAgent(Agent):
             raise StopResponse()
         logger.info("CALLER said → %s", user_text)
         _log_end_of_turn(new_message)
+        heard_timing = _heard_timing(new_message, _settings)
         # A real turn landed: the watchdog for unheard speech stands down. (A
         # phantom filtered above does not count — the caller still went unheard.)
         self._turn_seq += 1
@@ -1538,6 +1655,7 @@ class CarrierAgent(Agent):
         self._cancel_unheard_watch()
         self._cancel_idle_watch()
         self._turn_in_flight = True
+        self._voice_metrics = []
         # The voice starts on the reply's first sentence: the brain hands each
         # one over as the model finishes it, and `turn` feeds them to one
         # utterance while the rest is still being written. See `_TurnSpeech`.
@@ -1545,7 +1663,8 @@ class CarrierAgent(Agent):
         self.brain.speech_sink = turn if _settings.stream_compose else None
         pump = asyncio.create_task(turn.pump())
         try:
-            reply_task = asyncio.create_task(asyncio.to_thread(self.brain.handle, user_text))
+            reply_task = asyncio.create_task(
+                asyncio.to_thread(self.brain.handle, user_text, heard_timing))
             reply_task.add_done_callback(lambda _t: turn.finished())
             # Every filler promises work is coming ("Alright, let me check that."),
             # and in front of a goodbye that promise is nonsense — observed live, a
@@ -1571,6 +1690,8 @@ class CarrierAgent(Agent):
                 # (a money turn, the switch off): say the finished reply whole.
                 speeches = turn.speeches or [self.session.say(reply)]
                 await self._after_reply(speeches, reply)
+                if voice := self._turn_voice():
+                    await asyncio.to_thread(self.brain.note_turn_voice, **voice)
             except RuntimeError as e:  # e.g. caller hung up mid-turn
                 logger.info("Could not speak (session closing): %s", e)
         finally:
@@ -1639,6 +1760,24 @@ def _log_metrics(ev) -> None:
     elif kind == "stt_metrics":
         logger.debug("TIMING stt → %.2fs for %.1fs of audio",
                      metrics.duration, metrics.audio_duration)
+
+
+def _heard_timing(new_message, settings: Settings) -> dict[str, Any] | None:
+    """The caller's wait on this line, as numbers for the transcript's clock:
+    how long after they stopped the transcript existed (`stt`), how long after
+    they stopped the turn was committed (`eou`), and whether that was the
+    maximum — the turn detector reading a finished sentence as unfinished, which
+    on the 10:16 call of 09-09 happened on every turn."""
+    metrics = getattr(new_message, "metrics", None) or {}
+    if "end_of_turn_delay" not in metrics:
+        return None
+    eou = float(metrics["end_of_turn_delay"])
+    out: dict[str, Any] = {"eou": round(eou, 2)}
+    if metrics.get("transcription_delay") is not None:
+        out["stt"] = round(float(metrics["transcription_delay"]), 2)
+    if settings.turn_detector_enabled and eou >= settings.max_endpointing_delay - 0.05:
+        out["max"] = True
+    return out
 
 
 def _log_end_of_turn(new_message) -> None:
@@ -1711,7 +1850,6 @@ async def entrypoint(ctx: JobContext):
         tts=ud["tts"],
         **session_kwargs(ud, _settings),     # turn_handling (with the detector) included
     )
-    session.on("metrics_collected", _log_metrics)
     agent = CarrierAgent(ud["repo"], ud["composer"], ud["tts"],
                          fillers=ud.get("fillers"), greeting=ud.get("greeting"),
                          reask=ud.get("reask"), ctx=ctx,
@@ -1719,6 +1857,7 @@ async def entrypoint(ctx: JobContext):
                          still_there=ud.get("still_there"),
                          idle_close=ud.get("idle_close"))
     _CALL_ID.set(agent.brain.call_id)
+    session.on("metrics_collected", agent.on_metrics_collected)
     session.on("user_input_transcribed", agent.on_user_input_transcribed)
     session.on("user_state_changed", agent.on_user_state_changed)
 

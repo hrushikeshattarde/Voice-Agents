@@ -61,6 +61,58 @@ def _transcript_turns(payload: str | None) -> list[list[str]]:
     return turns
 
 
+def _turn_meta_list(payload: str | None) -> list[dict]:
+    """The stored per-line clock as a list of dicts, [] when unreadable."""
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        return []
+    return [m for m in data if isinstance(m, dict)] if isinstance(data, list) else []
+
+
+# The per-line clock's extra fields, passed through to the Transcript tab: the
+# caller's wait (`eou`: stopped -> turn committed; `stt`: stopped -> transcript;
+# `max`: waited the maximum), and the reply's making (`compose`, `first_text`
+# when streamed, `ttfb` first audio, `speech` seconds spoken, `cut`, `streamed`).
+_TIMING_FIELDS = ("eou", "stt", "max", "compose", "first_text", "ttfb", "speech", "cut",
+                  "streamed")
+
+# What a call can be flagged with. Event kinds are written to `call_events` by
+# the worker and the brain (see `CarrierSalesAgent.record_event`); the two
+# derived ones are read off the per-line clock. Same keys as the dashboard's
+# FLAG_META; a reply this slow, or a wait this long, is what a reviewer is
+# usually hunting for.
+EVENT_FLAGS = ("cut_off", "unheard", "backchannel_dropped", "withheld_committed",
+               "followon_withdrawn", "go_ahead_assumed", "compose_failed", "sip_wait")
+DERIVED_FLAGS = ("slow_turn", "waited_max")
+SLOW_TURN_SECS = 4.0
+
+
+def _reply_start(m: dict) -> float | None:
+    """How long the caller waited for a reply to START: its first text when it
+    was streamed, else the whole compose — one definition across calls from
+    before and after streaming existed."""
+    for key in ("first_text", "latency"):
+        if isinstance(m.get(key), (int, float)):
+            return float(m[key])
+    return None
+
+
+def _derived_flags(meta: list[dict]) -> tuple[dict[str, int], float | None]:
+    """(flags, slowest reply start) from the per-line clock."""
+    latencies = [start for start in (_reply_start(m) for m in meta) if start is not None]
+    flags: dict[str, int] = {}
+    slow = sum(1 for lat in latencies if lat >= SLOW_TURN_SECS)
+    if slow:
+        flags["slow_turn"] = slow
+    waited = sum(1 for m in meta if m.get("max"))
+    if waited:
+        flags["waited_max"] = waited
+    return flags, (round(max(latencies), 2) if latencies else None)
+
+
 def _transcript_with_timing(turns: list[list[str]], turn_meta_payload: str | None) -> list[dict]:
     """Each transcript turn plus WHEN it landed and, for the agent's own
     replies, how long that reply took — the per-turn clock `CarrierSalesAgent
@@ -72,23 +124,18 @@ def _transcript_with_timing(turns: list[list[str]], turn_meta_payload: str | Non
     doesn't line up with `turns`, still shows every line, just without a clock
     on it.
     """
-    meta: list[dict] = []
-    if turn_meta_payload:
-        try:
-            data = json.loads(turn_meta_payload)
-            if isinstance(data, list):
-                meta = data
-        except (TypeError, ValueError):
-            meta = []
+    meta = _turn_meta_list(turn_meta_payload)
     out = []
     for i, (speaker, text) in enumerate(turns):
-        m = meta[i] if i < len(meta) and isinstance(meta[i], dict) else {}
-        out.append({
+        m = meta[i] if i < len(meta) else {}
+        entry = {
             "speaker": speaker,
             "text": text,
             "elapsed_secs": m.get("t"),
             "latency_secs": m.get("latency"),
-        })
+        }
+        entry.update({k: m[k] for k in _TIMING_FIELDS if k in m})
+        out.append(entry)
     return out
 
 
@@ -132,6 +179,7 @@ class DashboardQueries:
     @staticmethod
     def _call_row(row: sqlite3.Row, with_transcript: bool = False) -> dict:
         transcript = _transcript_turns(row["transcript"])
+        flags, slowest = _derived_flags(_turn_meta_list(row["turn_meta"]))
         lane = None
         if row["load_origin"] and row["load_destination"]:
             lane = f"{row['load_origin']} → {row['load_destination']}"
@@ -164,18 +212,40 @@ class DashboardQueries:
             # manager writes, so a dashboard test call can never masquerade as
             # a carrier who actually rang the desk.
             "source": "playground" if row["is_playground"] else "phone",
+            # What a reviewer hunts for, without opening the call: the typed
+            # events on it (merged in by `_merge_event_flags`) and, off the
+            # per-line clock, replies that took too long and turns where the
+            # detector waited the maximum. {kind: count}.
+            "flags": flags,
+            "slowest_turn_secs": slowest,
         }
         if with_transcript:
             out["transcript"] = _transcript_with_timing(transcript, row["turn_meta"])
         return out
 
+    @staticmethod
+    def _merge_event_flags(conn: sqlite3.Connection, rows: list[dict]) -> None:
+        ids = [r["call_id"] for r in rows]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        counts: dict[str, dict[str, int]] = {}
+        for call_id, kind, n in conn.execute(
+                f"SELECT call_id, kind, COUNT(*) FROM call_events "
+                f"WHERE call_id IN ({marks}) GROUP BY call_id, kind", ids).fetchall():
+            counts.setdefault(call_id, {})[kind] = n
+        for r in rows:
+            r["flags"] = {**r["flags"], **counts.get(r["call_id"], {})}
+
     def calls(self, outcome: str | None = None, label: str | None = None,
-              q: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
+              q: str | None = None, limit: int = 100, offset: int = 0,
+              flag: str | None = None) -> list[dict]:
         """Newest first. `outcome` filters exactly ('incomplete' = no outcome
         yet — a dropped or still-open call); `label` filters the reason a call
         ended on (see `_call_row`'s "label" — "Rate too high", "Other", and so
         on) exactly; `q` matches call id, load id, carrier DOT/MC/name, or the
-        caller's phone number."""
+        caller's phone number; `flag` keeps only calls carrying that flag (an
+        event kind, or one of the two read off the per-line clock)."""
         sql, params = self._CALL_SELECT, []
         where = []
         if outcome == "incomplete":
@@ -186,6 +256,18 @@ class DashboardQueries:
         if label:
             where.append("c.end_label = ?")
             params.append(label)
+        if flag == "slow_turn":
+            where.append("EXISTS(SELECT 1 FROM json_each(c.turn_meta) j "
+                         "WHERE COALESCE(json_extract(j.value, '$.first_text'), "
+                         "json_extract(j.value, '$.latency')) >= ?)")
+            params.append(SLOW_TURN_SECS)
+        elif flag == "waited_max":
+            where.append("EXISTS(SELECT 1 FROM json_each(c.turn_meta) j "
+                         "WHERE json_extract(j.value, '$.max') = 1)")
+        elif flag:
+            where.append("EXISTS(SELECT 1 FROM call_events e "
+                         "WHERE e.call_id = c.call_id AND e.kind = ?)")
+            params.append(flag)
         if q:
             where.append("(c.call_id LIKE ? OR c.load_id LIKE ? OR "
                          "c.carrier_dot LIKE ? OR c.caller_number LIKE ? OR "
@@ -198,8 +280,9 @@ class DashboardQueries:
         params.extend([max(1, min(int(limit), 500)), max(0, int(offset))])
         conn = self._db.connect()
         try:
-            rows = conn.execute(sql, params).fetchall()
-            return [self._call_row(r) for r in rows]
+            rows = [self._call_row(r) for r in conn.execute(sql, params).fetchall()]
+            self._merge_event_flags(conn, rows)
+            return rows
         finally:
             conn.close()
 
@@ -212,6 +295,14 @@ class DashboardQueries:
             if not row:
                 return None
             detail = self._call_row(row, with_transcript=True)
+            self._merge_event_flags(conn, [detail])
+            detail["events"] = [
+                {"kind": r["kind"], "detail": r["detail"], "timestamp": r["timestamp"],
+                 "data": json.loads(r["data"]) if r["data"] else None}
+                for r in conn.execute(
+                    "SELECT * FROM call_events WHERE call_id=? ORDER BY id",
+                    (call_id,)).fetchall()
+            ]
             detail["offers"] = [
                 {"round": r["round_number"], "party": r["offered_by"],
                  "amount": r["amount"], "timestamp": r["timestamp"]}
@@ -313,6 +404,46 @@ class DashboardQueries:
             "outcomes": outcomes,
             "calls_by_day": calls_by_day,
             "recent": self.calls(limit=6),
+            "worker": self.worker_status(),
+        }
+
+    # -- the phone worker ----------------------------------------------------- #
+    WORKER_UP_SECS = 90.0          # three missed heartbeats
+    WORKER_STALE_SECS = 600.0
+
+    def worker_status(self) -> dict | None:
+        """The freshest heartbeat the phone worker left (see `worker_status` in
+        database.py), with a verdict: "up" while heartbeats are arriving, "stale"
+        once a few have been missed, "down" after ten minutes. None when no
+        worker has ever reported in — a fresh database."""
+        conn = self._db.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM worker_status ORDER BY last_seen DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        seen = _parse_ts(row["last_seen"])
+        age = None
+        if seen is not None:
+            now = datetime.datetime.now(seen.tzinfo) if seen.tzinfo else datetime.datetime.now()
+            age = max(0.0, (now - seen).total_seconds())
+        state = ("down" if age is None or age >= self.WORKER_STALE_SECS
+                 else "stale" if age >= self.WORKER_UP_SECS else "up")
+        try:
+            settings = json.loads(row["settings_json"]) if row["settings_json"] else {}
+        except (TypeError, ValueError):
+            settings = {}
+        return {
+            "worker_id": row["worker_id"],
+            "started_at": row["started_at"],
+            "last_seen": row["last_seen"],
+            "age_secs": age,
+            "state": state,
+            "build": row["build"],
+            "calls_live": row["calls_live"],
+            "settings": settings,
         }
 
     # -- loads ---------------------------------------------------------------- #

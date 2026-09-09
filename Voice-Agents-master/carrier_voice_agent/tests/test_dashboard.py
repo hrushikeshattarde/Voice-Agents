@@ -333,7 +333,7 @@ def test_http_routes_serve_json(offline_session_env):
                 return json.loads(res.read())
 
         overview = get("/api/overview")
-        assert set(overview) == {"kpis", "outcomes", "calls_by_day", "recent"}
+        assert set(overview) == {"kpis", "outcomes", "calls_by_day", "recent", "worker"}
         config = get("/api/config")
         assert config["data_source"] == "sqlite"
         # Key PRESENCE only — the config route must never carry a secret.

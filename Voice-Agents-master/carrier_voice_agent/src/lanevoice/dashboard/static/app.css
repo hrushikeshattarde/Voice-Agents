@@ -478,3 +478,35 @@ pre.facts {
 .email-status { font-size: 12.5px; margin-top: 8px; }
 .email-status.ok { color: var(--good-text); }
 .email-status.err { color: var(--muted); }
+
+/* --------------------------------------------- flags, turn timing, worker */
+.flags { display: flex; flex-wrap: wrap; gap: 4px; }
+.flag {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 999px;
+  font-size: 11px; font-weight: 550; white-space: nowrap;
+  background: var(--surface-2); color: var(--text-secondary); border: 1px solid var(--border);
+}
+.flag .n { font-weight: 400; opacity: .8; }
+.flag.cut_off, .flag.compose_failed, .flag.followon_withdrawn { color: var(--s2); border-color: var(--s2); }
+.flag.unheard, .flag.go_ahead_assumed, .flag.sip_wait { color: var(--s4); border-color: var(--s4); }
+.flag.waited_max, .flag.slow_turn { color: var(--accent); border-color: var(--accent); }
+.turnbar {
+  display: flex; margin-top: 6px; border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--border); max-width: 440px;
+}
+.turnbar .seg {
+  font-size: 10.5px; padding: 2px 6px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; min-width: 0; color: var(--ink); background: var(--surface-2);
+}
+.turnbar .seg.wait  { background: var(--grid); color: var(--text-secondary); }
+.turnbar .seg.think { background: var(--accent-wash); color: var(--accent); }
+.turnbar .seg.voice { background: rgba(27, 175, 122, .18); }
+.turnbar .seg.speak { background: rgba(42, 120, 214, .14); }
+.worker-strip {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 14px; margin-bottom: 14px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface); font-size: 13px;
+}
+.worker-strip.stale { border-color: var(--s4); }
+.worker-strip.down  { border-color: var(--s2); }
+.worker-strip .knobs { font-size: 12px; margin-left: auto; }

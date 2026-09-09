@@ -108,6 +108,29 @@ const outcomeKey = (o) => o || "incomplete";
    `_END_REASON_LABELS`. Kept in this fixed order for the filter dropdown. */
 const REASON_LABELS = ["Success", "Rate too high", "Carrier not qualified",
   "Ask for transfer to human", "Alternate dates", "User declined load", "Other"];
+/* What a call can be flagged with — the typed events the worker and the brain
+   record (`call_events`) plus two the dashboard reads off the per-line clock.
+   Same keys as `queries.EVENT_FLAGS`/`DERIVED_FLAGS`; this order is the filter's. */
+const FLAG_META = {
+  cut_off:             { label: "Cut off",          title: "The caller spoke over a line and its audio was cut" },
+  unheard:             { label: "Unheard",          title: "The caller spoke but nothing was transcribed; asked to repeat" },
+  waited_max:          { label: "Detector unsure",  title: "The turn detector read a finished sentence as unfinished and waited the maximum" },
+  slow_turn:           { label: "Slow turn",        title: "The caller waited 4 seconds or more for a reply to start" },
+  backchannel_dropped: { label: "Backchannel",      title: "A one-word transcript from under our line was dropped" },
+  withheld_committed:  { label: "Late answer",      title: "A short answer heard under our last words was committed once we stopped" },
+  followon_withdrawn:  { label: "Follow-on pulled", title: "A second half queued behind a cut line was withdrawn" },
+  go_ahead_assumed:    { label: "Go-ahead assumed", title: "The caller answered the pitch but nothing was transcribed; the requirements were read anyway" },
+  compose_failed:      { label: "Compose failed",   title: "No compliant reply could be composed; the call went to a rep" },
+  sip_wait:            { label: "Waited for line",  title: "The greeting was held until the SIP leg reported active" },
+};
+function flagChips(r) {
+  const flags = r.flags || {};
+  const chips = Object.entries(FLAG_META)
+    .filter(([kind]) => flags[kind])
+    .map(([kind, meta]) => el("span", { class: `flag ${kind}`, title: meta.title },
+      meta.label, flags[kind] > 1 ? el("span", { class: "n" }, `×${flags[kind]}`) : null));
+  return chips.length ? el("div", { class: "flags" }, chips) : el("span", { class: "dim" }, "—");
+}
 function outcomeChip(outcome) {
   const key = outcomeKey(outcome);
   const meta = OUTCOME_META[key] || { label: key };
@@ -346,12 +369,42 @@ function kpiTile(label, value, sub, trend) {
     sub ? el("div", { class: "sub" }, sub) : null);
 }
 
+/* Is the phone worker up, and on what? Read off its heartbeat row. Twice on
+   09-09 the worker's console window was closed after a test call and nothing
+   on this page said so. */
+function workerStrip(w) {
+  if (!w) {
+    return el("div", { class: "worker-strip down" },
+      el("span", { class: "status-dot off" }),
+      el("span", { class: "strong" }, "No worker heartbeat yet"),
+      el("span", { class: "dim" }, "The phone worker has not reported in since this database was created."));
+  }
+  const s = w.settings || {};
+  const knobs = [
+    s.min_endpointing_delay != null ? `endpointing ${s.min_endpointing_delay} / ${s.max_endpointing_delay}s` : null,
+    s.interruption_mode ? `barge-in ${s.interruption_mode} ${s.min_interruption_duration}s + ${s.min_interruption_words} words` : null,
+    s.stream_compose != null ? `streaming ${s.stream_compose ? "on" : "off"}` : null,
+    s.llm || null,
+  ].filter(Boolean).join(" · ");
+  const live = w.calls_live ?? 0;
+  const text = w.state === "up"
+    ? `Worker up · ${live} call${live === 1 ? "" : "s"} live · build ${w.build} · started ${fmtDateTime(w.started_at)}`
+    : w.state === "stale"
+      ? `Worker last seen ${timeAgo(w.last_seen)} — heartbeats have stopped`
+      : `Worker down — last heartbeat ${timeAgo(w.last_seen)} (build ${w.build}). The console window may have been closed.`;
+  return el("div", { class: `worker-strip ${w.state}`, title: `${w.worker_id} · last seen ${fmtDateTime(w.last_seen)}` },
+    el("span", { class: `status-dot ${w.state === "up" ? "on" : "off"}` }),
+    el("span", { class: "strong" }, text),
+    knobs ? el("span", { class: "dim knobs" }, knobs) : null);
+}
+
 async function renderOverview(root) {
   const data = await api("/api/overview?days=30");
   const k = data.kpis;
   const spark = sparkline(data.calls_by_day.slice(-14).map((d) => d.calls));
 
   root.append(
+    workerStrip(data.worker),
     el("div", { class: "grid kpis" },
       kpiTile("Total calls", fmtInt(k.total_calls),
         `${fmtInt(k.completed)} completed`, spark),
@@ -389,11 +442,12 @@ function runsTable(rows, { compact = false } = {}) {
       "Take a test call in the playground — it runs the same agent the phone line does.");
   }
   const head = compact
-    ? ["Started", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Final rate"]
-    : ["Started", "Run", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Rounds", "Final rate", "Duration"];
+    ? ["Started", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Flags", "Final rate"]
+    : ["Started", "Run", "Caller", "Lane", "Carrier", "Outcome", "Reason", "Flags", "Slowest",
+       "Rounds", "Final rate", "Duration"];
   const table = el("table", {},
     el("thead", {}, el("tr", {}, head.map((h) =>
-      el("th", { class: ["Rounds", "Final rate", "Duration"].includes(h) ? "num" : "" }, h)))),
+      el("th", { class: ["Slowest", "Rounds", "Final rate", "Duration"].includes(h) ? "num" : "" }, h)))),
     el("tbody", {}, rows.map((r) => {
       const caller = el("td", { class: "mono" },
         r.caller_number || el("span", { class: "dim" }, "—"));
@@ -414,17 +468,22 @@ function runsTable(rows, { compact = false } = {}) {
         r.source === "playground"
           ? el("div", { class: "dim", style: "font-family:system-ui; font-size:11px" }, "▶ playground")
           : null);
+      // What went wrong on the line, if anything, and the worst wait the caller
+      // sat through — so the calls worth listening to sort to the top of the eye.
+      const flags = el("td", { style: "max-width:200px" }, flagChips(r));
+      const slowest = el("td", { class: "num" },
+        r.slowest_turn_secs ? `${r.slowest_turn_secs.toFixed(1)}s` : el("span", { class: "dim" }, "—"));
       const cells = compact
         ? [el("td", { class: "dim", title: fmtDateTime(r.start_time) }, timeAgo(r.start_time)),
            caller, lane, carrier,
            el("td", {}, statusChip(r)),
-           reason,
+           reason, flags,
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—")]
         : [el("td", { class: "dim", title: r.start_time || "" }, fmtDateTime(r.start_time)),
            runId,
            caller, lane, carrier,
            el("td", {}, statusChip(r)),
-           reason,
+           reason, flags, slowest,
            el("td", { class: "num" }, r.rounds ?? "—"),
            el("td", { class: "num strong" }, r.final_rate ? fmtMoney(r.final_rate) : "—"),
            el("td", { class: "num" }, fmtDur(r.duration_secs))];
@@ -434,13 +493,14 @@ function runsTable(rows, { compact = false } = {}) {
 }
 
 async function renderRuns(root) {
-  const state = { outcome: "", label: "", q: "", rendered: "" };
+  const state = { outcome: "", label: "", flag: "", q: "", rendered: "" };
   const listWrap = el("div", { class: "card", style: "padding: 6px 4px" });
 
   async function refresh(force = false) {
     const params = new URLSearchParams({ limit: "200" });
     if (state.outcome) params.set("outcome", state.outcome);
     if (state.label) params.set("label", state.label);
+    if (state.flag) params.set("flag", state.flag);
     if (state.q) params.set("q", state.q);
     const rows = await api(`/api/calls?${params}`);
     // Re-render only on actual change — a poll that rebuilds identical rows
@@ -458,12 +518,16 @@ async function renderRuns(root) {
   const reasonSelect = el("select", { onchange: (e) => { state.label = e.target.value; refresh(); } },
     el("option", { value: "" }, "Any reason"),
     REASON_LABELS.map((label) => el("option", { value: label }, label)));
+  const flagSelect = el("select", { onchange: (e) => { state.flag = e.target.value; refresh(); } },
+    el("option", { value: "" }, "Any flag"),
+    Object.entries(FLAG_META).map(([kind, meta]) => el("option", { value: kind }, meta.label)));
   let debounce;
-  const search = el("input", { type: "search", placeholder: "Search runs, loads, carriers…",
+  const search = el("input", { type: "search",
+    placeholder: "Call id, load, MC, carrier or caller number…",
     oninput: (e) => { state.q = e.target.value.trim(); clearTimeout(debounce); debounce = setTimeout(refresh, 250); } });
 
   root.append(
-    el("div", { class: "filters" }, select, reasonSelect, search,
+    el("div", { class: "filters" }, select, reasonSelect, flagSelect, search,
       el("button", { class: "btn", onclick: refresh }, "Refresh")),
     listWrap);
   await refresh();
@@ -572,21 +636,50 @@ async function openCallDrawer(callId) {
   }
 }
 
-function bubble(who, text, meta) {
+/* Where the seconds went between the caller stopping and the reply playing,
+   as one bar: the end-of-turn wait (off the caller's line before this one),
+   the model (to its first text when streamed, else the whole compose), the
+   voice's first audio, and the speech itself. The same four numbers the worker
+   logs as TIMING lines, read here instead of in the log. */
+function turnBar(meta, prev) {
+  const wait = prev && prev.speaker !== "agent" ? prev.eou : null;
+  const think = meta.first_text ?? meta.compose ?? null;
+  const segs = [
+    ["wait", wait, "wait"],
+    ["think", think, meta.streamed ? "first text" : "compose"],
+    ["voice", meta.ttfb, "voice"],
+    ["speak", meta.speech, meta.cut ? "spoke, cut off" : "spoke"],
+  ].filter(([, v]) => typeof v === "number" && v > 0);
+  if (!segs.length) return null;
+  const total = segs.reduce((sum, [, v]) => sum + v, 0);
+  return el("div", { class: "turnbar",
+    title: segs.map(([, v, label]) => `${label} ${v.toFixed(1)}s`).join(" · ") },
+    segs.map(([cls, v, label]) =>
+      el("div", { class: `seg ${cls}`, style: `flex:${Math.max(v / total, 0.1).toFixed(3)}` },
+        `${label} ${v.toFixed(1)}s`)));
+}
+
+function bubble(who, text, meta, prev) {
   const isAgent = who === "agent";
   const elapsed = meta ? fmtElapsed(meta.elapsed_secs) : null;
   const latency = meta && isAgent && meta.latency_secs !== null && meta.latency_secs !== undefined
-    ? `${meta.latency_secs.toFixed(2)}s` : null;
+    ? `${meta.latency_secs.toFixed(2)}s${meta.streamed ? " · streamed" : ""}` : null;
+  // The caller's side of the wait: how long after they stopped the turn was
+  // committed, and whether the detector waited the maximum on it.
+  const heard = meta && !isAgent && typeof meta.eou === "number"
+    ? `heard after ${meta.eou.toFixed(1)}s${meta.max ? " · detector unsure, waited the maximum" : ""}`
+    : null;
   return el("div", { class: `bubble ${isAgent ? "agent" : "carrier"}` },
     el("div", { class: "avatar" }, isAgent ? "AI" : "C"),
-    el("div", {},
+    el("div", { style: "min-width:0" },
       el("div", { class: "who" }, isAgent ? "LaneVoice" : "Caller",
         elapsed ? el("span", { class: "dim", style: "font-weight:400; margin-left:6px" }, elapsed) : null),
       el("div", { class: "msg" }, text),
       // How long THIS reply took to put together — the same "TIMING brain"
-      // figure the worker logs live, per turn. Only the agent's own replies
-      // have one; a caller's turn has nothing to time on our side.
-      latency ? el("div", { class: "dim", style: "font-size:11px; margin-top:2px" }, latency) : null));
+      // figure the worker logs live, per turn — and, underneath, where it went.
+      latency ? el("div", { class: "dim", style: "font-size:11px; margin-top:2px" }, latency) : null,
+      heard ? el("div", { class: "dim", style: "font-size:11px; margin-top:2px" }, heard) : null,
+      isAgent && meta ? turnBar(meta, prev) : null));
 }
 
 function renderTranscriptTab(d) {
@@ -596,7 +689,7 @@ function renderTranscriptTab(d) {
       "The call never reached end_call — it was dropped mid-flight or is still open.");
   }
   return el("div", { class: "bubbles" },
-    d.transcript.map((turn) => bubble(turn.speaker, turn.text, turn)));
+    d.transcript.map((turn, i) => bubble(turn.speaker, turn.text, turn, d.transcript[i - 1])));
 }
 
 function renderNegotiationTab(d) {
@@ -624,6 +717,8 @@ function renderNegotiationTab(d) {
 function renderTimelineTab(d) {
   const events = [
     ...d.notes.map((n) => ({ ts: n.timestamp, text: n.note, kind: "note" })),
+    ...(d.events || []).map((e) => ({ ts: e.timestamp, kind: "event",
+      text: `${(FLAG_META[e.kind] || { label: e.kind }).label} — ${e.detail}` })),
     ...d.transfers.map((t) => ({ ts: t.timestamp, kind: "transfer",
       text: `Transferred to rep ${t.rep_id} — ${t.result}` })),
   ].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));

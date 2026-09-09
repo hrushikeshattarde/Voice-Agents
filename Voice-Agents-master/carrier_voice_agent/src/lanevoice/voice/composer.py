@@ -174,6 +174,9 @@ class _ChatComposer:
         # Whether the last `compose_stream` ran out of tokens mid-sentence. Set
         # once the stream ends; the caller reads it before trusting the tail.
         self.last_truncated = False
+        # Seconds from the start of the last `compose_stream` to its first text
+        # — the number the caller actually waits on. None for a whole reply.
+        self.last_first_text: float | None = None
 
     def _timed_chat(self, what: str, *args, **kwargs) -> tuple[str, bool]:
         """`_chat`, with one log line per call: how long, and how many tokens.
@@ -282,6 +285,7 @@ class _ChatComposer:
     def compose(self, directive: str, facts: str = "", dialogue: str = "",
                 speakable: str = "", correction: str = "") -> str:
         prompt = self._prompt(directive, facts, dialogue, speakable, correction)
+        self.last_first_text = None
         text, truncated = self._timed_chat(
             "compose", _SYSTEM, prompt,
             max_tokens=self._settings.llm_max_tokens,
@@ -327,6 +331,7 @@ class _ChatComposer:
         prompt = self._prompt(directive, facts, dialogue, speakable, correction, already_said)
         self._last_usage = None
         self.last_truncated = False
+        self.last_first_text = None
         started = time.monotonic()
         first: float | None = None
         try:
@@ -338,6 +343,7 @@ class _ChatComposer:
                 yield delta
         finally:
             elapsed = time.monotonic() - started
+            self.last_first_text = first
             tokens = (f"; {self._last_usage[0]:,} in / {self._last_usage[1]:,} out tokens"
                       if self._last_usage is not None else "")
             logger.info("TIMING compose (streamed) → first text %s, done %.2fs on %s%s%s",
@@ -569,6 +575,7 @@ class StubComposer:
     def __init__(self, settings: Settings | None = None):
         self.turns: list[dict] = []
         self.last_truncated = False
+        self.last_first_text: float | None = None
 
     def compose(self, directive: str, facts: str = "", dialogue: str = "",
                 speakable: str = "", correction: str = "") -> str:
@@ -581,6 +588,7 @@ class StubComposer:
                        speakable: str = "", correction: str = "",
                        already_said: str = "") -> Iterator[str]:
         self.last_truncated = False
+        self.last_first_text = 0.0
         yield self.compose(directive, facts, dialogue, speakable, correction)
 
     def read(self, dialogue: str, fields: dict[str, str]) -> dict:

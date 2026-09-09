@@ -257,6 +257,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(self.app.queries.calls(
                 outcome=qs.get("outcome", [None])[0] or None,
                 label=qs.get("label", [None])[0] or None,
+                flag=qs.get("flag", [None])[0] or None,
                 q=qs.get("q", [None])[0] or None,
                 limit=int(qs.get("limit", ["100"])[0]),
                 offset=int(qs.get("offset", ["0"])[0]),

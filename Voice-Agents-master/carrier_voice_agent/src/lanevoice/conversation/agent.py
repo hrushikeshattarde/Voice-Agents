@@ -611,6 +611,8 @@ class CarrierSalesAgent:
         # worker sets this for the duration of `handle()`; None means every
         # reply is composed whole before it is spoken. See `_say_streaming`.
         self.speech_sink = None
+        self._turn_streamed = False               # this turn's reply went out by sentence
+        self._turn_first_text: float | None = None  # ...and its first text took this long
         self._empty_state_only: str | None = None  # "Indiana": a state, not a place
         self._empty_place: str | None = None       # the table's name for where they are
         self._asked_state = False                  # one "which state?" per call
@@ -847,6 +849,10 @@ class CarrierSalesAgent:
                     continue
                 self._compose_seconds += time.monotonic() - started
                 self._compose_calls += 1
+                self._turn_streamed = True
+                if self._turn_first_text is None:
+                    # The first attempt's first text is what the caller waited on.
+                    self._turn_first_text = getattr(self._composer, "last_first_text", None)
                 if breach is not None:
                     why = correction = breach
                     logger.warning("rejected a streamed sentence in state %s — %s | it said: %r; "
@@ -909,6 +915,7 @@ class CarrierSalesAgent:
                f"after up to {self._settings.llm_attempts} attempts — handed to a rep. "
                f"Last failure: {why}")
         self._repo.log_note(self.call_id, note)
+        self._event("compose_failed", why[:240], attempts=self._settings.llm_attempts)
         self._last_note = note        # not through `_note()`: this failure mode
                                        # does not also try a TMS post
         # A call can break before it has a load — `resolve` takes that.
@@ -1039,11 +1046,17 @@ class CarrierSalesAgent:
         self._sync_transcript()
         return spoken
 
-    def handle(self, user_text: str) -> str:
+    def handle(self, user_text: str, heard_timing: dict | None = None) -> str:
         started = time.monotonic()
         self._compose_seconds = 0.0
         self._compose_calls = 0
+        self._turn_streamed = False
+        self._turn_first_text = None
         self._log_user(user_text)
+        if heard_timing:
+            # How long the caller waited to be heard — the worker's end-of-turn
+            # numbers for this very line, kept beside it for the dashboard.
+            self._turn_meta[-1].update(heard_timing)
         handler = {
             CallState.IDENTIFY_LOAD: self._identify_load,
             CallState.VERIFY_CARRIER: self._verify_carrier,
@@ -1082,6 +1095,11 @@ class CarrierSalesAgent:
                     and self.transcript[-1][0] == "agent"
                     and self._turn_meta[-1]["latency"] is None):
                 self._turn_meta[-1]["latency"] = round(total, 2)
+                self._turn_meta[-1]["compose"] = round(self._compose_seconds, 2)
+                if self._turn_streamed:
+                    self._turn_meta[-1]["streamed"] = True
+                    if self._turn_first_text is not None:
+                        self._turn_meta[-1]["first_text"] = round(self._turn_first_text, 2)
             # Every exit path — including a handler that just finished the call.
             self._sync_transcript()
             self.last_turn_timing = {
@@ -2482,6 +2500,8 @@ class CarrierSalesAgent:
             self._note("Caller answered the pitch but nothing they said could be transcribed "
                        "— read the requirements rather than asking them to repeat an "
                        "acknowledgement.")
+            self._event("go_ahead_assumed", "the caller answered the pitch but nothing was "
+                        "transcribed; the requirements were read as if they had said go ahead")
             spoken = self._read_requirements()
             self._sync_transcript()
             return spoken
@@ -2509,6 +2529,28 @@ class CarrierSalesAgent:
             self._finish(CallOutcome.ABANDONED, reason="went_quiet")
         self._sync_transcript()
 
+    # -- the event trail and the per-line clock ------------------------------ #
+    def record_event(self, kind: str, detail: str, **data) -> None:
+        """A typed mark on the call's record — what happened, in a word the
+        dashboard can flag and filter on, plus the sentence behind it. The
+        worker records what it sees on the line (a dropped backchannel, a wait
+        for the SIP leg); the brain records what it decides (a line taken back,
+        a compose that failed). See `call_events` in database.py."""
+        self._repo.log_event(self.call_id, kind, detail, data or None)
+
+    _event = record_event
+
+    def note_turn_voice(self, **fields) -> None:
+        """The voice's side of the last reply — first audio, how long it spoke,
+        whether it was cut — attached to that line's clock once it has played.
+        Beside `handle`'s compose numbers and the caller line's end-of-turn
+        wait, that is the whole gap the caller sat through, per turn, on the
+        dashboard instead of in the log."""
+        if not (self._turn_meta and self.transcript and self.transcript[-1][0] == "agent"):
+            return
+        self._turn_meta[-1].update({k: v for k, v in fields.items() if v is not None})
+        self._sync_transcript()
+
     def note_unheard(self) -> None:
         """The caller spoke and nothing was transcribed; the worker asked them to
         say it again. Recorded so a reviewer reading a transcript with an odd
@@ -2518,6 +2560,8 @@ class CarrierSalesAgent:
             self.call_id,
             "Caller spoke but nothing was transcribed (a short or quiet utterance "
             "the recogniser returned empty) — asked them to say it again.")
+        self._event("unheard", "the caller spoke but nothing was transcribed; asked them "
+                    "to say it again")
 
     def note_playback_cut(self, spoken_line: str, heard: str = "") -> None:
         """The caller spoke over this line and its audio stopped mid-play.
@@ -2549,13 +2593,17 @@ class CarrierSalesAgent:
         if self.transcript and self.transcript[-1] == ("agent", spoken_line):
             if heard:
                 self.transcript[-1] = ("agent", f"{heard} [cut off by the caller]")
+                if self._turn_meta:
+                    self._turn_meta[-1]["cut"] = True
             else:
                 self.transcript.pop()
                 if self._turn_meta:
                     self._turn_meta.pop()
+        retracted = None
         if mostly_unheard and self._requirements_read and spoken_line == self._requirements_line:
             self._requirements_read = False
             self._requirements_line = None
+            retracted = "requirements"
             self._note("The load's requirements were cut off before the carrier heard them"
                        + (f" (they heard: {heard!r})" if heard else "")
                        + " — they will be read again before any rate is discussed.")
@@ -2563,11 +2611,17 @@ class CarrierSalesAgent:
               and self.state is CallState.CHECK_REQUIREMENTS and not self._requirements_read):
             self._load_revealed = False
             self._pitch_line = None
+            retracted = "pitch"
         self._repo.log_note(
             self.call_id,
             f'Caller spoke over this line — its audio was cut off mid-play, so '
             f'they may not have heard it: "{spoken_line}"'
             + (f' (they heard up to: "{heard}")' if heard else " (none of it played)"))
+        self._event("cut_off",
+                    (f"the caller cut in after {heard_words} of {composed_words} words"
+                     if heard else f"the caller cut in before any of {composed_words} words played")
+                    + (f"; the {retracted} will be given again" if retracted else ""),
+                    composed_words=composed_words, heard_words=heard_words, retracted=retracted)
         self._sync_transcript()
 
     def set_caller(self, number: str | None) -> None:

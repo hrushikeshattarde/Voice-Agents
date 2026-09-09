@@ -150,6 +150,35 @@ CREATE TABLE IF NOT EXISTS practice_reports (
     emailed_at        TEXT,
     email_error       TEXT
 );
+
+-- What happened on a call that a reviewer would otherwise dig out of the
+-- worker's log: the caller cut a line off, an answer went unheard, a
+-- backchannel was dropped, the greeting waited for the SIP leg. One row per
+-- event, typed (`kind`) so the dashboard can flag and filter calls by it;
+-- `detail` is the one-line human reading, `data` optional numbers as JSON.
+CREATE TABLE IF NOT EXISTS call_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id   TEXT,
+    kind      TEXT,
+    detail    TEXT,
+    data      TEXT,
+    timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS call_events_by_call ON call_events (call_id);
+
+-- The phone worker's heartbeat: one row per worker process, rewritten every
+-- ~30 s while it runs. The dashboard reads the freshest row to say whether
+-- the desk is actually answering, which build it runs, how many calls it has
+-- up, and the turn-taking settings in force — the questions that used to need
+-- a console window (twice on 09-09 the window was closed and nobody could tell).
+CREATE TABLE IF NOT EXISTS worker_status (
+    worker_id     TEXT PRIMARY KEY,
+    started_at    TEXT,
+    last_seen     TEXT,
+    build         TEXT,
+    calls_live    INTEGER,
+    settings_json TEXT
+);
 """
 
 

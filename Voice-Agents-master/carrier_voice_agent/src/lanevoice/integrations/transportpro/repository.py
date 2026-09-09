@@ -1006,6 +1006,10 @@ class TransportProRepository:
     def log_note(self, call_id: str, note: str) -> None:
         self._audit.log_note(call_id, note)
 
+    def log_event(self, call_id: str, kind: str, detail: str,
+                  data: dict | None = None) -> None:
+        self._audit.log_event(call_id, kind, detail, data)
+
     def record_rep_summary_email(self, call_id: str, *, emailed_to: str | None = None,
                                  error: str | None = None) -> None:
         self._audit.record_rep_summary_email(call_id, emailed_to=emailed_to, error=error)
