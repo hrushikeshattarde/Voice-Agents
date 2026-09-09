@@ -268,7 +268,7 @@ is overridable via `.env` (env var wins). **Change a model = change one value.**
 | TTS voice | `TTS_VOICE` | `en-US-Ethan:MAI-Voice-2` |
 | TTS timeout (sec) | `TTS_TIMEOUT` | `15.0` |
 | Phrase via LLM? | `USE_LLM` | `false` (fast templates) |
-| Turn buffer (sec) | `MIN_ENDPOINTING_DELAY` / `MAX_ENDPOINTING_DELAY` | `0.8` / `8.0` |
+| Turn buffer (sec) | `MIN_ENDPOINTING_DELAY` / `MAX_ENDPOINTING_DELAY` | `1.0` / `2.0` |
 | Negotiation rounds | `MAX_NEGOTIATION_ROUNDS` | `8` |
 | Reserve held below Max Buy | `NEGOTIATION_BUFFER` | `0` (may reach Max Buy) |
 | Share of their move we give back | `NEGOTIATION_RECIPROCITY` | `0.5` (lower = firmer) |

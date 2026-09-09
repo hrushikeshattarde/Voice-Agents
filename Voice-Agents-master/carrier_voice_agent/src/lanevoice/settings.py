@@ -358,10 +358,16 @@ class Settings(BaseSettings):
     # MAX was 8.0, and on a measured live call 5 turns out of 11 spent every one
     # of those seconds. In all five the caller had plainly finished ("Okay.", at
     # an end-of-turn probability of 0.05) — the detector was merely unsure, and
-    # eight seconds of silence bought nothing on any of them. 3.0 is still a long
-    # pause by phone standards and cuts up to 5 seconds off roughly half the
-    # turns. Raise it back toward 6-8 if callers start getting clipped
-    # mid-sentence; that is the failure this number guards against.
+    # eight seconds of silence bought nothing on any of them. It went to 3.0,
+    # and then on 09-09 a whole call ran at the maximum: every finished sentence
+    # ("Yeah, it's 299953.", "It's getting empty in Cleveland at 10 AM.") scored
+    # 0.08-0.30 against the 0.56 threshold while the recogniser had already
+    # finalised each one within 0.6s. 2.0 costs that call four seconds less. It
+    # is still safe for a mid-sentence pause because MAX is not the only guard:
+    # the turn cannot commit until the recogniser has produced a FINAL, and
+    # AssemblyAI holds its final through a pause it reads as unfinished (see
+    # `telephony.worker._stt_extra_kwargs`). Raise it back toward 3.0 if callers
+    # dictating a number start getting answered halfway through it.
     #
     # MIN was 1.3 for as long as Whisper ran as one request per utterance: the
     # transcript took 1.0-1.8s to come back after the caller stopped, the turn
@@ -381,7 +387,7 @@ class Settings(BaseSettings):
     # `telephony.worker._stt_extra_kwargs`). If callers still get clipped, raise
     # this first.
     min_endpointing_delay: float = Field(default=1.0, validation_alias="MIN_ENDPOINTING_DELAY")
-    max_endpointing_delay: float = Field(default=3.0, validation_alias="MAX_ENDPOINTING_DELAY")
+    max_endpointing_delay: float = Field(default=2.0, validation_alias="MAX_ENDPOINTING_DELAY")
     # Whether a turn detector reads the transcript before a turn is committed.
     # LiveKit's hosted `turn-detector-v1` — same Inference credentials as the STT
     # and TTS — returns an end-of-turn probability for the words so far. Under the
