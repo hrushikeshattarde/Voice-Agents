@@ -61,6 +61,37 @@ def _transcript_turns(payload: str | None) -> list[list[str]]:
     return turns
 
 
+def _transcript_with_timing(turns: list[list[str]], turn_meta_payload: str | None) -> list[dict]:
+    """Each transcript turn plus WHEN it landed and, for the agent's own
+    replies, how long that reply took — the per-turn clock `CarrierSalesAgent
+    ._log_turn` keeps, read back for the Transcript tab (see HappyRobot's own
+    transcript view for the shape this is matching).
+
+    Falls back to a plain turn with no timing, never to dropping the turn —
+    a call from before this existed, or a `turn_meta` that for any reason
+    doesn't line up with `turns`, still shows every line, just without a clock
+    on it.
+    """
+    meta: list[dict] = []
+    if turn_meta_payload:
+        try:
+            data = json.loads(turn_meta_payload)
+            if isinstance(data, list):
+                meta = data
+        except (TypeError, ValueError):
+            meta = []
+    out = []
+    for i, (speaker, text) in enumerate(turns):
+        m = meta[i] if i < len(meta) and isinstance(meta[i], dict) else {}
+        out.append({
+            "speaker": speaker,
+            "text": text,
+            "elapsed_secs": m.get("t"),
+            "latency_secs": m.get("latency"),
+        })
+    return out
+
+
 class DashboardQueries:
     def __init__(self, db: Database):
         self._db = db
@@ -78,7 +109,7 @@ class DashboardQueries:
     _CALL_SELECT = """
         SELECT c.call_id, c.load_id, c.carrier_dot, c.caller_number,
                c.start_time, c.end_time,
-               c.outcome, c.transcript, c.end_label, c.end_reason,
+               c.outcome, c.transcript, c.end_label, c.end_reason, c.turn_meta,
                c.carrier_name   AS call_carrier_name,
                c.carrier_mc     AS call_carrier_mc,
                ca.legal_name    AS carrier_name,
@@ -135,7 +166,7 @@ class DashboardQueries:
             "source": "playground" if row["is_playground"] else "phone",
         }
         if with_transcript:
-            out["transcript"] = transcript
+            out["transcript"] = _transcript_with_timing(transcript, row["turn_meta"])
         return out
 
     def calls(self, outcome: str | None = None, label: str | None = None,

@@ -46,7 +46,8 @@ def test_sample_rows_left_by_an_offline_start_are_purged_and_real_rows_kept(tmp_
     db = Database(settings.db_path)
     db.init(seed=True)                          # what an offline start used to leave behind
     conn = db.connect()
-    conn.execute("INSERT INTO reps VALUES ('real', 'Real Person', '+12605551234', 1)")
+    conn.execute("INSERT INTO reps (rep_id, name, phone, available) "
+                 "VALUES ('real', 'Real Person', '+12605551234', 1)")
     conn.commit()
     conn.close()
 

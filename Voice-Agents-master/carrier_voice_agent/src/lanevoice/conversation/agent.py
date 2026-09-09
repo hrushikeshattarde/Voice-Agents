@@ -38,7 +38,9 @@ import enum
 import re
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from email.message import EmailMessage
 
 from lanevoice import formatting, geo, parsing
 from lanevoice.db.repository import Repository
@@ -52,6 +54,7 @@ from lanevoice.domain.models import (
     VerificationAction,
 )
 from lanevoice.logging_config import get_logger
+from lanevoice.practice.mailer import ReportMailer
 from lanevoice.services import (
     CarrierVerificationService,
     LoadService,
@@ -539,10 +542,15 @@ class CarrierSalesAgent:
         repo: Repository,
         composer: TurnComposer,
         settings: Settings | None = None,
+        mailer_factory: Callable[[Settings], ReportMailer] | None = None,
     ):
         self._repo = repo
         self._composer = composer
         self._settings = settings or get_settings()
+        # The post-call summary email's SMTP transport — same seam
+        # `PracticeSessionManager` uses, so a test can inject a fake mailer
+        # instead of a real SMTP connection. See `_send_rep_summary_email`.
+        self._mailer_factory = mailer_factory or ReportMailer
 
         self._loads = LoadService(repo)
         self._verifier = CarrierVerificationService(repo)
@@ -606,6 +614,10 @@ class CarrierSalesAgent:
         self._deadhead_cache: tuple[object, str | None] = (None, None)
         self._load_revealed = False               # gate: load facts reach the LLM only after this
         self.transcript: list[tuple[str, str]] = []
+        # One entry per `self.transcript` line, same order — when it landed
+        # (seconds since the call started) and, for the agent's own replies,
+        # how long that reply took to put together. See `_log_turn`.
+        self._turn_meta: list[dict] = []
         self.outcome: CallOutcome | None = None
         # Notes are mirrored onto the load in the TMS from a background thread —
         # see `_note`. ONE worker, so they land in the order they were written;
@@ -749,7 +761,7 @@ class CarrierSalesAgent:
                 continue
             breach = _breach(spoken, amounts, must_say, source, speakable)
             if breach is None:
-                self.transcript.append(("agent", spoken))
+                self._log_turn("agent", spoken)
                 return spoken
             why = breach
             logger.warning("rejected composed turn in state %s — %s | it said: %r",
@@ -780,11 +792,21 @@ class CarrierSalesAgent:
         self._finish(CallOutcome.TRANSFERRED, rep_id=rep_id, reason="compose_failed")
         rep = resolution.rep
         self.pending_transfer = rep if (rep is not None and rep.phone) else None
-        self.transcript.append(("agent", _LAST_RESORT))
+        self._log_turn("agent", _LAST_RESORT)
         return _LAST_RESORT
 
+    def _log_turn(self, speaker: str, text: str) -> None:
+        """Append one line to the transcript, with when it landed — seconds
+        since the call started, matching the clock on the call's own
+        recording. An agent reply's LATENCY is not known yet at this point
+        (composing may retry, lookups run after); `handle`'s `finally` backfills
+        it onto this same entry once the whole turn is done. The dashboard's
+        Transcript tab reads both back."""
+        self.transcript.append((speaker, text))
+        self._turn_meta.append({"t": round(time.time() - self._started_at, 1), "latency": None})
+
     def _log_user(self, text: str) -> None:
-        self.transcript.append(("carrier", text))
+        self._log_turn("carrier", text)
 
     def _note(self, note: str) -> None:
         """Record a note against the call, and against the load in the TMS.
@@ -863,7 +885,7 @@ class CarrierSalesAgent:
         call that is otherwise going fine.
         """
         try:
-            self._repo.update_transcript(self.call_id, self.transcript)
+            self._repo.update_transcript(self.call_id, self.transcript, self._turn_meta)
         except Exception:  # noqa: BLE001 - never let bookkeeping end a call
             logger.warning("could not sync live transcript for %s",
                            self.call_id, exc_info=True)
@@ -888,7 +910,7 @@ class CarrierSalesAgent:
         only the composing has already happened. See `compose_greeting`.
         """
         self.state = CallState.IDENTIFY_LOAD
-        self.transcript.append(("agent", spoken))
+        self._log_turn("agent", spoken)
         self._sync_transcript()
         return spoken
 
@@ -925,11 +947,18 @@ class CarrierSalesAgent:
             # recoverable by asking the caller anything, so stop asking.
             return self._backend_failure(exc)
         finally:
-            # Every exit path — including a handler that just finished the call.
-            self._sync_transcript()
             # Where this turn's time went: the composer, and everything else —
             # board and carrier lookups, the negotiation engine, bookkeeping.
             total = time.monotonic() - started
+            # The reply `_log_turn` just recorded didn't know its own latency
+            # yet (composing can retry; lookups run after) — attach it now, to
+            # that same entry, for the dashboard's transcript view.
+            if (self._turn_meta and self.transcript
+                    and self.transcript[-1][0] == "agent"
+                    and self._turn_meta[-1]["latency"] is None):
+                self._turn_meta[-1]["latency"] = round(total, 2)
+            # Every exit path — including a handler that just finished the call.
+            self._sync_transcript()
             self.last_turn_timing = {
                 "total": total,
                 "compose": self._compose_seconds,
@@ -2277,6 +2306,7 @@ class CarrierSalesAgent:
             # dashboard can show why a call ended without opening it.
             self._call_label(),
             self._call_summary_line(),
+            self._turn_meta,
         )
         if rep_id and outcome == CallOutcome.TRANSFERRED:
             # Requested, not connected: whether the caller actually reached the
@@ -2302,7 +2332,7 @@ class CarrierSalesAgent:
         """The line could be heard but nothing said on it could be transcribed,
         re-ask after re-ask. The worker has told the caller a rep will ring back;
         this puts that on the record as a callback, with the number."""
-        self.transcript.append(("agent", spoken))
+        self._log_turn("agent", spoken)
         self._note("Caller could be heard speaking but nothing they said could be "
                    "transcribed, repeatedly — told them a rep will call back. CALLBACK "
                    f"NEEDED at {self.caller_number or 'the number on the call record'}.")
@@ -2313,7 +2343,7 @@ class CarrierSalesAgent:
     def close_idle(self, spoken: str) -> None:
         """Nothing from the caller after the agent's question, prompt included —
         the worker has said goodbye; record the call as abandoned."""
-        self.transcript.append(("agent", spoken))
+        self._log_turn("agent", spoken)
         self._note("Caller went quiet after the agent's question — asked once whether "
                    "they were still there, heard nothing, and closed the call.")
         if self.state is not CallState.DONE:
@@ -2453,6 +2483,55 @@ class CarrierSalesAgent:
         target = self.load.load_id if self.load is not None else self._asked_load_id
         if target and self._settings.post_load_notes:
             self._repo.post_load_note(target, summary)
+        self._email_rep_summary()
+
+    def _email_rep_summary(self) -> None:
+        """The same CALL SUMMARY note, mailed to whoever Transport Pro has this
+        load's carrier-sales rep set to — so the desk hears about a call
+        without opening the dashboard. A call with no resolved load, no
+        assigned rep, or no address on file for that rep simply sends
+        nothing; there is no fallback-to-any-available-rep here the way a
+        live transfer has one, because mailing the wrong person's recap to a
+        random rep is worse than mailing nobody.
+
+        Backgrounded on the same single-worker thread `_note` already posts
+        TMS notes from, and waited on the same way at `abandon` — so a slow
+        or dead mail server costs this call's rep an email, never a delay on
+        the line or on the worker's next call.
+        """
+        if self.load is None or not self.load.assigned_rep_id:
+            return
+        rep = self._repo.get_rep(self.load.assigned_rep_id)
+        if rep is None or not rep.email:
+            return
+        try:
+            self._pending_notes.append(
+                self._tms_notes.submit(self._send_rep_summary_email, rep))
+        except RuntimeError:
+            # The executor is closed (a summary after `abandon`) — send it here.
+            self._send_rep_summary_email(rep)
+
+    def _send_rep_summary_email(self, rep: Rep) -> None:
+        """Never raises past this point: a bad address or a dead mail server
+        costs the rep an email, never the call record — see `_email_rep_summary`."""
+        if not self._settings.uses_practice_email:
+            self._repo.record_rep_summary_email(
+                self.call_id,
+                error="email not configured: set SMTP_HOST and SMTP_FROM (see settings.py)")
+            return
+        load_id = self.load.load_id if self.load is not None else (self._asked_load_id or "—")
+        msg = EmailMessage()
+        msg["Subject"] = f"Call recap — Load {load_id} — {self._call_label()}"
+        msg["From"] = self._settings.smtp_from
+        msg["To"] = f"{rep.name} <{rep.email}>"
+        msg.set_content(self._call_summary())
+        try:
+            self._mailer_factory(self._settings).send(msg)
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised upward
+            logger.warning("Call summary email failed for %s: %s", self.call_id, exc)
+            self._repo.record_rep_summary_email(self.call_id, error=str(exc))
+        else:
+            self._repo.record_rep_summary_email(self.call_id, emailed_to=rep.email)
 
     def abandon(self) -> None:
         """The line dropped before the call concluded — finalize the record.

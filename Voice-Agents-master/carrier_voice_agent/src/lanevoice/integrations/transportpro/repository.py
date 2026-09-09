@@ -1006,6 +1006,10 @@ class TransportProRepository:
     def log_note(self, call_id: str, note: str) -> None:
         self._audit.log_note(call_id, note)
 
+    def record_rep_summary_email(self, call_id: str, *, emailed_to: str | None = None,
+                                 error: str | None = None) -> None:
+        self._audit.record_rep_summary_email(call_id, emailed_to=emailed_to, error=error)
+
     def set_caller_number(self, call_id: str, number: str) -> None:
         self._audit.set_caller_number(call_id, number)
 
@@ -1023,12 +1027,13 @@ class TransportProRepository:
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
                  outcome: str, transcript: list | str, carrier_name: str | None = None,
                  carrier_mc: str | None = None, end_label: str | None = None,
-                 end_reason: str | None = None) -> None:
+                 end_reason: str | None = None, turn_meta: list | str | None = None) -> None:
         self._audit.end_call(call_id, load_id, carrier_dot, outcome, transcript,
-                             carrier_name, carrier_mc, end_label, end_reason)
+                             carrier_name, carrier_mc, end_label, end_reason, turn_meta)
 
-    def update_transcript(self, call_id: str, transcript: list | str) -> None:
-        self._audit.update_transcript(call_id, transcript)
+    def update_transcript(self, call_id: str, transcript: list | str,
+                         turn_meta: list | str | None = None) -> None:
+        self._audit.update_transcript(call_id, transcript, turn_meta)
 
 
 def _match(records: list[dict], load_id: str) -> dict | None:

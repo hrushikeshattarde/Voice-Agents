@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS reps (
     rep_id    TEXT PRIMARY KEY,
     name      TEXT NOT NULL,
     phone     TEXT NOT NULL,
-    available INTEGER NOT NULL DEFAULT 1
+    available INTEGER NOT NULL DEFAULT 1,
+    email     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS calls (
@@ -252,6 +253,26 @@ class Database:
             conn.execute("ALTER TABLE calls ADD COLUMN end_label TEXT")
         if call_columns and "end_reason" not in call_columns:
             conn.execute("ALTER TABLE calls ADD COLUMN end_reason TEXT")
+        # `calls.turn_meta`: one {"t": elapsed_secs, "latency": secs_or_null}
+        # per line of `transcript`, same order — when it landed on the call's
+        # own clock and, for the agent's replies, how long that reply took to
+        # put together. The dashboard's Transcript tab reads it back to show a
+        # timestamp per line, the way HappyRobot's transcript view does.
+        if call_columns and "turn_meta" not in call_columns:
+            conn.execute("ALTER TABLE calls ADD COLUMN turn_meta TEXT")
+        # `calls.rep_email_*`: how the post-call summary email to the load's
+        # assigned rep actually went — same shape as `practice_reports`'
+        # emailed_to/emailed_at/email_error, so a rep who never got a recap
+        # (no address on file, a dead mail server) shows up the same way a
+        # practice manager who never got a scorecard does.
+        for name in ("rep_email_sent_to", "rep_email_sent_at", "rep_email_error"):
+            if call_columns and name not in call_columns:
+                conn.execute(f"ALTER TABLE calls ADD COLUMN {name} TEXT")
+
+        reps_columns = {r["name"] for r in
+                        conn.execute("PRAGMA table_info(reps)").fetchall()}
+        if reps_columns and "email" not in reps_columns:
+            conn.execute("ALTER TABLE reps ADD COLUMN email TEXT")
 
         columns = {r["name"] for r in
                    conn.execute("PRAGMA table_info(carriers)").fetchall()}

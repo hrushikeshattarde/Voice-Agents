@@ -94,7 +94,9 @@ def seed_reps(db: Database) -> None:
     """
     conn = db.connect()
     try:
-        conn.executemany("INSERT OR IGNORE INTO reps VALUES (?,?,?,?)", _REPS)
+        conn.executemany(
+            "INSERT OR IGNORE INTO reps (rep_id, name, phone, available) VALUES (?,?,?,?)",
+            _REPS)
         conn.commit()
     finally:
         conn.close()
@@ -160,7 +162,9 @@ def seed_if_empty(db: Database) -> None:
             " VALUES (?,?,datetime('now'))",
             _CARRIER_EMAILS,
         )
-        conn.executemany("INSERT OR IGNORE INTO reps VALUES (?,?,?,?)", _REPS)
+        conn.executemany(
+            "INSERT OR IGNORE INTO reps (rep_id, name, phone, available) VALUES (?,?,?,?)",
+            _REPS)
         conn.commit()
     finally:
         conn.close()

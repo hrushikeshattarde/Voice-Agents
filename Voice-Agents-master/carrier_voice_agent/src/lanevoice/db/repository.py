@@ -87,6 +87,7 @@ class Repository:
             name=row["name"],
             phone=row["phone"],
             available=bool(row["available"]),
+            email=row["email"],
         )
 
     # -- reads -------------------------------------------------------------- #
@@ -221,6 +222,21 @@ class Repository:
             (call_id, note, _now()),
         )
 
+    def record_rep_summary_email(self, call_id: str, *, emailed_to: str | None = None,
+                                 error: str | None = None) -> None:
+        """How the post-call summary email to the load's assigned rep actually
+        went — exactly one of `emailed_to`/`error` is set, same contract as
+        `practice/store.py`'s `record_email`."""
+        if emailed_to:
+            self._execute(
+                "UPDATE calls SET rep_email_sent_to=?, rep_email_sent_at=?,"
+                " rep_email_error=NULL WHERE call_id=?",
+                (emailed_to, _now(), call_id),
+            )
+        else:
+            self._execute(
+                "UPDATE calls SET rep_email_error=? WHERE call_id=?", (error, call_id))
+
     def log_transfer(self, call_id: str, rep_id: str, result: str) -> None:
         self._execute(
             "INSERT INTO transfer_events (call_id, rep_id, transfer_result, timestamp)"
@@ -247,27 +263,39 @@ class Repository:
         )
         return True
 
-    def update_transcript(self, call_id: str, transcript: list | str) -> None:
+    def update_transcript(self, call_id: str, transcript: list | str,
+                         turn_meta: list | str | None = None) -> None:
         """Persist the transcript-so-far on the open call row.
 
         Called after every turn, so a live view (the dashboard) can read the
         call as it happens and a worker crash mid-call loses nothing. `end_call`
-        still writes the final word along with the outcome.
+        still writes the final word along with the outcome. `turn_meta` is the
+        parallel per-turn timing the dashboard's transcript view reads back —
+        see `CarrierSalesAgent._log_turn`.
         """
         payload = transcript if isinstance(transcript, str) else json.dumps(transcript)
+        if turn_meta is None:
+            self._execute(
+                "UPDATE calls SET transcript=? WHERE call_id=?", (payload, call_id))
+            return
+        meta_payload = turn_meta if isinstance(turn_meta, str) else json.dumps(turn_meta)
         self._execute(
-            "UPDATE calls SET transcript=? WHERE call_id=?", (payload, call_id))
+            "UPDATE calls SET transcript=?, turn_meta=? WHERE call_id=?",
+            (payload, meta_payload, call_id))
 
     def end_call(self, call_id: str, load_id: str | None, carrier_dot: str | None,
                  outcome: str, transcript: list | str, carrier_name: str | None = None,
                  carrier_mc: str | None = None, end_label: str | None = None,
-                 end_reason: str | None = None) -> None:
+                 end_reason: str | None = None, turn_meta: list | str | None = None) -> None:
         payload = transcript if isinstance(transcript, str) else json.dumps(transcript)
+        meta_payload = (turn_meta if turn_meta is None or isinstance(turn_meta, str)
+                       else json.dumps(turn_meta))
         self._execute(
             "UPDATE calls SET load_id=?, carrier_dot=?, end_time=?, outcome=?, transcript=?,"
-            " carrier_name=?, carrier_mc=?, end_label=?, end_reason=? WHERE call_id=?",
+            " carrier_name=?, carrier_mc=?, end_label=?, end_reason=?, turn_meta=?"
+            " WHERE call_id=?",
             (load_id, carrier_dot, _now(), outcome, payload, carrier_name, carrier_mc,
-             end_label, end_reason, call_id),
+             end_label, end_reason, meta_payload, call_id),
         )
 
     def set_caller_number(self, call_id: str, number: str) -> None:

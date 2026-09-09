@@ -45,6 +45,7 @@ def test_a_user_record_becomes_a_rep_with_a_diallable_number():
     rep = map_rep(USER_4507)
     assert (rep.rep_id, rep.name, rep.available) == ("4507", "Salomon Castillo", True)
     assert rep.phone == "+12602084500"            # the main line; an extension cannot ride a REFER
+    assert rep.email == "salomon.castillo@example.com"   # for the post-call summary
 
     with_cell = dict(USER_4507, phoneNumbers=[
         {"type": "FAX", "value": "260-555-0100"},
@@ -55,6 +56,7 @@ def test_a_user_record_becomes_a_rep_with_a_diallable_number():
     assert map_rep(dict(USER_4507, phoneNumbers=[{"type": "FAX", "value": "260-555"}])).phone == ""
     assert map_rep({"id": 9, "firstName": "", "lastName": ""}) is None
     assert map_rep(None) is None
+    assert map_rep(dict(USER_4507, emailContacts=[])).email is None
 
 
 def test_the_owner_is_read_from_transport_pro_and_the_directory_wins(repo):
@@ -69,7 +71,8 @@ def test_the_owner_is_read_from_transport_pro_and_the_directory_wins(repo):
     assert tp.get_rep("jsmith") is None                        # not a Transport Pro id
 
     conn = repo._db.connect()
-    conn.execute("INSERT INTO reps VALUES ('4507', 'Salomon Castillo', '+12605551234', 1)")
+    conn.execute("INSERT INTO reps (rep_id, name, phone, available) "
+                 "VALUES ('4507', 'Salomon Castillo', '+12605551234', 1)")
     conn.commit()
     conn.close()
     assert tp.get_rep("4507").phone == "+12605551234"          # reps.toml's direct number wins

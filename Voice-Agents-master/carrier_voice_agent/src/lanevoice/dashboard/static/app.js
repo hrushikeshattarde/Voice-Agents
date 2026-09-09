@@ -64,6 +64,13 @@ function fmtDur(secs) {
   const s = Math.round(secs);
   return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`;
 }
+/* m:ss into the call — the clock a recording's own timeline reads by, and
+   what a transcript timestamp means elsewhere (HappyRobot's own view included). */
+function fmtElapsed(secs) {
+  if (secs === null || secs === undefined) return null;
+  const s = Math.max(0, Math.round(secs));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
 function fmtDateTime(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
@@ -565,13 +572,21 @@ async function openCallDrawer(callId) {
   }
 }
 
-function bubble(who, text) {
+function bubble(who, text, meta) {
   const isAgent = who === "agent";
+  const elapsed = meta ? fmtElapsed(meta.elapsed_secs) : null;
+  const latency = meta && isAgent && meta.latency_secs !== null && meta.latency_secs !== undefined
+    ? `${meta.latency_secs.toFixed(2)}s` : null;
   return el("div", { class: `bubble ${isAgent ? "agent" : "carrier"}` },
     el("div", { class: "avatar" }, isAgent ? "AI" : "C"),
     el("div", {},
-      el("div", { class: "who" }, isAgent ? "LaneVoice" : "Caller"),
-      el("div", { class: "msg" }, text)));
+      el("div", { class: "who" }, isAgent ? "LaneVoice" : "Caller",
+        elapsed ? el("span", { class: "dim", style: "font-weight:400; margin-left:6px" }, elapsed) : null),
+      el("div", { class: "msg" }, text),
+      // How long THIS reply took to put together — the same "TIMING brain"
+      // figure the worker logs live, per turn. Only the agent's own replies
+      // have one; a caller's turn has nothing to time on our side.
+      latency ? el("div", { class: "dim", style: "font-size:11px; margin-top:2px" }, latency) : null));
 }
 
 function renderTranscriptTab(d) {
@@ -580,7 +595,8 @@ function renderTranscriptTab(d) {
       el("div", { class: "big" }, "No transcript stored"),
       "The call never reached end_call — it was dropped mid-flight or is still open.");
   }
-  return el("div", { class: "bubbles" }, d.transcript.map(([who, line]) => bubble(who, line)));
+  return el("div", { class: "bubbles" },
+    d.transcript.map((turn) => bubble(turn.speaker, turn.text, turn)));
 }
 
 function renderNegotiationTab(d) {

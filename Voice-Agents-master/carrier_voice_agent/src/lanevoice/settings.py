@@ -560,14 +560,15 @@ class Settings(BaseSettings):
     #    stored copy there is a retention decision to make knowingly.
     record_calls: bool = Field(default=False, validation_alias="RECORD_CALLS")
 
-    # --- Practice report email ----------------------------------------------- #
-    # The scored report goes to the rep's account manager (picked at session
-    # start, from practice/data/managers.toml). This is the codebase's FIRST
-    # outbound email — everything email-shaped before it was address parsing —
-    # and it is gated the way every integration is: unset SMTP_HOST/SMTP_FROM
-    # and reports are still scored, stored and shown, just never mailed (the
-    # skip is recorded on the report, not silent). Sending uses the stdlib;
-    # there is no mail-provider dependency to configure beyond these.
+    # --- Outbound email -------------------------------------------------------- #
+    # One SMTP config, two senders: the scored practice report to a rep's account
+    # manager (practice/mailer.py — the codebase's FIRST outbound email, back when
+    # everything email-shaped before it was address parsing), and the post-call
+    # CALL SUMMARY to a load's assigned rep (`CarrierSalesAgent._email_rep_summary`).
+    # Both are gated the way every integration is: unset SMTP_HOST/SMTP_FROM and
+    # the underlying feature still runs in full — scored, summarized, stored,
+    # shown — just never mailed (the skip is recorded, not silent). Sending uses
+    # the stdlib; there is no mail-provider dependency to configure beyond these.
     smtp_host: str = Field(default="", validation_alias="SMTP_HOST")
     smtp_port: int = Field(default=587, validation_alias="SMTP_PORT")
     smtp_username: str = Field(default="", validation_alias="SMTP_USERNAME")
@@ -579,6 +580,9 @@ class Settings(BaseSettings):
 
     @property
     def uses_practice_email(self) -> bool:
+        """Is SMTP configured at all — despite the name, this gates BOTH
+        outbound-email senders (see the block comment above), not just
+        practice reports; the name predates the second one."""
         return bool(self.smtp_host.strip() and self.smtp_from.strip())
 
     # --- Deadhead ------------------------------------------------------------ #

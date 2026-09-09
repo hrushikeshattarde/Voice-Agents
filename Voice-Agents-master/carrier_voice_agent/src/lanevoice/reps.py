@@ -9,6 +9,7 @@ edits (`REPS_FILE`, `reps.toml` next to the database by default):
     name = "Jordan Smith"
     phone = "+12605551234"
     available = true
+    email = "jordan.smith@example.com"
 
 Same editable-data-file pattern as the practice managers, same validation
 posture: a malformed entry is refused at load with the field named, because the
@@ -70,8 +71,19 @@ def load_reps(path: str | Path) -> list[Rep] | None:
         available = entry.get("available", True)
         if not isinstance(available, bool):
             raise ValueError(f"{path.name}: rep 'available' must be true or false")
+        email = entry.get("email")
+        if email is not None:
+            if not isinstance(email, str) or not email.strip():
+                raise ValueError(f"{path.name}: rep 'email' must be non-empty text if present")
+            email = email.strip()
+            if "@" not in email or " " in email:
+                # Not full RFC validation — just the typo class that would mail
+                # a rep's summary to nowhere. Same bar `managers.toml` holds.
+                raise ValueError(
+                    f"{path.name}: {email!r} does not look like an email address")
+            email = email.lower()
         rep = Rep(rep_id=entry["id"].strip(), name=entry["name"].strip(),
-                  phone=phone, available=available)
+                  phone=phone, available=available, email=email)
         if rep.rep_id in seen:
             raise ValueError(f"{path.name}: duplicate rep id {rep.rep_id!r}")
         seen.add(rep.rep_id)
@@ -87,8 +99,8 @@ def sync_reps(db: Database, reps: list[Rep] | None) -> None:
     try:
         conn.execute("DELETE FROM reps")
         conn.executemany(
-            "INSERT INTO reps (rep_id, name, phone, available) VALUES (?,?,?,?)",
-            [(r.rep_id, r.name, r.phone, int(r.available)) for r in reps])
+            "INSERT INTO reps (rep_id, name, phone, available, email) VALUES (?,?,?,?,?)",
+            [(r.rep_id, r.name, r.phone, int(r.available), r.email) for r in reps])
         conn.commit()
     finally:
         conn.close()

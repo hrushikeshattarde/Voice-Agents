@@ -155,14 +155,36 @@ def test_call_detail_carries_the_audit_trail(dash):
 
     detail = queries.call_detail(agent.call_id)
     assert detail is not None
-    # Transcript is [speaker, line] pairs, both parties present.
-    speakers = {who for who, _ in detail["transcript"]}
+    # Each turn is a dict — speaker, text, and when it landed on the call's
+    # own clock (and, for the agent's replies, how long that reply took).
+    speakers = {turn["speaker"] for turn in detail["transcript"]}
     assert speakers == {"agent", "carrier"}
+    assert all("elapsed_secs" in turn for turn in detail["transcript"])
     # Round 0 is the agent's opening at the board rate.
     opening = detail["offers"][0]
     assert (opening["round"], opening["party"], opening["amount"]) == (0, "agent", 2000.0)
     assert detail["load"]["load_id"] == "L1001"
     assert queries.call_detail("CALL-nope") is None
+
+
+def test_the_transcript_carries_a_clock_and_reply_latency(dash):
+    """What HappyRobot's own transcript view shows: when each line landed, and
+    how long the assistant took to answer. The greeting is composed in
+    prewarm, before any turn — it lands at 0:00 with no latency of its own;
+    every later agent line does, timed the same way as the worker's own
+    "TIMING brain" log line."""
+    repo, queries = dash
+    agent = _drive(repo)
+
+    turns = queries.call_detail(agent.call_id)["transcript"]
+    greeting = turns[0]
+    assert greeting["speaker"] == "agent" and greeting["latency_secs"] is None
+    elapsed = [t["elapsed_secs"] for t in turns]
+    assert elapsed == sorted(elapsed)                    # the call's own clock, never backwards
+    replies = [t for t in turns[1:] if t["speaker"] == "agent"]
+    assert replies and all(t["latency_secs"] is not None and t["latency_secs"] >= 0
+                           for t in replies)
+    assert all(t["latency_secs"] is None for t in turns if t["speaker"] == "carrier")
 
 
 def test_transcript_is_live_during_the_call(dash):
@@ -186,7 +208,11 @@ def test_transcript_is_live_during_the_call(dash):
     assert detail["outcome"] == "booked"
     # Every in-memory turn made it to disk, including the post-finish goodbye.
     assert len(detail["transcript"]) == len(agent.transcript)
-    assert detail["transcript"][-1][0] == "agent"
+    assert detail["transcript"][-1]["speaker"] == "agent"
+    # The greeting's reply latency is not measured (composed in prewarm, before
+    # any turn); every later agent line has one, timed on the same clock as the
+    # worker's own "TIMING brain" log line.
+    assert detail["transcript"][-1]["latency_secs"] is not None
 
 
 def test_playback_cut_lands_in_the_timeline(dash):
@@ -213,7 +239,7 @@ def test_abandon_persists_the_transcript(dash):
     assert row["call_id"] == agent.call_id
     assert row["turns"] >= 3          # greeting + caller turn + reply, at least
     detail = queries.call_detail(agent.call_id)
-    assert any(who == "carrier" for who, _ in detail["transcript"])
+    assert any(turn["speaker"] == "carrier" for turn in detail["transcript"])
 
     # Idempotent, and never overwrites a real outcome.
     booked = _drive(repo)

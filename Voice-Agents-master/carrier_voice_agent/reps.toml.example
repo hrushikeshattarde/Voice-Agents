@@ -17,11 +17,17 @@
 # `available = false` keeps somebody in the directory without routing calls to
 # them (out sick, on leave). All of `id`, `name` and `phone` are required.
 #
+# `email` is likewise optional and likewise an override: Transport Pro's own
+# user record already carries one (`emailContacts`), read straight off it with
+# no entry here. Set it only to redirect the post-call summary somewhere else
+# (a shared inbox, a rep whose TP record has no address on file).
+#
 # [[reps]]
 # id = "jsmith"
 # name = "Jordan Smith"
 # phone = "+12605551234"
 # available = true
+# email = "jordan.smith@example.com"
 #
 # [[reps]]
 # id = "alee"

@@ -921,6 +921,12 @@ def map_rep(record: dict | None) -> Rep | None:
     `reps.toml` entry with that rep's direct number. `phone` is "" when the record
     has nothing diallable at all; the agent then names the rep and promises a
     callback rather than a transfer it cannot make.
+
+    `email` is read the same way `map_carrier` reads a carrier's addresses —
+    by shape (`_emails`), not by field name — because the live record carries
+    it as `emailContacts: [{"type": "MAIN", "value": "..."}]`, and a
+    field-name lookup here would repeat the mistake `_emails`'s own docstring
+    warns about.
     """
     if not isinstance(record, dict) or record.get("id") in (None, ""):
         return None
@@ -948,7 +954,9 @@ def map_rep(record: dict | None) -> Rep | None:
         logger.info("Transport Pro rep %s (%s) has no diallable number on file — the "
                     "agent will promise a callback, not a transfer. Add one to "
                     "reps.toml under id %r.", name, rep_id, rep_id)
-    return Rep(rep_id=rep_id, name=name, phone=phone, available=True)
+    emails = _emails(record)
+    return Rep(rep_id=rep_id, name=name, phone=phone, available=True,
+               email=emails[0] if emails else None)
 
 
 def _terminal_id(*holders: Any) -> str | None:

@@ -319,6 +319,10 @@ class Rep:
     name: str
     phone: str
     available: bool
+    # Where the post-call summary email goes — a `reps.toml` override, or
+    # Transport Pro's own `emailContacts` on the user record. None means no
+    # address is known anywhere, and the summary is simply never mailed.
+    email: str | None = None
 
 
 # --------------------------------------------------------------------------- #
